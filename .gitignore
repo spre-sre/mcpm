@@ -1,0 +1,30 @@
+# Binaries
+mcpm
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local MCP files (generated during testing)
+.mcp/
+.mcp.json
+.gemini/
