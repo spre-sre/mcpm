@@ -5,7 +5,7 @@ A CLI tool to install and manage [Model Context Protocol (MCP)](https://modelcon
 ## Features
 
 - **Easy Installation** - Install MCP servers with a single command
-- **Multi-Platform Support** - Works with GitHub, GitLab.com, and GitLab Red Hat
+- **Multi-Platform Support** - Works with GitHub and GitLab
 - **Auto-Detection** - Automatically detects project type (Node.js, Python, Go)
 - **Build Automation** - Handles dependencies and build steps automatically
 - **Multi-Client** - Register servers with Claude Code and/or Gemini CLI
@@ -34,11 +34,8 @@ sudo mv mcpm /usr/local/bin/
 # From GitHub
 mcpm install @modelcontextprotocol/server-filesystem
 
-# From GitLab.com
+# From GitLab
 mcpm install gl:@gitlab-org/my-mcp-server
-
-# From GitLab Red Hat
-mcpm install gl:rh:@sp-ai/lumino/lumino-mcp-server
 
 # From direct URL
 mcpm install https://github.com/user/repo.git
@@ -49,8 +46,7 @@ mcpm install https://github.com/user/repo.git
 | Scheme | Description | Example |
 |--------|-------------|---------|
 | `@org/repo` | GitHub (default) | `@anthropics/mcp-server` |
-| `gl:@org/repo` | GitLab.com | `gl:@gitlab-org/server` |
-| `gl:rh:@org/repo` | GitLab Red Hat | `gl:rh:@sp-ai/lumino/server` |
+| `gl:@org/repo` | GitLab | `gl:@gitlab-org/server` |
 | `https://...` | Direct URL | Any git URL |
 
 ## How It Works
