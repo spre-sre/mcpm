@@ -10,6 +10,8 @@ import (
 	"mcpm/internal/tui"
 )
 
+var installGlobal bool
+
 var installCmd = &cobra.Command{
 	Use:   "install [scheme]",
 	Short: "Install an MCP server from a repository",
@@ -20,6 +22,9 @@ Examples:
   mcpm install gl:@gitlab-org/my-server
   mcpm install gl:rh:@sp-ai/lumino/lumino-mcp-server
   mcpm install https://github.com/user/repo.git
+
+  # Install globally (available in all projects)
+  mcpm install @modelcontextprotocol/server-filesystem --global
 
 Schemes:
   @org/repo           GitHub (default)
@@ -33,7 +38,7 @@ Schemes:
 
 		// Initialize and run the TUI with alt screen to avoid TTY issues
 		p := tea.NewProgram(
-			tui.NewInstallModel(url, repoRef),
+			tui.NewInstallModel(url, repoRef, installGlobal),
 			tea.WithAltScreen(),
 		)
 		if _, err := p.Run(); err != nil {
@@ -64,5 +69,6 @@ func parseScheme(input string) (string, string) {
 }
 
 func init() {
+	installCmd.Flags().BoolVarP(&installGlobal, "global", "g", false, "Install globally (available in all projects)")
 	rootCmd.AddCommand(installCmd)
 }

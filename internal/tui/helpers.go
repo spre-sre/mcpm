@@ -61,7 +61,7 @@ func updateClientSelection(m Model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			tools = append(tools, injector.TargetGeminiCLI)
 		}
 
-		err := injector.Register(m.buildResult, tools, finalEnv)
+		err := injector.Register(m.buildResult, tools, finalEnv, m.global)
 		if err != nil {
 			m.err = err
 			return m, tea.Quit

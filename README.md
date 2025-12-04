@@ -39,6 +39,9 @@ mcpm install gl:@gitlab-org/my-mcp-server
 
 # From direct URL
 mcpm install https://github.com/user/repo.git
+
+# Install globally (available in all projects)
+mcpm install @modelcontextprotocol/server-filesystem --global
 ```
 
 ### Add an Existing MCP Server
@@ -63,6 +66,25 @@ mcpm add myserver /path/to/server --claude
 
 # Add only to Gemini CLI
 mcpm add myserver /path/to/server --gemini
+
+# Add globally (available in all projects)
+mcpm add myserver /path/to/server --global
+```
+
+### Remove an MCP Server
+
+```bash
+# Remove from both clients (current directory)
+mcpm remove myserver
+
+# Remove only from Claude Code
+mcpm remove myserver --claude
+
+# Remove only from Gemini CLI
+mcpm remove myserver --gemini
+
+# Remove from global configuration
+mcpm remove myserver --global
 ```
 
 ### URL Schemes
@@ -151,7 +173,9 @@ Servers are registered in `.gemini/settings.json` in the current directory:
 mcpm/
 ├── cmd/
 │   ├── root.go          # Root command setup
-│   └── install.go       # Install command
+│   ├── install.go       # Install command
+│   ├── add.go           # Add command
+│   └── remove.go        # Remove command
 ├── internal/
 │   ├── fetcher/
 │   │   └── git.go       # Git clone functionality

@@ -41,9 +41,22 @@ func (c GeminiConfig) MarshalJSON() ([]byte, error) {
 	return json.MarshalIndent(output, "", "  ")
 }
 
-func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string) error {
-	configDir := filepath.Join(cwd, ".gemini")
-	configPath := filepath.Join(configDir, "settings.json")
+func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
+	var configDir, configPath string
+
+	if global {
+		// Global config in ~/.gemini/settings.json
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("could not get home directory: %w", err)
+		}
+		configDir = filepath.Join(home, ".gemini")
+		configPath = filepath.Join(configDir, "settings.json")
+	} else {
+		// Project-level config in ./.gemini/settings.json
+		configDir = filepath.Join(cwd, ".gemini")
+		configPath = filepath.Join(configDir, "settings.json")
+	}
 
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("could not create .gemini dir: %w", err)

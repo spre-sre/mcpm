@@ -14,17 +14,17 @@ const (
 	TargetGeminiCLI  TargetTool = "gemini-cli"
 )
 
-func Register(result *builder.BuildResult, tools []TargetTool, env map[string]string) error {
+func Register(result *builder.BuildResult, tools []TargetTool, env map[string]string, global bool) error {
 	cwd, _ := os.Getwd()
 
 	for _, tool := range tools {
 		switch tool {
 		case TargetClaudeCode:
-			if err := updateClaudeCode(cwd, result, env); err != nil {
+			if err := updateClaudeCode(cwd, result, env, global); err != nil {
 				return fmt.Errorf("claude configuration failed: %w", err)
 			}
 		case TargetGeminiCLI:
-			if err := updateGeminiCLI(cwd, result, env); err != nil {
+			if err := updateGeminiCLI(cwd, result, env, global); err != nil {
 				return fmt.Errorf("gemini configuration failed: %w", err)
 			}
 		}

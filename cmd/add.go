@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	addTransport string
-	addEnvVars   []string
+	addTransport  string
+	addEnvVars    []string
 	addClaudeCode bool
 	addGeminiCLI  bool
+	addGlobal     bool
 )
 
 var addCmd = &cobra.Command{
@@ -45,7 +46,10 @@ Examples:
   mcpm add myserver /path/to/server --claude
 
   # Add only to Gemini CLI
-  mcpm add myserver /path/to/server --gemini`,
+  mcpm add myserver /path/to/server --gemini
+
+  # Add globally (available in all projects)
+  mcpm add myserver /path/to/server --global`,
 	Args: cobra.MinimumNArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		name := args[0]
@@ -78,27 +82,40 @@ Examples:
 
 		cwd, _ := os.Getwd()
 
+		scope := "local"
+		if addGlobal {
+			scope = "user"
+		}
+
 		if addClaudeCode {
-			if err := addToClaudeCode(cwd, name, commandOrURL, serverArgs, env, addTransport); err != nil {
+			if err := addToClaudeCode(cwd, name, commandOrURL, serverArgs, env, addTransport, scope); err != nil {
 				fmt.Printf("Error adding to Claude Code: %v\n", err)
 			} else {
-				fmt.Printf("Added %s to Claude Code\n", name)
+				if addGlobal {
+					fmt.Printf("Added %s to Claude Code (global)\n", name)
+				} else {
+					fmt.Printf("Added %s to Claude Code\n", name)
+				}
 			}
 		}
 
 		if addGeminiCLI {
-			if err := addToGeminiCLI(cwd, name, commandOrURL, serverArgs, env, addTransport); err != nil {
+			if err := addToGeminiCLI(cwd, name, commandOrURL, serverArgs, env, addTransport, addGlobal); err != nil {
 				fmt.Printf("Error adding to Gemini CLI: %v\n", err)
 			} else {
-				fmt.Printf("Added %s to Gemini CLI\n", name)
+				if addGlobal {
+					fmt.Printf("Added %s to Gemini CLI (global)\n", name)
+				} else {
+					fmt.Printf("Added %s to Gemini CLI\n", name)
+				}
 			}
 		}
 	},
 }
 
-func addToClaudeCode(cwd, name, commandOrURL string, args []string, env map[string]string, transport string) error {
+func addToClaudeCode(cwd, name, commandOrURL string, args []string, env map[string]string, transport, scope string) error {
 	// Build command args for claude mcp add
-	cmdArgs := []string{"mcp", "add", "--transport", transport}
+	cmdArgs := []string{"mcp", "add", "--transport", transport, "--scope", scope}
 
 	// Add environment variables
 	for key, value := range env {
@@ -123,9 +140,22 @@ func addToClaudeCode(cwd, name, commandOrURL string, args []string, env map[stri
 	return nil
 }
 
-func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[string]string, transport string) error {
-	configDir := filepath.Join(cwd, ".gemini")
-	configPath := filepath.Join(configDir, "settings.json")
+func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[string]string, transport string, global bool) error {
+	var configDir, configPath string
+
+	if global {
+		// Global config in ~/.gemini/settings.json
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("could not get home directory: %w", err)
+		}
+		configDir = filepath.Join(home, ".gemini")
+		configPath = filepath.Join(configDir, "settings.json")
+	} else {
+		// Project-level config in ./.gemini/settings.json
+		configDir = filepath.Join(cwd, ".gemini")
+		configPath = filepath.Join(configDir, "settings.json")
+	}
 
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("could not create .gemini dir: %w", err)
@@ -181,5 +211,6 @@ func init() {
 	addCmd.Flags().StringArrayVarP(&addEnvVars, "env", "e", []string{}, "Environment variables (KEY=VALUE)")
 	addCmd.Flags().BoolVar(&addClaudeCode, "claude", false, "Add only to Claude Code")
 	addCmd.Flags().BoolVar(&addGeminiCLI, "gemini", false, "Add only to Gemini CLI")
+	addCmd.Flags().BoolVarP(&addGlobal, "global", "g", false, "Add globally (available in all projects)")
 	rootCmd.AddCommand(addCmd)
 }

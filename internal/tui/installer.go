@@ -27,6 +27,7 @@ type Model struct {
 	repoName    string // User input name
 	repoPath    string
 	buildResult *builder.BuildResult
+	global      bool
 
 	spinner    spinner.Model
 	inputs     []textinput.Model
@@ -37,17 +38,23 @@ type Model struct {
 	cursor   int
 }
 
-func NewInstallModel(repoUrl, repoName string) Model {
+func NewInstallModel(repoUrl, repoName string, global bool) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = focusedStyle
+
+	scope := "Current Dir"
+	if global {
+		scope = "Global"
+	}
 
 	return Model{
 		state:    stateFetching,
 		repoUrl:  repoUrl,
 		repoName: repoName,
+		global:   global,
 		spinner:  s,
-		clients:  []string{"Claude Code (Current Dir)", "Gemini CLI (Current Dir)"},
+		clients:  []string{fmt.Sprintf("Claude Code (%s)", scope), fmt.Sprintf("Gemini CLI (%s)", scope)},
 		selected: map[int]bool{0: true, 1: true},
 	}
 }

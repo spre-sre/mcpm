@@ -17,7 +17,7 @@ type McpServerDef struct {
 	Env     map[string]string `json:"env,omitempty"`
 }
 
-func updateClaudeCode(cwd string, result *builder.BuildResult, env map[string]string) error {
+func updateClaudeCode(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
 	// Extract server name from path
 	// Look for .mcp/servers/<name> pattern
 	name := "mcp-server"
@@ -37,8 +37,15 @@ func updateClaudeCode(cwd string, result *builder.BuildResult, env map[string]st
 	}
 
 	// Build command args for claude mcp add
-	// Format: claude mcp add [--env KEY=VALUE]... <name> <command> [args...]
+	// Format: claude mcp add [--scope SCOPE] [--env KEY=VALUE]... <name> <command> [args...]
 	cmdArgs := []string{"mcp", "add"}
+
+	// Add scope (user for global, local for project-specific)
+	if global {
+		cmdArgs = append(cmdArgs, "--scope", "user")
+	} else {
+		cmdArgs = append(cmdArgs, "--scope", "local")
+	}
 
 	// Add environment variables
 	for key, value := range env {
