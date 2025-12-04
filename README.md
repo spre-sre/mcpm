@@ -28,7 +28,7 @@ sudo mv mcpm /usr/local/bin/
 
 ## Usage
 
-### Install an MCP Server
+### Install an MCP Server from Repository
 
 ```bash
 # From GitHub
@@ -39,6 +39,30 @@ mcpm install gl:@gitlab-org/my-mcp-server
 
 # From direct URL
 mcpm install https://github.com/user/repo.git
+```
+
+### Add an Existing MCP Server
+
+For HTTP endpoints or already installed servers:
+
+```bash
+# Add HTTP server
+mcpm add sentry https://mcp.sentry.dev/mcp --transport http
+
+# Add SSE server
+mcpm add slack https://mcp.slack.com/sse --transport sse
+
+# Add local stdio server
+mcpm add myserver /usr/local/bin/my-mcp-server
+
+# Add with environment variables
+mcpm add myserver node /path/to/server.js -e API_KEY=xxx
+
+# Add only to Claude Code
+mcpm add myserver /path/to/server --claude
+
+# Add only to Gemini CLI
+mcpm add myserver /path/to/server --gemini
 ```
 
 ### URL Schemes
