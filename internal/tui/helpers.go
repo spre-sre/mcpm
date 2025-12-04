@@ -39,7 +39,7 @@ func updateClientSelection(m Model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.clients)-1 {
 			m.cursor++
 		}
-	case "space":
+	case " ":
 		m.selected[m.cursor] = !m.selected[m.cursor]
 	case "enter":
 		m.state = stateDone
