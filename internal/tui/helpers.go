@@ -2,6 +2,7 @@ package tui
 
 import (
 	tea "github.com/charmbracelet/bubbletea"
+	"mcpm/internal/builder"
 	"mcpm/internal/injector"
 )
 
@@ -69,4 +70,16 @@ func updateClientSelection(m Model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// registerClients is a helper to register with selected clients
+func registerClients(result *builder.BuildResult, selected map[int]bool, env map[string]string, global bool) error {
+	var tools []injector.TargetTool
+	if selected[0] {
+		tools = append(tools, injector.TargetClaudeCode)
+	}
+	if selected[1] {
+		tools = append(tools, injector.TargetGeminiCLI)
+	}
+	return injector.Register(result, tools, env, global)
 }

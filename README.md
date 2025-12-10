@@ -87,6 +87,27 @@ mcpm remove myserver --gemini
 mcpm remove myserver --global
 ```
 
+### Update an Installed Server
+
+Pull latest changes from remote and rebuild:
+
+```bash
+# Update a specific server
+mcpm update server-filesystem
+
+# Update all installed servers
+mcpm update --all
+
+# Update and re-register globally
+mcpm update server-filesystem --global
+```
+
+### List Installed Servers
+
+```bash
+mcpm list
+```
+
 ### URL Schemes
 
 | Scheme | Description | Example |
@@ -175,7 +196,9 @@ mcpm/
 │   ├── root.go          # Root command setup
 │   ├── install.go       # Install command
 │   ├── add.go           # Add command
-│   └── remove.go        # Remove command
+│   ├── remove.go        # Remove command
+│   ├── update.go        # Update command
+│   └── list.go          # List command
 ├── internal/
 │   ├── fetcher/
 │   │   └── git.go       # Git clone functionality
@@ -191,7 +214,8 @@ mcpm/
 │   │   ├── claude_code.go
 │   │   └── gemini_cli.go
 │   └── tui/
-│       ├── installer.go # Main TUI model
+│       ├── installer.go # Install TUI model
+│       ├── updater.go   # Update TUI model
 │       ├── commands.go  # Tea commands
 │       ├── helpers.go   # Input handlers
 │       └── styles.go    # Lipgloss styles

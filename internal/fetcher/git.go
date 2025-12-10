@@ -52,3 +52,68 @@ func Clone(url string) (string, error) {
 
 	return targetPath, nil
 }
+
+// Pull updates from remote for an existing repository
+func Pull(repoPath string) error {
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	err = worktree.Pull(&git.PullOptions{
+		RemoteName: "origin",
+		Force:      true,
+	})
+
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("git pull failed: %w", err)
+	}
+
+	return nil
+}
+
+// GetServerPath returns the path to a server by name
+func GetServerPath(name string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	serverPath := filepath.Join(cwd, ".mcp", "servers", name)
+	if _, err := os.Stat(serverPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("server '%s' not found in .mcp/servers/", name)
+	}
+
+	return serverPath, nil
+}
+
+// ListServers returns a list of installed server names
+func ListServers() ([]string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	serversDir := filepath.Join(cwd, ".mcp", "servers")
+	entries, err := os.ReadDir(serversDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+
+	var servers []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			servers = append(servers, entry.Name())
+		}
+	}
+
+	return servers, nil
+}
