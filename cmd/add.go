@@ -74,7 +74,12 @@ Examples:
 		// Detect transport type if not specified
 		if addTransport == "" {
 			if strings.HasPrefix(commandOrURL, "http://") || strings.HasPrefix(commandOrURL, "https://") {
-				addTransport = "http"
+				// Check if URL indicates SSE endpoint (path ends with /sse or contains /sse/)
+				if strings.HasSuffix(commandOrURL, "/sse") || strings.Contains(commandOrURL, "/sse/") {
+					addTransport = "sse"
+				} else {
+					addTransport = "http"
+				}
 			} else {
 				addTransport = "stdio"
 			}
