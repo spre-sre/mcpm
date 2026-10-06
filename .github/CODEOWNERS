@@ -1,0 +1,28 @@
+# CODEOWNERS for mcpm (Crucible-governed Go repository)
+# Every pattern below is a trusted (pinned) path or an implicit-load file.
+# Changes to these paths require review from repository maintainers.
+
+# Checker and kit machinery
+/bin/crucible                       @ggeorgie
+/scripts/verify_pins.py             @ggeorgie
+/scripts/mint_attestation.py        @ggeorgie
+/scripts/mcp_server.py              @ggeorgie
+/harness/                           @ggeorgie
+/.github/workflows/crucible.yml     @ggeorgie
+/.github/CODEOWNERS                 @ggeorgie
+
+# Spec, config, pins, baseline
+/contracts/                         @ggeorgie
+/.crucible/config.toml              @ggeorgie
+/.crucible/pins.json                @ggeorgie
+/.crucible/baseline.json            @ggeorgie
+/.crucible/archetype/               @ggeorgie
+
+# Agent tool configuration
+/.mcp.json                          @ggeorgie
+/.claude/                           @ggeorgie
+
+# Go ecosystem implicit-load files & dependencies
+/go.mod                             @ggeorgie
+/go.sum                             @ggeorgie
+/go.work                            @ggeorgie
