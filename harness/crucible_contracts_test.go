@@ -3,8 +3,9 @@
 // Test names are TestCrucible_INV_<NAME>_<case>. Every assertion goes through
 // check or checkEqual, which count cases and failures per invariant; TestMain
 // writes the counts to CRUCIBLE_RESULTS. No case reaches a path that runs an
-// external program: every mcp.json has an empty buildCmd, and no fixture has
-// a Node, Python or Go marker without an mcp.json beside it.
+// external program on correct code: a valid mcp.json has an empty buildCmd,
+// and no fixture has a Node, Python or Go marker without an mcp.json beside
+// it. One case has a buildCmd in a manifest that must be rejected first.
 package harness_test
 
 import (
@@ -181,11 +182,19 @@ func makeTree(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// detect calls DetectAndBuild on a tree and returns the code and the result.
+// detectIn calls DetectAndBuild on a new tree and returns the code, the result and the tree.
+func detectIn(t *testing.T, files map[string]string) (int, *builder.BuildResult, string) {
+	t.Helper()
+	dir := makeTree(t, files)
+	result, err := builder.DetectAndBuild(dir)
+	return errorCode(err), result, dir
+}
+
+// detect calls DetectAndBuild on a new tree and returns the code and the result.
 func detect(t *testing.T, files map[string]string) (int, *builder.BuildResult) {
 	t.Helper()
-	result, err := builder.DetectAndBuild(makeTree(t, files))
-	return errorCode(err), result
+	code, result, _ := detectIn(t, files)
+	return code, result
 }
 
 // inDir runs fn with the working directory set to dir, then restores it.
@@ -231,21 +240,85 @@ func serverName(rng *rand.Rand) string {
 	return string(out)
 }
 
-// randomManifest returns a Manifest with an empty BuildCmd, so nothing runs.
-func randomManifest(rng *rand.Rand) builder.Manifest {
-	types := []string{"", "node", "python", "go"}
-	args := make([]string, rng.Intn(5))
-	for i := range args {
-		args[i] = token(rng, 24)
-	}
-	env := make([]string, rng.Intn(4))
-	for i := range env {
-		env[i] = strings.ToUpper(serverName(rng))
-	}
-	return builder.Manifest{Type: types[rng.Intn(len(types))], RunCmd: token(rng, 16), Args: args, RequiredEnv: env}
+// manifestCase is a valid manifest, the files its args name, and which
+// values the result must make absolute against the server directory.
+type manifestCase struct {
+	manifest builder.Manifest
+	files    map[string]string // created beside mcp.json
+	absCmd   bool              // runCmd is a relative path
+	absArgs  []bool            // args[i] names a created file or directory
 }
 
-// checkManifestResult checks that an accepted manifest returns its fields unchanged.
+// want returns the result the case must give when built in dir.
+func (c manifestCase) want(dir string) builder.Manifest {
+	want := c.manifest
+	if c.absCmd {
+		want.RunCmd = filepath.Join(dir, want.RunCmd)
+	}
+	want.Args = append([]string(nil), c.manifest.Args...)
+	for i, abs := range c.absArgs {
+		if abs {
+			want.Args[i] = filepath.Join(dir, want.Args[i])
+		}
+	}
+	return want
+}
+
+// randomRunCmd returns a runCmd and whether it is a relative path.
+func randomRunCmd(rng *rand.Rand) (string, bool) {
+	name := serverName(rng)
+	switch rng.Intn(4) {
+	case 0:
+		return "bin/" + name, true
+	case 1:
+		return "./" + name, true
+	case 2:
+		return "/usr/local/bin/" + name, false
+	}
+	return name, false // a bare name stays a PATH lookup
+}
+
+// randomArg returns an arg, a file to create for it (or ""), and whether it must be resolved.
+func randomArg(rng *rand.Rand) (string, string, bool) {
+	name := serverName(rng)
+	switch rng.Intn(6) {
+	case 0:
+		return "--" + name, "", false // a flag
+	case 1:
+		return "/opt/" + name + "/index.js", "", false // already absolute
+	case 2:
+		return "dist/" + name + ".js", "dist/" + name + ".js", true // a built file
+	case 3:
+		return name + ".py", name + ".py", true // a file in the root
+	case 4:
+		return "missing/" + name + ".js", "", false // a relative path that does not exist
+	}
+	return "@scope/" + name, "", false // a package name, not a path
+}
+
+// randomManifestCase returns a valid manifest with an empty BuildCmd, so nothing runs.
+func randomManifestCase(rng *rand.Rand) manifestCase {
+	types := []string{"", "node", "python", "go"}
+	c := manifestCase{files: map[string]string{}}
+	c.manifest.Type = types[rng.Intn(len(types))]
+	c.manifest.RunCmd, c.absCmd = randomRunCmd(rng)
+	c.manifest.Args = make([]string, rng.Intn(5))
+	c.absArgs = make([]bool, len(c.manifest.Args))
+	for i := range c.manifest.Args {
+		var file string
+		c.manifest.Args[i], file, c.absArgs[i] = randomArg(rng)
+		if file != "" {
+			c.files[file] = "x"
+		}
+	}
+	c.manifest.RequiredEnv = make([]string, rng.Intn(4))
+	for i := range c.manifest.RequiredEnv {
+		c.manifest.RequiredEnv[i] = strings.ToUpper(serverName(rng))
+	}
+	return c
+}
+
+// checkManifestResult checks an accepted manifest's result against want.
 func checkManifestResult(t *testing.T, invariant string, result *builder.BuildResult, want builder.Manifest, label string) {
 	t.Helper()
 	if result == nil {
@@ -302,46 +375,93 @@ func TestCrucible_INV_PROJECT_DETECTED_random(t *testing.T) {
 			continue
 		}
 		// mcp.json plus any other markers: the manifest wins, nothing is built.
-		manifest := randomManifest(rng)
-		data, _ := json.Marshal(manifest)
+		c := randomManifestCase(rng)
+		data, _ := json.Marshal(c.manifest)
 		files["mcp.json"] = string(data)
+		for name, content := range c.files {
+			files[name] = content
+		}
 		for _, marker := range projectMarkers[1:] {
 			if rng.Intn(2) == 0 {
 				files[marker] = "{}"
 			}
 		}
-		code, result := detect(t, files)
+		code, result, dir := detectIn(t, files)
 		check(t, "INV_PROJECT_DETECTED", code, codeAccept, label+" with mcp.json")
 		if code == codeAccept {
-			checkManifestResult(t, "INV_PROJECT_DETECTED", result, manifest, label)
+			checkManifestResult(t, "INV_PROJECT_DETECTED", result, c.want(dir), label)
 		}
 	}
 }
 
-// INV_MANIFEST_JSON: mcp.json does not decode into Manifest -> REJECT(ERR_MANIFEST_INVALID)
+// INV_MANIFEST_JSON: mcp.json does not decode into Manifest, or has no runCmd -> REJECT(ERR_MANIFEST_INVALID)
 func TestCrucible_INV_MANIFEST_JSON_boundary(t *testing.T) {
-	accepted := map[string]builder.Manifest{
-		`{}`:      {},
-		`null`:    {},
-		`{"x":1}`: {},
-		`{"runCmd":"r","args":[],"requiredEnv":[]}`: {RunCmd: "r", Args: []string{}, RequiredEnv: []string{}},
-		// runCmd is taken literally (builder.go buildFromManifest), also when it names a program on PATH.
-		`{"runCmd":"go"}`:                                     {RunCmd: "go"},
-		`{"type":"python","runCmd":"python"}`:                 {RunCmd: "python"},
-		`{"type":"node","runCmd":"node","args":["index.js"]}`: {RunCmd: "node", Args: []string{"index.js"}},
+	same := func(m builder.Manifest) func(string) builder.Manifest {
+		return func(string) builder.Manifest { return m }
 	}
-	for content, want := range accepted {
-		code, result := detect(t, map[string]string{"mcp.json": content})
-		check(t, "INV_MANIFEST_JSON", code, codeAccept, "valid "+content)
+	accepted := []struct {
+		content string
+		files   map[string]string
+		want    func(dir string) builder.Manifest
+	}{
+		{`{"runCmd":"r","args":[],"requiredEnv":[]}`, nil, same(builder.Manifest{RunCmd: "r"})},
+		// A bare runCmd stays a PATH lookup, also when it names a program on PATH.
+		{`{"runCmd":"go"}`, nil, same(builder.Manifest{RunCmd: "go"})},
+		{`{"type":"python","runCmd":"python"}`, nil, same(builder.Manifest{RunCmd: "python"})},
+		// The README example: a relative arg that names a file becomes absolute.
+		{`{"type":"node","buildCmd":"","runCmd":"node","args":["dist/index.js"],"requiredEnv":["API_KEY"]}`,
+			map[string]string{"dist/index.js": "x"},
+			func(dir string) builder.Manifest {
+				return builder.Manifest{RunCmd: "node", Args: []string{filepath.Join(dir, "dist", "index.js")}, RequiredEnv: []string{"API_KEY"}}
+			}},
+		{`{"runCmd":"node","args":["index.js"]}`, map[string]string{"index.js": "x"},
+			func(dir string) builder.Manifest {
+				return builder.Manifest{RunCmd: "node", Args: []string{filepath.Join(dir, "index.js")}}
+			}},
+		{`{"runCmd":"node","args":["lib"]}`, map[string]string{"lib/x.js": "x"},
+			func(dir string) builder.Manifest {
+				return builder.Manifest{RunCmd: "node", Args: []string{filepath.Join(dir, "lib")}}
+			}},
+		// A flag stays a flag, also when a file of that name exists.
+		{`{"runCmd":"node","args":["-x","--port","index.js"]}`, map[string]string{"-x": "x", "--port": "x", "index.js": "x"},
+			func(dir string) builder.Manifest {
+				return builder.Manifest{RunCmd: "node", Args: []string{"-x", "--port", filepath.Join(dir, "index.js")}}
+			}},
+		// A relative arg that names nothing in the directory stays as written.
+		{`{"runCmd":"node","args":["index.js"]}`, nil, same(builder.Manifest{RunCmd: "node", Args: []string{"index.js"}})},
+		// A relative runCmd path becomes absolute; flags, values, package names and "" stay.
+		{`{"runCmd":"./server"}`, nil, func(dir string) builder.Manifest { return builder.Manifest{RunCmd: filepath.Join(dir, "server")} }},
+		{`{"runCmd":"bin/server","args":["--port","8080","@scope/pkg",""]}`, nil,
+			func(dir string) builder.Manifest {
+				return builder.Manifest{RunCmd: filepath.Join(dir, "bin", "server"), Args: []string{"--port", "8080", "@scope/pkg", ""}}
+			}},
+		{`{"runCmd":"/usr/bin/env","args":["/abs/x.js"]}`, nil, same(builder.Manifest{RunCmd: "/usr/bin/env", Args: []string{"/abs/x.js"}})},
+	}
+	for _, c := range accepted {
+		files := map[string]string{"mcp.json": c.content}
+		for name, content := range c.files {
+			files[name] = content
+		}
+		code, result, dir := detectIn(t, files)
+		check(t, "INV_MANIFEST_JSON", code, codeAccept, "valid "+c.content)
 		if code == codeAccept {
-			checkManifestResult(t, "INV_MANIFEST_JSON", result, want, "valid "+content)
+			checkManifestResult(t, "INV_MANIFEST_JSON", result, c.want(dir), "valid "+c.content)
 		}
 	}
-	rejected := []string{``, `{`, `[]`, `"text"`, `1`, `{"runCmd":1}`, `{"args":"x"}`, `{"requiredEnv":[1]}`, `{"buildCmd":true}`, `{}x`}
+	rejected := []string{
+		``, `{`, `[]`, `"text"`, `1`, `{"runCmd":1}`, `{"args":"x"}`, `{"requiredEnv":[1]}`, `{"buildCmd":true}`, `{}x`,
+		// No runCmd.
+		`{}`, `null`, `{"x":1}`, `{"runCmd":""}`, `{"runCmd":"   "}`, `{"runCmd":"\t\n"}`, `{"args":["index.js"]}`,
+	}
 	for _, content := range rejected {
 		code, _ := detect(t, map[string]string{"mcp.json": content})
 		check(t, "INV_MANIFEST_JSON", code, errManifestInvalid, "invalid "+content)
 	}
+	// The manifest is rejected before its buildCmd runs.
+	code, _, dir := detectIn(t, map[string]string{"mcp.json": `{"buildCmd":"touch buildcmd-ran"}`})
+	check(t, "INV_MANIFEST_JSON", code, errManifestInvalid, "no runCmd with a buildCmd")
+	_, err := os.Stat(filepath.Join(dir, "buildcmd-ran"))
+	check(t, "INV_MANIFEST_JSON", errorCode(err), errUnexpected, "buildCmd did not run")
 }
 
 // wrongTypes gives each Manifest field a JSON value of the wrong type.
@@ -352,14 +472,27 @@ func TestCrucible_INV_MANIFEST_JSON_random(t *testing.T) {
 	fields := []string{"type", "buildCmd", "runCmd", "args", "requiredEnv"}
 	for i := 0; i < randomCases; i++ {
 		label := fmt.Sprintf("case=%d", i)
-		manifest := randomManifest(rng)
+		c := randomManifestCase(rng)
+		manifest := c.manifest
 		data, _ := json.Marshal(manifest)
 
-		code, result := detect(t, map[string]string{"mcp.json": string(data)})
+		files := map[string]string{"mcp.json": string(data)}
+		for name, content := range c.files {
+			files[name] = content
+		}
+		code, result, dir := detectIn(t, files)
 		check(t, "INV_MANIFEST_JSON", code, codeAccept, label+" valid")
 		if code == codeAccept {
-			checkManifestResult(t, "INV_MANIFEST_JSON", result, manifest, label)
+			checkManifestResult(t, "INV_MANIFEST_JSON", result, c.want(dir), label)
 		}
+
+		// The same manifest without a runCmd: empty or whitespace only.
+		blank := manifest
+		blank.RunCmd = []string{"", " ", "\t", " \n "}[rng.Intn(4)]
+		data, _ = json.Marshal(blank)
+		code, _ = detect(t, map[string]string{"mcp.json": string(data)})
+		check(t, "INV_MANIFEST_JSON", code, errManifestInvalid, fmt.Sprintf("%s runCmd=%q", label, blank.RunCmd))
+		data, _ = json.Marshal(manifest)
 
 		// A proper prefix of a JSON object is never valid JSON.
 		cut := rng.Intn(len(data))

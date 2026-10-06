@@ -9,17 +9,28 @@ maps its error to a code below.
 
 - INV_PROJECT_DETECTED: dir ∌ {mcp.json, package.json, pyproject.toml, requirements.txt, go.mod} ⇒ builder.DetectAndBuild(dir) fails -> REJECT(ERR_PROJECT_UNDETECTED)
   Source: README.md "How It Works" step 2; internal/builder/builder.go DetectAndBuild.
-- INV_MANIFEST_JSON: dir ∋ mcp.json ∧ ¬json.Unmarshal(mcp.json, &Manifest) ⇒ builder.DetectAndBuild(dir) fails -> REJECT(ERR_MANIFEST_INVALID)
-  Source: README.md "Custom (mcp.json)"; internal/builder/builder.go buildFromManifest.
+- INV_MANIFEST_JSON: dir ∋ mcp.json ∧ (¬json.Unmarshal(mcp.json, &Manifest) ∨ trim(Manifest.runCmd) = "") ⇒ builder.DetectAndBuild(dir) fails before buildCmd runs -> REJECT(ERR_MANIFEST_INVALID)
+  Source: README.md "Custom (mcp.json)"; internal/builder/builder.go buildFromManifest; required runCmd: maintainer decision, 2026-10-06.
 - INV_SERVER_INSTALLED: os.Stat(cwd/.mcp/servers/name) reports not-exist ⇒ fetcher.GetServerPath(name) fails -> REJECT(ERR_SERVER_NOT_FOUND)
   Source: README.md "Update an Installed Server" and "How It Works" step 1; internal/fetcher/git.go GetServerPath.
 
 The accept side of each invariant is also checked:
 
-- A valid `mcp.json` with an empty `buildCmd` returns its `runCmd`, `args` and
-  `requiredEnv` unchanged; `runCmd` is taken literally, also when it names a
-  program such as `python` or `go`. A nil and an empty list are equal.
-  Source: internal/builder/builder.go buildFromManifest ("For MVP, take literally").
+- A valid `mcp.json` with an empty `buildCmd` returns `requiredEnv` unchanged,
+  and `runCmd` and `args` resolved against the server directory `dir`
+  (MCP clients start the server from another working directory):
+  - `runCmd`: a relative value that contains a path separator (`bin/server`,
+    `./server`) becomes `filepath.Join(dir, runCmd)`. A bare name (`node`,
+    `python`, `go`) stays a PATH lookup. An absolute value stays.
+  - each arg: a non-empty relative arg that does not start with `-` and
+    names an existing file or directory in `dir` (checked after `buildCmd`)
+    becomes `filepath.Join(dir, arg)`. Every other arg (flags starting with
+    `-`, also when a file of that name exists; values; package names such as
+    `@scope/pkg`; relative paths that do not exist; absolute paths; `""`)
+    stays as written.
+  A nil and an empty list are equal.
+  Source: README.md "Custom (mcp.json)" example (`"args": ["dist/index.js"]`,
+  relative to the repo root); maintainer decision, 2026-10-06.
 - `mcp.json` takes precedence over every other marker, so nothing is built.
   Source: internal/builder/builder.go DetectAndBuild ("1. Check for explicit
   mcp.json"). README.md "How It Works" lists `mcp.json` last but states no order.
