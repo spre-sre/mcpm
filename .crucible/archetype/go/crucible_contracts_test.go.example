@@ -1,0 +1,107 @@
+// EXAMPLE Tier 1 contract tests. Not a real test: adapt every TODO(agent).
+//
+// Copy to harness/crucible_contracts_test.go (an external test package that
+// imports the project by its module path). Test names start with TestCrucible
+// and carry the invariant name: TestCrucible_INV_<NAME>_<case>.
+package harness_test
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"sync"
+	"testing"
+
+	// TODO(agent): the project's REAL package, by module path.
+	entrypkg "example.com/TODO/module/pkg"
+)
+
+const (
+	crucibleSeed    = 20240601
+	errExampleLimit = -1  // TODO(agent): code from SPEC.md "## Error codes"
+	exampleLimit    = 100 // TODO(agent): boundary from the spec rule
+)
+
+// Tier 1 result protocol (architecture.md 11.1). The CLI sets CRUCIBLE_RESULTS
+// (a file path) and CRUCIBLE_RESULTS_NONCE. Every SPEC.md invariant must appear
+// with cases > 0 and failures == 0, or Tier 1 fails even when `go test` exits 0.
+// TODO(agent): EVERY invariant name from SPEC.md goes in this list.
+var invariants = []string{"INV_EXAMPLE_LIMIT"}
+
+type tally struct {
+	Cases    int `json:"cases"`
+	Failures int `json:"failures"`
+}
+
+var (
+	mu      sync.Mutex
+	results = map[string]*tally{}
+)
+
+// check counts one case for the invariant and reports a mismatch as a failure.
+func check(t *testing.T, invariant string, got, want int, label string) {
+	t.Helper()
+	mu.Lock()
+	if results[invariant] == nil {
+		results[invariant] = &tally{}
+	}
+	results[invariant].Cases++
+	if got != want {
+		results[invariant].Failures++
+	}
+	mu.Unlock()
+	if got != want {
+		t.Errorf("%s %s: got %d want %d", invariant, label, got, want)
+	}
+}
+
+// TestMain runs the tests, then writes the result file (also when tests fail).
+func TestMain(m *testing.M) {
+	code := m.Run()
+	document := map[string]any{"nonce": os.Getenv("CRUCIBLE_RESULTS_NONCE"),
+		"invariants": map[string]*tally{}}
+	table := document["invariants"].(map[string]*tally)
+	for _, name := range invariants {
+		table[name] = &tally{}
+		if recorded := results[name]; recorded != nil {
+			table[name] = recorded
+		}
+	}
+	data, err := json.Marshal(document)
+	if err == nil {
+		err = os.WriteFile(os.Getenv("CRUCIBLE_RESULTS"), data, 0o600)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot write CRUCIBLE_RESULTS:", err)
+		code = 1
+	}
+	os.Exit(code)
+}
+
+// outcome returns 0 on accept, else the spec error code.
+func outcome(value int) int {
+	// TODO(agent): translate the real result or error into the spec code.
+	if err := entrypkg.TODOEntry(value); err != nil {
+		return errExampleLimit
+	}
+	return 0
+}
+
+// INV_EXAMPLE_LIMIT: value <= limit -> REJECT(ERR_EXAMPLE_LIMIT)  (TODO(agent): rename)
+func TestCrucible_INV_EXAMPLE_LIMIT_boundary(t *testing.T) {
+	check(t, "INV_EXAMPLE_LIMIT", outcome(exampleLimit), 0, "boundary")
+	check(t, "INV_EXAMPLE_LIMIT", outcome(exampleLimit+1), errExampleLimit, "first reject")
+}
+
+func TestCrucible_INV_EXAMPLE_LIMIT_random(t *testing.T) {
+	rng := rand.New(rand.NewSource(crucibleSeed))
+	for i := 0; i < 2000; i++ {
+		value := rng.Intn(2*exampleLimit + 1)
+		want := 0
+		if value > exampleLimit {
+			want = errExampleLimit
+		}
+		check(t, "INV_EXAMPLE_LIMIT", outcome(value), want, fmt.Sprintf("value=%d", value))
+	}
+}

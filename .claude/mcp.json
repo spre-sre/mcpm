@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "crucible": {
+      "command": "python3",
+      "args": [
+        "bin/crucible",
+        "mcp"
+      ]
+    }
+  }
+}

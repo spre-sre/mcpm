@@ -28,3 +28,6 @@ Thumbs.db
 .mcp/
 .mcp.json
 .gemini/
+.crucible/attestation.token
+.crucible/run/
+# Go build outputs

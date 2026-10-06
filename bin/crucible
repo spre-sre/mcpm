@@ -1,0 +1,1412 @@
+#!/usr/bin/env python3
+"""crucible: the verification and admission CLI of the Adversarial Crucible kit.
+
+Standard library only. Every command takes --json: stdout then carries exactly
+one JSON object and nothing else; human logs go to stderr. Exit codes: 0
+success, 1 gate failure, 2 usage or config error, 3 trust error (unpinned or
+changed machinery), 4 internal error. Every subprocess is an argv list (never
+a shell string) with a timeout. See reference/architecture.md sections 4 to 9.
+
+Commands: check-ast, verify, telemetry, promote, install-hooks, status, spec,
+mcp, ci, preflight, and the hook entry points hook-pre-commit, hook-commit-msg,
+hook-post-commit, hook-pre-push (run from the pinned checker snapshot).
+"""
+
+import sys
+
+sys.dont_write_bytecode = True  # never write __pycache__ into gated or pinned trees
+
+import argparse  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+import importlib.util  # noqa: E402
+import io  # noqa: E402
+import json  # noqa: E402
+import math  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import secrets  # noqa: E402
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import subprocess  # noqa: E402
+import tarfile  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+import tomllib  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "scripts"))
+
+import mint_attestation as ma  # noqa: E402
+import verify_pins as vp  # noqa: E402
+from verify_pins import ConfigError, KitError, PathViolation, TrustError, say  # noqa: E402
+
+EXIT_OK, EXIT_GATE, EXIT_USAGE, EXIT_TRUST, EXIT_INTERNAL = 0, 1, 2, 3, 4
+SPEC_REL = "contracts/SPEC.md"
+OUTPUT_TAIL_CHARS = 4000
+AST_TIMEOUT_SECONDS = 600
+MAX_INVARIANTS = 32
+GATE_PASS_VERDICTS = ("PROCEED_CANARY_RAMP", "PROCEED_NO_BASELINE")
+REEXEC_COMMANDS = ("verify", "promote", "telemetry", "status", "check-ast", "spec")
+COMMIT_TIMEOUT_SECONDS = 600
+RESULTS_MAX_BYTES = 1_000_000
+SMOKE_MIN_SAMPLES = 100
+
+INVARIANT_RE = re.compile(
+    r"^- (INV_[A-Z0-9_]+): (\S.*?) -> REJECT\((ERR_[A-Z0-9_]+)\)\s*$")
+ERROR_ROW_RE = re.compile(r"^\|\s*(ERR_[A-Z0-9_]+)\s*\|\s*([-+]?\d+)\s*\|\s*(.*?)\s*\|\s*$")
+GAPS_HEADING_RE = re.compile(r"^##\s+Gaps\s*$", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+
+def new_result(command: str) -> dict:
+    return {"command": command, "verdict": None, "stage": None, "exit_code": 0,
+            "step0": None, "tier1": None, "tier2": None, "token_issued": False,
+            "admitted": False, "commit": None, "reasons": []}
+
+
+def fail(result: dict, stage: str | None, code: int, reason: str, verdict: str = "FAIL") -> dict:
+    result.update(verdict=verdict, stage=stage, exit_code=code)
+    result["reasons"].append(reason)
+    say(f"{result['command']} FAILED ({stage or 'config'}): {reason}")
+    return result
+
+
+def tail(text: str) -> str:
+    return text[-OUTPUT_TAIL_CHARS:]
+
+
+# ---------------------------------------------------------------------------
+# Running commands
+# ---------------------------------------------------------------------------
+
+def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None = None,
+             split: bool = False):
+    """Run an argv list (never a shell) with a timeout, in its own process
+    group so a timeout kills the whole tree. Returns (returncode, output,
+    timed_out, seconds). returncode is 127 when the program cannot start. With
+    split, stderr is relayed to our stderr and `output` is stdout alone."""
+    env = dict(os.environ)  # the CLI adds only the section's env table and CRUCIBLE_* (12.1)
+    env.update(env_extra or {})
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE if split else subprocess.STDOUT,
+                                start_new_session=True)
+    except (OSError, ValueError) as exc:
+        return 127, f"cannot start {argv[0]!r}: {exc}", False, 0.0
+    try:
+        out, err = proc.communicate(timeout=max(timeout, 0.1))
+        timed_out = False
+        if split and err:
+            sys.stderr.write(err.decode(errors="replace"))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        out, _ = proc.communicate()
+        timed_out = True
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.communicate()
+        raise
+    return proc.returncode, out.decode(errors="replace"), timed_out, time.monotonic() - started
+
+
+# ---------------------------------------------------------------------------
+# SPEC.md (section 9)
+# ---------------------------------------------------------------------------
+
+def parse_spec(text: str) -> tuple[dict, list[str]]:
+    """Strict parse. Returns (spec, errors); spec is complete only when errors
+    is empty. Lines inside fenced code blocks are ignored."""
+    errors: list[str] = []
+    invariants: list[dict] = []
+    codes: dict[str, dict] = {}
+    in_fence = False
+    in_errors = False
+    seen_heading = False
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.startswith("## "):
+            in_errors = line[3:].strip().lower() == "error codes"
+            seen_heading = seen_heading or in_errors
+            continue
+        if line.startswith("- INV_") or re.match(r"^\s*-\s*INV_", line):
+            match = INVARIANT_RE.match(line)
+            if not match:
+                errors.append(f"line {number}: malformed invariant (need "
+                              "'- INV_<NAME>: <condition> -> REJECT(ERR_<NAME>)')")
+            else:
+                invariants.append({"name": match[1], "condition": match[2], "error": match[3],
+                                   "code": None})
+            continue
+        if in_errors and re.match(r"^\|\s*ERR_", line):
+            row = ERROR_ROW_RE.match(line)
+            if not row:
+                errors.append(f"line {number}: malformed error-code row "
+                              "(need '| ERR_<NAME> | <negative integer> | <meaning> |')")
+                continue
+            name, code, meaning = row[1], int(row[2]), row[3]
+            if name in codes:
+                errors.append(f"line {number}: duplicate error code row for {name}")
+            elif code >= 0:
+                errors.append(f"line {number}: {name} has code {code}; codes must be negative")
+            else:
+                codes[name] = {"error": name, "code": code, "meaning": meaning}
+    if not seen_heading:
+        errors.append("missing '## Error codes' heading")
+    names = [inv["name"] for inv in invariants]
+    for name in sorted({n for n in names if names.count(n) > 1}):
+        errors.append(f"duplicate invariant name {name}")
+    if not 1 <= len(invariants) <= MAX_INVARIANTS:
+        errors.append(f"need 1 to {MAX_INVARIANTS} invariants, found {len(invariants)}")
+    by_code: dict[int, str] = {}
+    for entry in codes.values():
+        if entry["code"] in by_code:
+            errors.append(f"error code {entry['code']} is used by both "
+                          f"{by_code[entry['code']]} and {entry['error']}")
+        by_code[entry["code"]] = entry["error"]
+    for inv in invariants:
+        if inv["error"] not in codes:
+            errors.append(f"{inv['name']} uses {inv['error']}, which has no code row")
+        else:
+            inv["code"] = codes[inv["error"]]["code"]
+    spec = {"invariants": invariants, "error_codes": sorted(codes.values(), key=lambda c: c["error"]),
+            "sha256": vp.sha256_hex(text.encode())}
+    return spec, errors
+
+
+def load_spec(ws: Path) -> tuple[dict | None, list[str]]:
+    path = ws / SPEC_REL
+    try:
+        text = vp.read_nofollow(path).decode()
+    except (KitError, UnicodeDecodeError, OSError) as exc:
+        return None, [f"cannot read {SPEC_REL}: {exc}"]
+    return parse_spec(text)
+
+
+# ---------------------------------------------------------------------------
+# Step 0 and Tier 1
+# ---------------------------------------------------------------------------
+
+def _reject_constant(name: str):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def check_engine_output(code: int, output: str) -> tuple[dict | None, str | None]:
+    """The AST engine contract: exit 0, 1 or 2, and stdout is one JSON object
+    {"ok": bool, "violations": [str], ...}. Returns (report, problem)."""
+    if code not in (0, 1, 2):
+        return None, f"engine exited with {code}; allowed exit codes are 0, 1 and 2"
+    try:
+        report = json.loads(output, parse_constant=_reject_constant)
+    except ValueError as exc:
+        return None, f"engine output is not one JSON object: {exc}"
+    if not isinstance(report, dict) or not isinstance(report.get("ok"), bool):
+        return None, "engine output needs a boolean 'ok'"
+    violations = report.get("violations")
+    if not isinstance(violations, list) or not all(isinstance(v, str) for v in violations):
+        return report, "engine output needs 'violations' as a list of strings"
+    if (code == 0) != report["ok"]:
+        return report, f"engine exit code {code} contradicts ok={report['ok']}"
+    return report, None
+
+
+def gaps_text(text: str) -> str:
+    """The text under the `## Gaps` heading of SPEC.md (up to the next heading
+    of level 1 or 2), whitespace-normalized. Fenced blocks are ignored."""
+    collected: list[str] = []
+    in_fence = in_gaps = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.match(r"^#{1,2}\s", line):
+            in_gaps = bool(GAPS_HEADING_RE.match(line))
+            continue
+        if in_gaps:
+            collected.append(line)
+    return " ".join(" ".join(collected).split())
+
+
+def none_reason_in_gaps(ws: Path, reason: str) -> bool:
+    try:
+        text = vp.read_nofollow(ws / SPEC_REL).decode()
+    except (KitError, UnicodeDecodeError, OSError):
+        return False
+    return " ".join(reason.split()) in gaps_text(text)
+
+
+def run_ast(ws: Path, cfg: dict) -> dict:
+    """Run `[ast] command` and check its JSON contract. An empty command
+    passes with a warning only when `[ast] none_reason` is a non-empty string
+    whose text also appears under `## Gaps` in SPEC.md."""
+    command = cfg["ast"]["command"]
+    if not command:
+        reason = cfg["ast"]["none_reason"].strip()
+        if not reason:
+            return {"command": [], "passed": False, "report": None,
+                    "error": "[ast] command is empty and [ast] none_reason is empty (fail closed)"}
+        if not none_reason_in_gaps(ws, reason):
+            return {"command": [], "passed": False, "report": None,
+                    "error": f"[ast] none_reason must also appear under a '## Gaps' heading in "
+                             f"{SPEC_REL}; the reader of the spec must see what is not checked"}
+        say(f"WARNING: no AST engine configured; none_reason: {reason}")
+        return {"command": [], "passed": True, "report": None,
+                "warning": f"no AST engine: {reason}"}
+    code, output, timed_out, seconds = run_argv(vp.expand_command(command), ws,
+                                                AST_TIMEOUT_SECONDS, env_extra=cfg["ast"]["env"],
+                                                split=True)
+    result = {"command": command, "exit_code": code, "duration_seconds": round(seconds, 3),
+              "report": None}
+    if timed_out:
+        return {**result, "passed": False, "error": "AST command timed out"}
+    if code == 127:
+        return {**result, "passed": False, "error": output}
+    report, problem = check_engine_output(code, output)
+    result["report"] = report
+    if problem:
+        return {**result, "passed": False, "error": problem}
+    result["passed"] = code == 0 and not report["violations"]
+    if not result["passed"]:
+        result["error"] = "; ".join(report["violations"][:5]) or f"engine exited with {code}"
+    return result
+
+
+def read_contract_tests(ws: Path, entries: list[str]) -> tuple[str, list[str], list[str]]:
+    """(combined text, files read, problems) for the explicit contract_tests list."""
+    text, read, problems = [], [], []
+    if not entries:
+        problems.append("[tier1] contract_tests is empty; list the files that name the invariants")
+    for entry in entries:
+        try:
+            text.append(vp.read_nofollow(ws / entry).decode(errors="replace"))
+            read.append(entry)
+        except (KitError, OSError):
+            problems.append(f"contract test file {entry} is missing or not a regular file")
+    return "".join(text), read, problems
+
+
+def run_step0(ws: Path, cfg: dict, rules) -> dict:
+    ast = run_ast(ws, cfg)
+    spec, spec_errors = load_spec(ws)
+    closure_report = vp.command_closure(ws, cfg, rules)
+    closure = closure_report["unpinned"]
+    text, files, problems = read_contract_tests(ws, cfg["tier1"]["contract_tests"])
+    coverage = {"checked": bool(spec and not spec_errors), "missing": [], "files": files}
+    if coverage["checked"]:
+        coverage["missing"] = [i["name"] for i in spec["invariants"] if i["name"] not in text]
+    reasons = []
+    if closure:
+        reasons.append("command closure: these files are run or read by the gate commands but "
+                       "are not pinned: " + ", ".join(closure))
+    if not ast["passed"]:
+        reasons.append(f"AST gate failed: {ast.get('error') or 'see step0.ast.report'}")
+    reasons += [f"SPEC.md: {e}" for e in spec_errors]
+    reasons += problems
+    if coverage["missing"]:
+        reasons.append("spec invariants not named in any contract_tests file: "
+                       + ", ".join(coverage["missing"]))
+    return {"passed": not reasons, "ast": ast, "command_closure": closure_report,
+            "spec": {"ok": not spec_errors, "errors": spec_errors,
+                     "invariants": len(spec["invariants"]) if spec else 0,
+                     "sha256": spec["sha256"] if spec else None},
+            "invariant_coverage": coverage, "reasons": reasons}
+
+
+def _unique_pairs(pairs):
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key in the results file")
+    return dict(pairs)
+
+
+def check_tier1_results(path: Path, nonce: str, names: list[str]) -> tuple[dict | None, list[str]]:
+    """Strictly validate the results file the contract tests wrote (section
+    11.1). Returns ({invariant: {"cases", "failures"}}, problems). Passing needs
+    no problems: strict JSON, our nonce, every spec invariant with cases > 0 and
+    failures == 0, and no unknown invariant."""
+    try:
+        raw = vp.read_nofollow(path)
+    except (KitError, OSError):
+        return None, ["the contract tests wrote no results file ($CRUCIBLE_RESULTS); a process "
+                      "that exits early or never reports cannot pass Tier 1"]
+    if len(raw) > RESULTS_MAX_BYTES:
+        return None, [f"the results file is larger than {RESULTS_MAX_BYTES} bytes"]
+    try:
+        data = json.loads(raw.decode(), parse_constant=_reject_constant,
+                          object_pairs_hook=_unique_pairs)
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, [f"the results file is not strict JSON: {exc}"]
+    if not isinstance(data, dict) or not isinstance(data.get("invariants"), dict):
+        return None, ['the results file needs {"nonce": ..., "invariants": {...}}']
+    if not isinstance(data.get("nonce"), str) or not hmac.compare_digest(data["nonce"], nonce):
+        return None, ["the results file does not carry this run's nonce ($CRUCIBLE_RESULTS_NONCE)"]
+    invariants, problems = data["invariants"], []
+    for name in names:
+        entry = invariants.get(name)
+        cases = entry.get("cases") if isinstance(entry, dict) else None
+        failures = entry.get("failures") if isinstance(entry, dict) else None
+        if not isinstance(entry, dict) or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in (cases, failures)):
+            problems.append(f"{name}: no integer cases and failures in the results file")
+        elif cases <= 0:
+            problems.append(f"{name}: ran {vp.plural(cases, 'case')}; every invariant needs at least one")
+        elif failures != 0:
+            problems.append(f"{name}: {vp.plural(failures, 'case')} failed")
+    problems += [f"{name}: unknown invariant in the results file" for name in sorted(invariants)
+                 if name not in names]
+    report = {name: {"cases": entry.get("cases"), "failures": entry.get("failures")}
+              for name, entry in invariants.items() if isinstance(entry, dict)}
+    return report, problems
+
+
+def run_tier1(ws: Path, cfg: dict) -> dict:
+    """Run `[tier1] command` with the result protocol (section 11.1): a results
+    path in a fresh temp directory outside the repository and a random nonce.
+    Tier 1 passes only if the command exits 0 and the results validate."""
+    command = cfg["tier1"]["command"]
+    out = {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": False,
+           "invariants": None}
+    if not command or not all(isinstance(c, str) and c for c in command):
+        return {**out, "error": "tier1.command is empty or missing (fail closed)"}
+    spec, spec_errors = load_spec(ws)
+    if spec_errors:
+        return {**out, "error": "SPEC.md is invalid; Tier 1 cannot check its invariants"}
+    names = [inv["name"] for inv in spec["invariants"]]
+    scratch = Path(tempfile.mkdtemp(prefix="crucible-tier1-")).resolve()
+    try:
+        if scratch == ws.resolve() or ws.resolve() in scratch.parents:
+            return {**out, "error": "the temporary directory is inside the repository; point "
+                                    "TMPDIR outside it"}
+        results, nonce = scratch / "results.json", secrets.token_hex(16)
+        code, output, timed_out, seconds = run_argv(
+            vp.expand_command(command), ws, cfg["tier1"]["timeout_seconds"],
+            env_extra={**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results),
+                       "CRUCIBLE_RESULTS_NONCE": nonce})
+        out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
+                   timed_out=timed_out)
+        if timed_out or code != 0:
+            return out
+        report, problems = check_tier1_results(results, nonce, names)
+        out["invariants"] = report
+        if problems:
+            out["error"] = "Tier 1 results rejected: " + "; ".join(problems[:6])
+        return out
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def tier1_failed(t1: dict) -> bool:
+    return bool(t1.get("error")) or t1["timed_out"] or t1["exit_code"] != 0
+
+
+# ---------------------------------------------------------------------------
+# Trust gate shared by verify, telemetry, promote
+# ---------------------------------------------------------------------------
+
+def trust_gate(ws: Path, result: dict):
+    """The anchor, the pinned set and the pinned environment. Returns (state, trust, secret, cfg, rules,
+    tree) or None after recording the failure in `result`."""
+    try:
+        state, trust, secret, cfg, rules = vp.require_anchor(ws)
+        tree = vp.working_tree(ws, rules)
+        vp.require_pins(trust, tree, rules, "work tree")
+        vp.require_environment(ws, trust, cfg, rules)
+    except PathViolation as exc:
+        fail(result, "step0", EXIT_GATE, str(exc))
+        return None
+    except TrustError as exc:
+        fail(result, "trust", EXIT_TRUST, str(exc))
+        return None
+    return state, trust, secret, cfg, rules, tree
+
+
+def gate_stages(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
+    """Step 0 then Tier 1. True when both passed; otherwise `result` holds the
+    failure. Also proves the gated tree did not change while Tier 1 ran."""
+    step0 = run_step0(ws, cfg, rules)
+    result["step0"] = step0
+    if not step0["passed"]:
+        for reason in step0["reasons"]:
+            result["reasons"].append(reason)
+        fail(result, "step0", EXIT_GATE, "Step 0 failed")
+        return False
+    tier1 = run_tier1(ws, cfg)
+    result["tier1"] = {k: tier1[k] for k in ("exit_code", "duration_seconds", "output_tail",
+                                              "invariants")}
+    if tier1["timed_out"]:
+        fail(result, "timeout", EXIT_GATE, "Tier 1 timed out")
+        return False
+    if tier1_failed(tier1):
+        fail(result, "tier1", EXIT_GATE, tier1.get("error") or
+             f"Tier 1 exited with {tier1['exit_code']}")
+        return False
+    try:
+        after = vp.working_tree(ws, rules)
+    except PathViolation as exc:
+        fail(result, "tier1", EXIT_GATE, str(exc))
+        return False
+    if after != tree:
+        delta = vp.diff_maps(tree, after)
+        fail(result, "tier1", EXIT_GATE,
+             f"the gated tree changed while Tier 1 ran: {delta}; no token issued")
+        return False
+    return True
+
+
+def issue_token(ws: Path, secret: bytes, cfg: dict, tree: dict, result: dict, level: str,
+                verdict: str, tier2: dict | None) -> dict:
+    report = {"step0": result["step0"], "tier1": result["tier1"], "tier2": tier2}
+    payload = ma.build_payload(level=level, secret=secret, parent=vp.head_commit(ws),
+                               files=tree, verdict=verdict, report=report,
+                               ttl_seconds=cfg["attestation"]["ttl_seconds"], tier2=tier2)
+    ma.write_token(ws, ma.sign_payload(payload, secret))
+    result["token_issued"] = True
+    say(f"{level.upper()} PASSED: token issued (nonce {payload['nonce'][:12]}..., "
+        f"{vp.plural(len(tree), 'gated file')}, expires {payload['expires_at']})")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 (section 8)
+# ---------------------------------------------------------------------------
+
+def load_telemetry_math(ws: Path):
+    path = ws / "harness" / "telemetry_math.py"
+    if not path.is_file():
+        raise KitError("harness/telemetry_math.py is missing (fail closed)")
+    spec = importlib.util.spec_from_file_location("crucible_telemetry_math", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, "evaluate_gate", None)):
+        raise KitError("harness/telemetry_math.py has no evaluate_gate")
+    return module
+
+
+def extract_head(ws: Path, destination: Path) -> None:
+    data = vp.git(ws, "archive", "--format=tar", "HEAD", timeout=600)
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        if hasattr(tarfile, "data_filter"):
+            archive.extractall(destination, filter="data")
+        else:  # pragma: no cover - old interpreters
+            for member in archive.getmembers():
+                if member.name.startswith(("/", "..")) or ".." in Path(member.name).parts:
+                    raise KitError(f"unsafe path in git archive: {member.name}")
+            archive.extractall(destination)
+
+
+def command_for(ws: Path, command: list[str], cwd: Path, rules) -> list[str]:
+    """Resolve a tier2 command for a tree. Ungated work-tree files (a local
+    interpreter) become absolute so a baseline tree without them still runs."""
+    resolved = []
+    for element in vp.expand_command(command):
+        if cwd != ws and not element.startswith(("-", "/")) and (ws / element).is_file() \
+                and not rules.is_gated(element):
+            resolved.append(str(ws / element))
+        else:
+            resolved.append(element)
+    return resolved
+
+
+def validate_driver_output(path: Path, samples: int) -> tuple[list, list]:
+    """Fail closed: exactly `samples` finite latencies and as many finite
+    memory readings. Anything else is an error."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise KitError(f"driver wrote no valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise KitError("driver output is not a JSON object")
+    series = {}
+    for key in ("latencies_ns", "memory_bytes"):
+        values = data.get(key)
+        if not isinstance(values, list) or len(values) != samples:
+            raise KitError(f"driver {key} must be a list of exactly {samples} numbers")
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(value):
+                raise KitError(f"driver {key} holds a non-finite or non-numeric value")
+        series[key] = [float(v) for v in values]
+    return series["latencies_ns"], series["memory_bytes"]
+
+
+def run_driver(ws: Path, tree: Path, command: list[str], rules, samples: int, seed: int,
+               scratch: Path, deadline: float, env: dict | None = None) -> tuple[list, list]:
+    out = scratch / f"out-{secrets.token_hex(4)}.json"
+    argv = command_for(ws, command, tree, rules) + [
+        "--root", str(tree), "--samples", str(samples), "--seed", str(seed), "--out", str(out)]
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Tier 2 time budget exhausted")
+    code, output, timed_out, _ = run_argv(argv, tree, remaining, env_extra=env)
+    if timed_out:
+        raise TimeoutError("the telemetry driver timed out")
+    if code != 0:
+        raise KitError(f"telemetry driver exited with {code}: {tail(output)[-500:]}")
+    return validate_driver_output(out, samples)
+
+
+def driver_problems(tree: Path, cfg: dict, rules, drivers: list[str], label: str) -> list[str]:
+    """Why the driver set of `cfg` cannot run in `tree`, or []. Fail closed on
+    an empty set (12.2) and on a configured driver path the tree lacks."""
+    if not cfg["tier2"]["command"] or not all(isinstance(c, str) and c
+                                              for c in cfg["tier2"]["command"]):
+        return [f"{label} tier2.command is empty or missing (fail closed)"]
+    missing = [d for d in cfg["tier2"]["driver_paths"] if not (tree / d).exists()]
+    if missing:
+        return [f"{label} [tier2] driver_paths names {', '.join(missing)}, which does not exist"]
+    if not drivers:
+        return [f"{label} tier2.command and driver_paths name no gated driver file or directory "
+                "(a driver must be a pinned path: name it in the command, or list it in "
+                "[tier2] driver_paths)"]
+    return []
+
+
+def baseline_config_bytes(ws: Path, head: str | None) -> bytes | None:
+    """HEAD's own .crucible/config.toml, or None when HEAD has none."""
+    if not head or not vp.git_ok(ws, "cat-file", "-e", f"{head}:{vp.CONFIG_REL}"):
+        return None
+    return vp.git(ws, "show", f"{head}:{vp.CONFIG_REL}", timeout=60)
+
+
+def baseline_has_tier2(raw_config: bytes) -> bool:
+    """True when HEAD's config has a [tier2] section. Unreadable TOML is an
+    error, never "no baseline": a damaged config cannot restart the comparison."""
+    try:
+        data = tomllib.loads(raw_config.decode())
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise KitError(f"HEAD's own {vp.CONFIG_REL} is not valid TOML ({exc}); the baseline "
+                       "cannot be measured. Restore a valid pinned config at HEAD") from exc
+    return isinstance(data, dict) and "tier2" in data
+
+
+def promotion_commits_since(ws: Path, genesis: str | None, head: str) -> list[str]:
+    """Commits in genesis..HEAD whose message carries a promotion trailer."""
+    exclude = [f"^{genesis}"] if genesis else []
+    found = []
+    for commit in vp.git(ws, "rev-list", head, *exclude).decode().split():
+        fields = ma.parse_trailer(ma.commit_message(ws, commit), ws)
+        if fields and fields.get("level") == "promotion":
+            found.append(commit)
+    return found
+
+
+def first_adoption_problems(ws: Path, genesis: str | None, head: str | None,
+                            prior_promotions: bool) -> list[str]:
+    """Empty when PROCEED_NO_BASELINE is legitimate (12.4): HEAD has no tier2
+    configuration (checked by the caller), no commit in genesis..HEAD carries a
+    promotion trailer, and the ledger holds no promotion. Each failing
+    condition is named with its remedy."""
+    problems = []
+    if not head:
+        return ["the repository has no commit; commit the work first"]
+    if genesis and not vp.git_ok(ws, "merge-base", "--is-ancestor", f"{genesis}^{{commit}}", head):
+        problems.append(
+            f"the pinned genesis {genesis[:12]} is not an ancestor of HEAD: the history was "
+            "rewritten or replaced, so there is no legitimate baseline. Restore the original "
+            "history; only a human can re-anchor (install-hooks --repin)")
+        return problems
+    admitted = promotion_commits_since(ws, genesis, head)
+    if admitted:
+        problems.append(
+            f"commit {admitted[0][:12]} between genesis and HEAD carries a promotion trailer, "
+            "so this is not a first adoption, but HEAD has no .crucible/config.toml with a "
+            "[tier2] section to measure against. Restore the pinned config and driver at HEAD "
+            "(a rolled-back tree cannot restart the comparison)")
+    if prior_promotions:
+        problems.append(
+            "this clone's ledger records an earlier promotion, so this is not a first adoption, "
+            "but HEAD has no .crucible/config.toml with a [tier2] section to measure against. "
+            "Restore the pinned config and driver at HEAD (a reset cannot restart the comparison)")
+    return problems
+
+
+def prepare_baseline(ws: Path, head: str, base_dir: Path, raw_config: bytes) -> tuple:
+    """Extract HEAD and read ITS config (12.3). Returns (cfg, rules, drivers,
+    problems): the baseline is measured with its own command, env and drivers."""
+    base_dir.mkdir()
+    extract_head(ws, base_dir)
+    try:
+        base_cfg = vp.parse_config(raw_config.decode())
+    except (ConfigError, UnicodeDecodeError) as exc:
+        return None, None, [], [f"HEAD's own {vp.CONFIG_REL} is unusable ({exc}); the baseline "
+                                "cannot be measured. Restore a valid pinned config at HEAD"]
+    base_rules = vp.GateRules(base_cfg)
+    drivers = vp.tier2_driver_set(base_dir, base_cfg, base_rules, ignored=lambda _tree, _rel: False)
+    problems = driver_problems(base_dir, base_cfg, base_rules, drivers, "the baseline (HEAD)")
+    return base_cfg, base_rules, drivers, problems
+
+
+def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
+              genesis: str | None = None, prior_promotions: bool = False) -> dict:
+    """Run Tier 2. Returns {"verdict", "stage", "reasons", ...}; verdict is one
+    of PROCEED_CANARY_RAMP, PROCEED_NO_BASELINE or a REJECT/ERROR verdict.
+    The baseline tree runs with its own [tier2] command, env and driver paths
+    (12.3). A baseline whose tree has no [tier2] configuration is legitimate
+    only as a first adoption (12.4); anywhere else it is ERROR_TIER2."""
+    tier2 = cfg["tier2"]
+    command = tier2["command"]
+    out = {"verdict": "ERROR_TIER2", "stage": "tier2", "reasons": [], "baseline_commit": None,
+           "seed": None, "rounds": tier2["rounds"], "samples_per_round": None,
+           "ci_method": None, "gate": None}
+    drivers = vp.tier2_driver_set(ws, cfg, rules)
+    problems = driver_problems(ws, cfg, rules, drivers, "the candidate")
+    if problems:
+        out["reasons"] += problems
+        return out
+    per_round = tier2["samples"] // tier2["rounds"]
+    if per_round < 1:
+        out["reasons"].append("tier2.samples must be at least tier2.rounds")
+        return out
+    out["samples_per_round"] = per_round
+    try:
+        math_module = load_telemetry_math(ws)
+    except (KitError, OSError, SyntaxError) as exc:
+        out["reasons"].append(str(exc))
+        return out
+    base_seed = secrets.randbits(31) if seed is None else seed
+    out["seed"] = base_seed
+    head = vp.head_commit(ws)
+    out["baseline_commit"] = head
+    deadline = time.monotonic() + tier2["timeout_seconds"]
+    scratch = Path(tempfile.mkdtemp(prefix="crucible-tier2-"))
+    try:
+        raw_config = baseline_config_bytes(ws, head)
+        has_baseline = raw_config is not None and baseline_has_tier2(raw_config)
+        base_dir = scratch / "baseline"
+        base = None
+        if has_baseline:
+            base_cfg, base_rules, _drivers, base_problems = prepare_baseline(
+                ws, head, base_dir, raw_config)
+            if base_problems:
+                out["reasons"] += base_problems
+                return out
+            base = (base_cfg, base_rules)
+        else:
+            problems = first_adoption_problems(ws, genesis, head, prior_promotions)
+            if problems:
+                out["reasons"] += problems
+                return out
+        base_lat, cand_lat, base_mem, cand_mem = [], [], [], []  # one series per round
+        for index in range(tier2["rounds"] if has_baseline else 1):
+            round_seed = base_seed + index
+            sides = ("A", "B") if index % 2 == 0 else ("B", "A")  # ABBA interleaving
+            for side in sides:
+                if side == "A" and not has_baseline:
+                    continue
+                if side == "A":
+                    lat, mem = run_driver(ws, base_dir, base[0]["tier2"]["command"], base[1],
+                                          per_round, round_seed, scratch, deadline,
+                                          env=base[0]["tier2"]["env"])
+                else:
+                    lat, mem = run_driver(ws, ws, command, rules, per_round, round_seed,
+                                          scratch, deadline, env=tier2["env"])
+                (base_lat if side == "A" else cand_lat).append(lat)  # one list per round
+                (base_mem if side == "A" else cand_mem).append(mem)  # one series per round
+        if not has_baseline:
+            out.update(verdict="PROCEED_NO_BASELINE", stage=None,
+                       reasons=["first adoption: HEAD has no [tier2] configuration; the candidate "
+                                "driver ran and its output validated, nothing to compare"])
+            say("TIER 2: PROCEED_NO_BASELINE (first adoption)")
+            return out
+        gate = math_module.evaluate_gate(base_lat, cand_lat, base_mem, cand_mem,
+                                         dict(tier2), base_seed)
+    except TimeoutError as exc:
+        out.update(verdict="ERROR_TIMEOUT", stage="timeout", reasons=[str(exc)])
+        return out
+    except (KitError, ValueError, OSError, tarfile.TarError) as exc:
+        out["reasons"].append(str(exc))
+        return out
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    out["gate"] = gate
+    out["rounds"] = gate.get("rounds") or out["rounds"]
+    out["ci_method"] = gate.get("ci_method")
+    out["verdict"] = str(gate.get("verdict"))
+    out["reasons"] = [str(r) for r in gate.get("reasons", [])]
+    if out["verdict"] in GATE_PASS_VERDICTS:
+        out["stage"] = None
+    say(f"TIER 2: {out['verdict']}")
+    return out
+
+
+def smoke_samples(tier2: dict) -> int:
+    configured = tier2.get("smoke_samples")
+    return configured if configured else max(tier2["min_samples"], SMOKE_MIN_SAMPLES)
+
+
+def resolution_problems(math_module, latencies: list) -> list[str]:
+    """The Tier 2 gate rejects samples whose timer resolution is too coarse
+    (12.8); preflight applies the same check, with the same function, to the
+    smoke run so the problem surfaces before ratification."""
+    check = getattr(math_module, "sample_resolution", None)
+    if check is None:
+        return ["harness/telemetry_math.py has no sample_resolution: the resolution check "
+                "cannot run (fail closed)"]
+    info = check(latencies)
+    if info["ok"]:
+        return []
+    reason = getattr(math_module, "COARSE_REASON", "driver resolution too coarse")
+    return [f"{reason} (smoke run: quantum {info['quantum']:.6g} ns, median {info['median']:.6g} "
+            f"ns, {info['distinct_fraction']:.1%} distinct values)"]
+
+
+def run_tier2_smoke(ws: Path, cfg: dict, rules) -> dict:
+    """One candidate-only driver run for preflight: the driver starts, writes
+    the output contract, every value is finite and the timer resolution is fine
+    enough (12.8). Nothing is compared."""
+    tier2 = cfg["tier2"]
+    command = tier2["command"]
+    count = smoke_samples(tier2)
+    out = {"smoke": True, "ok": False, "samples": count, "reasons": [], "stage": "tier2"}
+    problems = driver_problems(ws, cfg, rules, vp.tier2_driver_set(ws, cfg, rules), "the candidate")
+    if problems:
+        out["reasons"] += problems
+        return out
+    scratch = Path(tempfile.mkdtemp(prefix="crucible-smoke-"))
+    try:
+        math_module = load_telemetry_math(ws)
+        lat, mem = run_driver(ws, ws, command, rules, count, 1, scratch,
+                              time.monotonic() + tier2["timeout_seconds"], env=tier2["env"])
+        median = sorted(lat)[len(lat) // 2]
+        out.update(latency_median_ns=median, latency_max_ns=max(lat), memory_points=len(mem))
+        if median <= 0:
+            out["reasons"].append("the driver reported a median latency <= 0: drift would be undefined")
+        else:
+            out["reasons"] += resolution_problems(math_module, lat)
+        if not out["reasons"]:
+            out.update(ok=True, stage=None)
+    except TimeoutError as exc:
+        out.update(stage="timeout", reasons=[str(exc)])
+    except (KitError, OSError, SyntaxError) as exc:
+        out["reasons"].append(str(exc))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return out
+
+
+def tier2_summary(t2: dict) -> dict:
+    """What a token and the JSON result carry: the verdict and the statistics."""
+    return json.loads(json.dumps(t2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_check_ast(ws: Path, args) -> dict:
+    result = new_result("check-ast")
+    try:
+        cfg = vp.load_config(ws / vp.CONFIG_REL)
+    except ConfigError as exc:
+        return fail(result, None, EXIT_USAGE, str(exc))
+    ast = run_ast(ws, cfg)
+    result["step0"] = {"ast": ast}
+    if ast["passed"]:
+        result["verdict"] = "PASS"
+    else:
+        fail(result, "step0", EXIT_GATE, f"AST gate failed: {ast.get('error') or 'see step0'}")
+    return result
+
+
+def cmd_verify(ws: Path, args) -> dict:
+    result = new_result("verify")
+    ma.remove_token(ws)  # a new verification always invalidates the old token
+    gate = trust_gate(ws, result)
+    if gate is None:
+        return result
+    _state, _trust, secret, cfg, rules, tree = gate
+    if not gate_stages(ws, cfg, rules, tree, result):
+        return result
+    issue_token(ws, secret, cfg, tree, result, "verify", "PASS", None)
+    result["verdict"] = "PASS"
+    return result
+
+
+def cmd_telemetry(ws: Path, args) -> dict:
+    result = new_result("telemetry")
+    gate = trust_gate(ws, result)
+    if gate is None:
+        return result
+    state, trust, _secret, cfg, rules, _tree = gate
+    t2 = run_tier2(ws, cfg, rules, seed=getattr(args, "seed", None),
+                   genesis=trust.get("genesis"),
+                   prior_promotions=bool(ma.promotion_commits(state)))
+    result["tier2"] = tier2_summary(t2)
+    result["verdict"] = t2["verdict"]
+    if t2["verdict"] not in GATE_PASS_VERDICTS:
+        result["reasons"] += t2["reasons"]
+        result.update(stage=t2["stage"] or "tier2", exit_code=EXIT_GATE)
+    return result
+
+
+def stage_gated(ws: Path, rules) -> list[str]:
+    paths = set(vp.work_tree_listing(ws)) | set(vp.index_listing(ws))
+    return sorted(p for p in paths if rules.is_gated(p) and not vp.is_local_state(p))
+
+
+def admit(ws: Path, secret: bytes, rules, payload: dict, message: str, result: dict) -> dict:
+    """git add of the gated paths, then git commit through the hooks. A SIGTERM
+    during this block is held until it ends (defer_sigterm)."""
+    old_head = vp.head_commit(ws)
+    with ma.defer_sigterm():
+        paths = stage_gated(ws, rules)
+        if paths:
+            vp.git(ws, "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul",
+                   input_bytes=b"\0".join(f":(literal){p}".encode("utf-8", "surrogateescape")
+                                          for p in paths), timeout=600)
+        staged = vp.staged_tree(ws, rules)
+        if staged != payload["files"]:
+            return fail(result, "admission", EXIT_GATE,
+                        f"staged gated tree differs from the promoted tree: "
+                        f"{vp.diff_maps(payload['files'], staged)}; not committing",
+                        verdict=result["verdict"] or "FAIL")
+        say("ADMISSION: committing the promoted tree through the hooks")
+        proc = subprocess.run(["git", "-C", str(ws), "commit", "-m", message],
+                              capture_output=True, timeout=COMMIT_TIMEOUT_SECONDS)
+    sys.stderr.write(proc.stderr.decode(errors="replace"))
+    new_head = vp.head_commit(ws)
+    if proc.returncode != 0 or new_head == old_head:
+        return fail(result, "admission", EXIT_GATE,
+                    "git commit failed or HEAD did not move: "
+                    + tail(proc.stderr.decode(errors="replace"))[-600:],
+                    verdict=result["verdict"] or "FAIL")
+    try:
+        level = ma.verify_commit_trailer(ws, secret, new_head)
+        if level != "promotion":
+            raise ma.AttestationError(f"new commit carries a '{level}' trailer, not promotion")
+    except KitError as exc:
+        return fail(result, "admission", EXIT_GATE,
+                    f"commit {new_head[:12]} was created but its trailer is not valid: {exc}",
+                    verdict=result["verdict"] or "FAIL")
+    result.update(admitted=True, commit=new_head)
+    say(f"ADMITTED as {new_head[:12]}")
+    return result
+
+
+def cmd_promote(ws: Path, args) -> dict:
+    result = new_result("promote")
+    message = args.message
+    if not message or not message.strip():
+        return fail(result, "admission", EXIT_USAGE, "promote needs a non-empty message (-m)")
+    try:
+        ma.reject_trailer_in_message(message)
+    except KitError as exc:
+        return fail(result, "admission", EXIT_GATE, str(exc))
+    ma.remove_token(ws)
+    gate = trust_gate(ws, result)
+    if gate is None:
+        return result
+    state, trust, secret, cfg, rules, tree = gate
+    genesis = trust.get("genesis")
+    if genesis and not vp.git_ok(ws, "merge-base", "--is-ancestor", f"{genesis}^{{commit}}", "HEAD"):
+        return fail(result, "trust", EXIT_TRUST,
+                    f"the pinned genesis commit {genesis[:12]} is not an ancestor of HEAD: the "
+                    "history was rewritten or replaced; promote refuses")
+    if not gate_stages(ws, cfg, rules, tree, result):
+        return result
+    t2 = run_tier2(ws, cfg, rules, seed=getattr(args, "seed", None), genesis=genesis,
+                   prior_promotions=bool(ma.promotion_commits(state)))
+    result["tier2"] = tier2_summary(t2)
+    result["verdict"] = t2["verdict"]
+    if t2["verdict"] not in GATE_PASS_VERDICTS:
+        result["reasons"] += t2["reasons"]
+        result.update(stage=t2["stage"] or "tier2", exit_code=EXIT_GATE)
+        say("promotion REJECTED; no token issued, nothing committed")
+        return result
+    payload = issue_token(ws, secret, cfg, tree, result, "promotion", t2["verdict"],
+                          {"verdict": t2["verdict"], "baseline_commit": t2["baseline_commit"],
+                           "seed": t2["seed"]})
+    return admit(ws, secret, rules, payload, message, result)
+
+
+def cmd_install_hooks(ws: Path, args) -> dict:
+    result = new_result("install-hooks")
+    try:
+        summary = vp.install_hooks(ws, repin=args.repin)
+    except ConfigError as exc:
+        return fail(result, None, EXIT_USAGE, str(exc))
+    except KitError as exc:
+        return fail(result, "trust", EXIT_TRUST, str(exc))
+    result["verdict"] = "PINNED" if summary["pinned"] else "UNCHANGED"
+    result["step0"] = None
+    result["install"] = summary
+    return result
+
+
+def porcelain_clean(ws: Path) -> bool:
+    out = vp.split_z(vp.git(ws, "status", "--porcelain=v1", "-z", "--no-renames"))
+    return not [e for e in out if not vp.is_local_state(e[3:])]
+
+
+def token_status(ws: Path, anchor, head: str | None) -> dict:
+    status = {"state": "NONE", "reason": None}
+    if not (ws / vp.TOKEN_REL).exists() and not (ws / vp.TOKEN_REL).is_symlink():
+        return status
+    if anchor is None:
+        return {"state": "INVALID", "reason": "no verified anchor to check the token against"}
+    state, trust, secret, cfg, rules = anchor
+    try:
+        token = ma.read_token(ws)
+        payload = ma.check_token(token, secret, trust["kid"], ma.consumed_nonces(state), head)
+        status.update(state="VALID", level=payload["level"], verdict=payload["verdict"],
+                      expires_at=payload["expires_at"], nonce=payload["nonce"][:12])
+        status["matches_work_tree"] = payload["files"] == vp.working_tree(ws, rules)
+        status["matches_staged"] = payload["files"] == vp.staged_tree(ws, rules)
+        if not status["matches_work_tree"]:
+            status.update(state="INVALID", reason="gated work tree differs from the verified tree")
+    except KitError as exc:
+        status.update(state="INVALID", reason=str(exc))
+    return status
+
+
+def cmd_status(ws: Path, args) -> dict:
+    result = new_result("status")
+    head = vp.head_commit(ws)
+    branch = subprocess.run(["git", "-C", str(ws), "symbolic-ref", "--short", "-q", "HEAD"],
+                            capture_output=True, text=True,
+                            timeout=vp.GIT_TIMEOUT_SECONDS).stdout.strip() or None
+    state = vp.state_dir(ws, create=False)
+    anchor = None
+    pin_status, differences, anchor_error = "NO_ANCHOR", {"modified": [], "added": [], "removed": []}, None
+    trust = vp.load_trust(state) if state.is_dir() else None
+    if trust is not None:
+        try:
+            anchor = vp.require_anchor(ws)
+            _s, trust, _k, _c, rules = anchor
+            differences = vp.pin_differences(trust, vp.working_tree(ws, rules), rules)
+            pin_status = "DIFFER" if any(differences.values()) else "MATCH"
+        except KitError as exc:
+            pin_status, anchor_error = "DIFFER", str(exc)
+    closure = {"unpinned": [], "exempt": [], "closure_files": []}
+    environment_changes = None
+    try:
+        cfg = anchor[3] if anchor else vp.load_config(ws / vp.CONFIG_REL)
+        closure = vp.command_closure(ws, cfg, vp.GateRules(cfg))
+        if anchor:
+            environment_changes = vp.diff_maps(anchor[1].get("environment") or {},
+                                               vp.environment_digests(ws, cfg, anchor[4]))
+    except KitError:
+        pass
+    result.update(
+        closure_exempt=closure["exempt"], closure_unpinned=closure["unpinned"],
+        closure_files=closure["closure_files"], environment_differences=environment_changes,
+        verdict=pin_status, head=head, branch=branch, clean=porcelain_clean(ws),
+        pin_status=pin_status, pin_differences=differences, anchor_error=anchor_error,
+        anchor=None if trust is None else {"kid": trust["kid"], "genesis": trust.get("genesis"),
+                                           "pinned_at": trust.get("pinned_at"),
+                                           "pins": len(trust["pins"])},
+        hooks=vp.hook_states(ws, state) if state.is_dir() else {n: "MISSING" for n in vp.HOOKS},
+        token=token_status(ws, anchor, head))
+    return result
+
+
+def cmd_spec(ws: Path, args) -> dict:
+    spec, errors = load_spec(ws)
+    result = {"command": "spec", "ok": not errors, "errors": errors, "exit_code": EXIT_OK if not errors else EXIT_GATE,
+              "invariants": [], "error_codes": [], "sha256": None}
+    if spec:
+        result.update(invariants=spec["invariants"], error_codes=spec["error_codes"],
+                      sha256=spec["sha256"])
+    return result
+
+
+def cmd_mcp(ws: Path, args) -> dict:
+    """Serve over MCP. With a trust anchor, run the server from the pinned
+    checker snapshot (never the work-tree copy); without one, the work-tree
+    server."""
+    result = new_result("mcp")
+    argv_tail: list[str] = []
+    try:
+        state = vp.state_dir(ws, create=False)
+        anchored = state.is_dir() and vp.load_trust(state) is not None
+        if anchored:
+            vp.require_anchor(ws)
+    except TrustError as exc:
+        return fail(result, "trust", EXIT_TRUST, str(exc))
+    if anchored:
+        server = vp.checker_dir(state) / "scripts" / "mcp_server.py"
+        argv_tail = ["--workspace", str(ws)]
+    else:
+        server = ws / "scripts" / "mcp_server.py"
+    if not server.is_file():
+        return fail(result, None, EXIT_USAGE, f"{server} not found")
+    os.chdir(ws)
+    flags = [vp.ISOLATED_FLAG] if anchored else []
+    os.execv(sys.executable, [sys.executable, *flags, str(server), *argv_tail])
+    return result  # not reached
+
+
+def preflight_environment(ws: Path, result: dict) -> bool:
+    """With an anchor on file, the environment must still match its digests
+    (recorded at repin, checked against the pinned config). No anchor, no check."""
+    try:
+        state = vp.state_dir(ws, create=False)
+        trust = vp.load_trust(state) if state.is_dir() else None
+        if trust is None:
+            return True
+        try:
+            pinned = vp.snapshot_config(state)
+        except ConfigError as exc:
+            raise TrustError(f"pinned config snapshot is unusable: {exc}") from exc
+        vp.require_environment(ws, trust, pinned, vp.GateRules(pinned))
+    except PathViolation as exc:
+        fail(result, "step0", EXIT_GATE, str(exc))
+        return False
+    except TrustError as exc:
+        fail(result, "trust", EXIT_TRUST, str(exc))
+        return False
+    return True
+
+
+def cmd_preflight(ws: Path, args) -> dict:
+    """Everything `verify` checks that does not need the anchor, plus one Tier 2
+    driver smoke run (candidate only). Needs no anchor and issues no token: it
+    is how the agent proves a configuration before a human ratifies it."""
+    result = new_result("preflight")
+    cfg = vp.load_config(ws / vp.CONFIG_REL)
+    rules = vp.GateRules(cfg)
+    if not preflight_environment(ws, result):
+        return result
+    try:
+        tree = vp.working_tree(ws, rules)
+    except PathViolation as exc:
+        return fail(result, "step0", EXIT_GATE, str(exc))
+    if not gate_stages(ws, cfg, rules, tree, result):
+        return result
+    smoke = run_tier2_smoke(ws, cfg, rules)
+    result["tier2"] = smoke
+    if not smoke["ok"]:
+        result["reasons"] += smoke["reasons"]
+        return fail(result, smoke["stage"] or "tier2", EXIT_GATE, "the Tier 2 driver smoke run failed")
+    result["verdict"] = "PASS"
+    say("PREFLIGHT PASSED: Step 0, Tier 1 and the Tier 2 driver smoke run are clean; "
+        "no token issued (a human pins, then run verify)")
+    return result
+
+
+def commit_range(ws: Path, spec_range: str | None, genesis: str | None) -> list[str]:
+    if spec_range is None:
+        revs = ["HEAD", "-n", "1"]
+    else:
+        if spec_range.startswith("-") or ".." not in spec_range:
+            raise KitError(f"--range must look like A..B, got {spec_range!r}")
+        revs = [spec_range]
+    exclude = []
+    if genesis:
+        if not vp.git_ok(ws, "cat-file", "-e", f"{genesis}^{{commit}}"):
+            raise KitError(f"genesis commit {genesis[:12]} is not in this clone "
+                           "(fetch full history)")
+        exclude = [f"^{genesis}"]
+    out = vp.git(ws, "rev-list", "--reverse", *revs, *exclude).decode().split()
+    return out
+
+
+def check_ci_trailers(ws: Path, rules, commits: list[str]) -> list[str]:
+    problems = []
+    for commit in commits:
+        paths = ma.commit_paths(ws, commit)
+        try:
+            vp.reject_non_ascii(paths, f"commit {commit[:12]}")
+        except PathViolation as exc:
+            problems.append(f"{commit[:12]}: {exc}")
+            continue
+        if not any(rules.is_gated(p) for p in paths):
+            continue
+        try:
+            fields = ma.parse_trailer(ma.commit_message(ws, commit), ws)
+            level = ma.check_trailer_structure(fields, ma.commit_tree_oid(ws, commit),
+                                               ma.commit_first_parent(ws, commit))
+            if level != "promotion":
+                raise ma.AttestationError(f"attestation level is '{level}', not promotion")
+        except KitError as exc:
+            problems.append(f"{commit[:12]}: {exc}")
+    return problems
+
+
+def run_ci_setup(ws: Path, cfg: dict) -> str | None:
+    """Run the `[ci] setup` argv commands (12.9) in order, each with its own
+    timeout, no shell. Returns the failure reason, or None when all passed."""
+    commands = cfg["ci"]["setup"]
+    for number, argv in enumerate(commands, 1):
+        say(f"CI setup {number}/{len(commands)}: {' '.join(argv)}")
+        code, output, timed_out, _ = run_argv(vp.expand_command(argv), ws,
+                                              cfg["ci"]["timeout_seconds"],
+                                              env_extra=cfg["ci"]["env"])
+        if timed_out:
+            return (f"[ci] setup command {number} ({argv[0]}) timed out after "
+                    f"{cfg['ci']['timeout_seconds']} seconds")
+        if code != 0:
+            return f"[ci] setup command {number} ({argv[0]}) exited with {code}: " \
+                   f"{tail(output)[-500:]}"
+    return None
+
+
+def range_base(ws: Path, spec_range: str | None) -> str | None:
+    """The commit on the left of --range A..B (for A...B, the merge base of A
+    and B). None without a range or when it names no commit."""
+    if spec_range is None or ".." not in spec_range:
+        return None
+    left, _, right = spec_range.partition("..")
+    if right.startswith("."):
+        right = right[1:]
+        left = vp.git(ws, "merge-base", left or "HEAD", right or "HEAD",
+                      check=False).decode().strip()
+    rev = vp.git(ws, "rev-parse", "--verify", "-q", f"{left or 'HEAD'}^{{commit}}",
+                 check=False).decode().strip()
+    return rev or None
+
+
+def base_pins_state(ws: Path, base: str | None, mirror: dict) -> tuple[str, dict]:
+    """Compare the committed mirror with the one at the range base. ("absent",
+    {}) when the base has none (the adoption), ("same", {}) or ("changed",
+    delta)."""
+    if not base or not vp.git_ok(ws, "cat-file", "-e", f"{base}:{vp.PINS_MIRROR_REL}"):
+        return "absent", {}
+    try:
+        old = json.loads(vp.git(ws, "show", f"{base}:{vp.PINS_MIRROR_REL}", timeout=60))
+        old_pins = old["pins"]
+    except (KitError, ValueError, KeyError, TypeError):
+        return "changed", {"modified": [vp.PINS_MIRROR_REL], "added": [], "removed": []}
+    delta = vp.diff_maps(old_pins, mirror["pins"])
+    if old.get("genesis") != mirror.get("genesis"):
+        delta["modified"] = sorted(delta["modified"] + ["genesis"])
+    return ("changed", delta) if any(delta.values()) else ("same", {})
+
+
+def cmd_ci(ws: Path, args) -> dict:
+    """CI: AST + spec + Tier 1 + structural trailer check. No token and no
+    secret exist in CI, so signatures are NOT verified here; pre-push on the
+    maintainer's machine verifies them. `[ci] setup` commands run before the
+    gates. An empty range checks no trailers; every gate still runs."""
+    result = new_result("ci")
+    result["signatures_verified"] = False
+    result["note"] = ("CI has no secret: trailer signatures are NOT verified here "
+                      "(format, tree and parent only); pre-push verifies signatures locally")
+    try:
+        cfg = vp.load_config(ws / vp.CONFIG_REL)
+        rules = vp.GateRules(cfg)
+        mirror = json.loads(vp.read_nofollow(ws / vp.PINS_MIRROR_REL))
+        genesis = mirror.get("genesis")
+        if not isinstance(mirror.get("pins"), dict):
+            raise ValueError("no pins map")
+
+        def pins_delta():
+            tree = vp.working_tree(ws, rules)
+            pins = {p: h for p, h in tree.items() if rules.pin_entry(p)}
+            return tree, vp.diff_maps(mirror["pins"], pins)
+        tree, delta = pins_delta()
+    except ConfigError as exc:
+        return fail(result, None, EXIT_USAGE, str(exc))
+    except (KitError, ValueError, KeyError, TypeError) as exc:
+        return fail(result, "trust", EXIT_TRUST, f"cannot read {vp.PINS_MIRROR_REL}: {exc}")
+    if any(delta.values()):
+        for line in vp.describe_diff("tree vs pins.json", delta):
+            say(line)
+        return fail(result, "trust", EXIT_TRUST,
+                    f"pinned files differ from the committed {vp.PINS_MIRROR_REL}: {delta}")
+    base = range_base(ws, args.range)
+    state, base_delta = base_pins_state(ws, base, mirror)
+    result["pins_vs_base"] = {"base": base, "state": state}
+    if state == "changed":
+        for line in vp.describe_diff("pins.json vs range base", base_delta):
+            say(line)
+        return fail(result, "trust", EXIT_TRUST,
+                    f"trusted inputs changed since the range base {str(base)[:12]}: human review "
+                    f"required ({base_delta})")
+    failure = run_ci_setup(ws, cfg)
+    if failure:
+        return fail(result, "setup", EXIT_GATE, failure)
+    try:
+        tree, delta = pins_delta()
+    except KitError as exc:
+        return fail(result, "setup", EXIT_GATE, f"the work tree is unusable after setup: {exc}")
+    if any(delta.values()):
+        return fail(result, "setup", EXIT_GATE,
+                    f"[ci] setup changed pinned files: {delta}; setup must only create local files")
+    if not gate_stages(ws, cfg, rules, tree, result):
+        return result
+    try:
+        commits = commit_range(ws, args.range, genesis)
+        problems = check_ci_trailers(ws, rules, commits)
+    except KitError as exc:
+        return fail(result, "admission", EXIT_GATE, str(exc))
+    result["commits_checked"] = len(commits)
+    result["range_empty"] = not commits
+    if not commits:
+        say("CI: the commit range is empty; no trailers to check, the gates above still ran")
+    if problems:
+        result["reasons"] += problems
+        return fail(result, "admission", EXIT_GATE,
+                    f"{vp.plural(len(problems), 'commit')} lack a structurally valid promotion trailer"
+                    if len(problems) != 1 else
+                    "1 commit lacks a structurally valid promotion trailer")
+    result["verdict"] = "PASS"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hooks (entry points; run from the checker snapshot)
+# ---------------------------------------------------------------------------
+
+def run_hook(name: str, args) -> int:
+    try:
+        ws = vp.repo_toplevel(Path.cwd())
+        if name == "hook-pre-commit":
+            return ma.hook_pre_commit(ws)
+        if name == "hook-commit-msg":
+            return ma.hook_commit_msg(ws, args.msg_file)
+        if name == "hook-post-commit":
+            return ma.hook_post_commit(ws)
+        return ma.hook_pre_push(ws, args.remote, sys.stdin.read().splitlines())
+    except KitError as exc:
+        say(f"{name} REJECTED: {exc}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+COMMANDS = {"check-ast": cmd_check_ast, "verify": cmd_verify, "telemetry": cmd_telemetry,
+            "promote": cmd_promote, "install-hooks": cmd_install_hooks, "status": cmd_status,
+            "spec": cmd_spec, "mcp": cmd_mcp, "ci": cmd_ci, "preflight": cmd_preflight}
+HOOK_COMMANDS = ("hook-pre-commit", "hook-commit-msg", "hook-post-commit", "hook-pre-push")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="crucible", description="Adversarial Crucible CLI")
+    parser.add_argument("--workspace", type=Path, default=None)
+    parser.add_argument("--json", action="store_true", dest="json_mode")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name: str, help_text: str):
+        child = sub.add_parser(name, help=help_text)
+        child.add_argument("--workspace", type=Path, default=argparse.SUPPRESS)
+        child.add_argument("--json", action="store_true", dest="json_mode", default=argparse.SUPPRESS)
+        return child
+
+    add("check-ast", "run the configured AST engine")
+    add("verify", "trust check, Step 0, Tier 1; on success write a verify token")
+    add("telemetry", "Tier 2 only; writes no token").add_argument("--seed", type=int, default=None)
+    promote = add("promote", "verify + telemetry, promotion token, commit through the hooks")
+    promote.add_argument("-m", "--message", required=True)
+    promote.add_argument("--seed", type=int, default=None)
+    add("install-hooks", "human only: pin the trust anchor and install hooks") \
+        .add_argument("--repin", action="store_true")
+    add("preflight", "pre-ratification check: Step 0, Tier 1, Tier 2 driver smoke run; no anchor, no token")
+    add("status", "HEAD, pins, hooks, token state")
+    add("spec", "parsed contracts/SPEC.md as JSON")
+    add("mcp", "serve the crucible over MCP (execs scripts/mcp_server.py)")
+    add("ci", "CI gate: AST, spec, Tier 1, structural trailer check") \
+        .add_argument("--range", default=None)
+    for hook in HOOK_COMMANDS:
+        child = sub.add_parser(hook, help=argparse.SUPPRESS)
+        if hook == "hook-commit-msg":
+            child.add_argument("msg_file", type=Path)
+        if hook == "hook-pre-push":
+            child.add_argument("remote", nargs="?", default="")
+            child.add_argument("url", nargs="?", default="")
+        # git passes hook-specific extras (a merge's squash flag, a commit source, ...): ignored (12.6)
+        child.add_argument("ignored", nargs="*", help=argparse.SUPPRESS)
+    return parser
+
+
+def resolve_workspace(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.resolve()
+    candidate = HERE.parent
+    if (candidate / ".git").exists() and (candidate / "bin" / "crucible").is_file():
+        return candidate.resolve()
+    return vp.repo_toplevel(Path.cwd())
+
+
+def reexec_into_snapshot(ws: Path, argv: list[str]) -> None:
+    """Run the human-pinned checker snapshot instead of the work-tree copy, so
+    a modified work-tree CLI cannot judge itself. No-op without an anchor."""
+    try:
+        snapshot = vp.checker_dir(vp.state_dir(ws, create=False)) / "bin" / "crucible"
+    except KitError:
+        return
+    if snapshot.is_file() and snapshot.resolve() != Path(__file__).resolve():
+        os.execv(sys.executable, [sys.executable, vp.ISOLATED_FLAG, str(snapshot),
+                                  "--workspace", str(ws), *argv])
+
+
+def strict_json_value(value):
+    """Convert every non-finite float to null so the output is strict JSON."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): strict_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [strict_json_value(v) for v in value]
+    return value
+
+
+def strict_dumps(result: dict) -> str:
+    return json.dumps(strict_json_value(json.loads(json.dumps(result, default=str))),
+                      sort_keys=True, allow_nan=False)
+
+
+def emit(result: dict, json_mode: bool) -> None:
+    if json_mode:
+        sys.stdout.write(strict_dumps(result) + "\n")
+    else:
+        sys.stdout.write(f"crucible {result['command']}: {result.get('verdict')}"
+                         + (f" (stage {result['stage']})" if result.get("stage") else "")
+                         + "\n")
+        for reason in result.get("reasons", []):
+            sys.stdout.write(f"  - {reason}\n")
+    sys.stdout.flush()
+
+
+def main(argv: list[str] | None = None, reexec: bool = False) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] in HOOK_COMMANDS:
+        args, _ignored = build_parser().parse_known_args(raw)  # hooks accept and ignore extras
+    else:
+        args = build_parser().parse_args(raw)
+    restore = ma.exit_on_sigterm()
+    try:
+        if args.command in HOOK_COMMANDS:
+            return run_hook(args.command, args)
+        json_mode = getattr(args, "json_mode", False)
+        result = new_result(args.command)
+        try:
+            ws = resolve_workspace(getattr(args, "workspace", None))
+            if reexec and args.command in REEXEC_COMMANDS:
+                reexec_into_snapshot(ws, raw)
+            result = COMMANDS[args.command](ws, args)
+        except ConfigError as exc:
+            result = fail(new_result(args.command), None, EXIT_USAGE, str(exc))
+        except TrustError as exc:
+            result = fail(new_result(args.command), "trust", EXIT_TRUST, str(exc))
+        except KitError as exc:
+            result = fail(new_result(args.command), None, EXIT_INTERNAL, str(exc))
+        except (OSError, subprocess.SubprocessError) as exc:
+            result = fail(new_result(args.command), None, EXIT_INTERNAL, f"internal error: {exc}")
+        emit(result, json_mode)
+        return int(result.get("exit_code", 0))
+    finally:
+        restore()
+
+
+if __name__ == "__main__":
+    sys.exit(main(reexec=True))

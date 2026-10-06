@@ -1,0 +1,110 @@
+# Crucible CI gate (installed as .github/workflows/crucible.yml, a pinned file).
+#
+# What this job does: it re-runs Step 0 (AST gate, spec check) and Tier 1 on a
+# clean runner, then checks the structure of the Crucible-Attestation trailer on
+# every gated commit in the range (exactly one trailer; its tree equals the
+# commit's tree; its parent equals the commit's first parent). It needs no token
+# and no secret.
+#
+# Which checker runs: the BASE ref's bin/crucible (a separate checkout under
+# $RUNNER_TEMP/crucible-base) judges the HEAD tree (--workspace). A change in
+# the head cannot weaken the checker that judges it. The job also compares the
+# head's .crucible/pins.json with the base's and fails with "trusted inputs
+# changed: human review required" when they differ. That includes the adoption
+# commit: the base has no crucible yet, so the first run fails closed and a
+# human reviews the adoption.
+#
+# What it cannot do:
+#   * It cannot verify the HMAC signature of a trailer. The signing secret lives
+#     only on the maintainer's machine; the pre-push hook checks signatures.
+#   * It is not independent of the repository. The workflow file itself is a
+#     repository file: a change to it takes effect for that run. Protect it
+#     with code-owner review (see .github/CODEOWNERS.example), branch protection
+#     and this job as a required status check. Without those, CI is advisory.
+#
+# Production hardening: pin third-party actions to full commit SHAs. This file
+# uses version tags because SHAs cannot be verified offline. Replace each tag
+# with the full 40-character commit SHA of that release and keep the tag in a
+# trailing comment.
+name: crucible
+
+on:
+  workflow_call:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  crucible:
+    runs-on: ubuntu-latest
+    steps:
+      # TODO: pin to a full commit SHA (tag: v4)
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # TODO: pin to a full commit SHA (tag: v5)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compute commit range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          ZERO=0000000000000000000000000000000000000000
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            HEAD="$PR_HEAD"
+            # The merge base, not the base tip: the range is the PR's own commits.
+            BASE=$(git merge-base "$PR_BASE" "$HEAD" 2>/dev/null || echo "$PR_BASE")
+          else
+            BASE="${PUSH_BEFORE:-$ZERO}"
+            HEAD="$PUSH_AFTER"
+            # A new branch (zero SHA) or a force push (old SHA not in the clone)
+            # has no usable "before": use the merge base with the default branch.
+            # A branch with no new commits has merge base == HEAD, so BASE == HEAD
+            # and the range is empty (no trailers to check; every gate still runs).
+            # Only unrelated histories fall back to the root commit (the genesis
+            # commit is exempt).
+            if [ "$BASE" = "$ZERO" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE=$(git merge-base "$HEAD" "origin/$DEFAULT_BRANCH" 2>/dev/null || true)
+              if [ -z "$BASE" ]; then
+                BASE=$(git rev-list --max-parents=0 "$HEAD" | tail -n 1)
+              fi
+            fi
+          fi
+          echo "range=$BASE..$HEAD" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Checking range $BASE..$HEAD"
+      - name: Check out the base ref separately
+        env:
+          CRUCIBLE_BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -eu
+          git worktree add --detach "$RUNNER_TEMP/crucible-base" "$CRUCIBLE_BASE"
+      - name: Trusted inputs must not change
+        run: |
+          set -eu
+          BASE_PINS="$RUNNER_TEMP/crucible-base/.crucible/pins.json"
+          if [ ! -f "$BASE_PINS" ] || [ ! -f "$RUNNER_TEMP/crucible-base/bin/crucible" ]; then
+            echo "trusted inputs changed: human review required (the base ref has no crucible: adoption)"
+            exit 1
+          fi
+          if ! cmp -s "$BASE_PINS" .crucible/pins.json; then
+            echo "trusted inputs changed: human review required"
+            diff "$BASE_PINS" .crucible/pins.json || true
+            exit 1
+          fi
+      - name: Crucible CI gate
+        env:
+          CRUCIBLE_RANGE: ${{ steps.range.outputs.range }}
+        run: python3 "$RUNNER_TEMP/crucible-base/bin/crucible" ci --json --workspace "$GITHUB_WORKSPACE" --range "$CRUCIBLE_RANGE"

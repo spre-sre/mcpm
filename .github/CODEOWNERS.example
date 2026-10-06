@@ -1,0 +1,51 @@
+# EXAMPLE CODEOWNERS for a crucible repository. Installed as
+# .github/CODEOWNERS.example; it never replaces a real CODEOWNERS file.
+#
+# To use it: copy to .github/CODEOWNERS, replace @TODO-owner with the human
+# maintainer(s) who may ratify trusted inputs, delete the lines for ecosystems
+# you do not use, and in the branch protection rules enable "Require review
+# from Code Owners" and make the "crucible" job a required status check.
+#
+# Every pattern below is a trusted (pinned) path or an implicit-load file: a
+# change to one of them changes what judges the code, so a human reviews it.
+# Later patterns win in CODEOWNERS; keep the whole list at one owner.
+
+# Checker and kit machinery
+/bin/crucible                       @TODO-owner
+/scripts/verify_pins.py             @TODO-owner
+/scripts/mint_attestation.py        @TODO-owner
+/scripts/mcp_server.py              @TODO-owner
+/scripts/ast_gate.py                @TODO-owner
+/harness/                           @TODO-owner
+/.github/workflows/crucible.yml     @TODO-owner
+/.github/CODEOWNERS                 @TODO-owner
+
+# Spec, config, pins, baseline
+/contracts/                         @TODO-owner
+/.crucible/config.toml              @TODO-owner
+/.crucible/pins.json                @TODO-owner
+/.crucible/baseline.json            @TODO-owner
+/.crucible/archetype/               @TODO-owner
+
+# Agent tool configuration
+/.mcp.json                          @TODO-owner
+/.claude/                           @TODO-owner
+
+# Contract tests and implicit-load files, per ecosystem
+/tests/                             @TODO-owner
+/conftest.py                        @TODO-owner
+/pyproject.toml                     @TODO-owner
+/setup.cfg                          @TODO-owner
+/pytest.ini                         @TODO-owner
+/tox.ini                            @TODO-owner
+/go.mod                             @TODO-owner
+/go.sum                             @TODO-owner
+/go.work                            @TODO-owner
+/Cargo.toml                         @TODO-owner
+/Cargo.lock                         @TODO-owner
+/build.rs                           @TODO-owner
+/.cargo/                            @TODO-owner
+/Makefile                           @TODO-owner
+/GNUmakefile                        @TODO-owner
+/makefile                           @TODO-owner
+/CMakeLists.txt                     @TODO-owner

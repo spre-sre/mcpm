@@ -1,0 +1,83 @@
+// EXAMPLE Tier 2 telemetry driver. Not a real driver: adapt every TODO(agent).
+//
+// Copy to harness/telemetry_driver/main.go. Contract (architecture.md s8):
+//
+//	telemetry_driver --root DIR --samples N --seed S --out FILE.json
+//
+// writes {"latencies_ns": [N floats], "memory_bytes": [N floats]}.
+// Only the data may depend on the seed, never which code paths run.
+//
+// Timer resolution (architecture.md 12.8): one call is often shorter than the
+// clock tick. Each sample times a BATCH of calls and reports the per-call mean
+// as a float. The batch size is calibrated once so every sample spans at
+// least minBatchNS. Coarse samples are rejected (REJECT_INVALID_SAMPLES).
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"math/rand"
+	"os"
+	"runtime"
+	"time"
+
+	// TODO(agent): the project's REAL package, by module path.
+	entrypkg "example.com/TODO/module/pkg"
+)
+
+const (
+	minBatchNS = 200000 // every sample spans at least this much wall time
+	maxBatch   = 1 << 20
+)
+
+// runBatch calls the entry point count times over the workload from start
+// (wrapping) and returns the elapsed nanoseconds.
+func runBatch(workload []int, start, count int) float64 {
+	begin := time.Now()
+	for k := 0; k < count; k++ {
+		_ = entrypkg.TODOEntry(workload[(start+k)%len(workload)]) // TODO(agent): rejects are valid work
+	}
+	return float64(time.Since(begin).Nanoseconds())
+}
+
+// calibrate returns the smallest power-of-two batch spanning 2*minBatchNS.
+func calibrate(workload []int) int {
+	count := 1
+	for count < maxBatch && runBatch(workload, 0, count) < 2*minBatchNS {
+		count *= 2
+	}
+	return count
+}
+
+func main() {
+	root := flag.String("root", ".", "tree being measured (the command runs with cwd=root)")
+	samples := flag.Int("samples", 0, "number of samples")
+	seed := flag.Int64("seed", 0, "workload seed")
+	out := flag.String("out", "", "output JSON file")
+	flag.Parse()
+	_ = root
+	if *samples <= 0 || *out == "" {
+		os.Exit(2)
+	}
+
+	rng := rand.New(rand.NewSource(*seed))
+	workload := make([]int, *samples) // TODO(agent): realistic inputs for the critical paths
+	for i := range workload {
+		workload[i] = rng.Intn(201)
+	}
+
+	latencies := make([]float64, 0, *samples)
+	memory := make([]float64, 0, *samples)
+	var stats runtime.MemStats
+	batch := calibrate(workload) // warm-up and batch size; not measured
+	for i := 0; i < *samples; i++ {
+		latencies = append(latencies, runBatch(workload, i*batch, batch)/float64(batch))
+		runtime.ReadMemStats(&stats)
+		memory = append(memory, float64(stats.HeapAlloc))
+	}
+
+	data, err := json.Marshal(map[string][]float64{"latencies_ns": latencies, "memory_bytes": memory})
+	if err != nil || os.WriteFile(*out, data, 0o644) != nil {
+		os.Exit(2)
+	}
+}

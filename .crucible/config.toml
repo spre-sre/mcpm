@@ -1,0 +1,65 @@
+# Crucible config for mcpm (Go archetype). Pinned: changes need a human repin.
+[project]
+name = "mcpm"
+runtime = "go"                # informational only
+
+[gate]
+source_paths = ["cmd/", "internal/", "main.go"]
+trusted_paths = [
+  "contracts/",
+  "harness/",
+  "harness/telemetry_driver/",     # the Tier 2 driver (main.go): named in driver_paths
+  "go.mod",
+  "go.sum",
+  "go.work",
+  "go.work.sum",
+  "vendor/",
+  ".gitignore",                     # decides which files closure treats as environment
+  ".crucible/config.toml",
+  ".crucible/baseline.json",
+]
+
+[ast]
+command = []
+none_reason = "No AST engine for Go in this kit; complexity is not ratcheted. Recorded under ## Gaps in contracts/SPEC.md."
+
+# .gitignore ignores go.work, and an ignored workspace file changes which code
+# `go` loads. GOWORK=off in every command disables it; the digests below also
+# refuse a go.work that appears after the pin. GOTOOLCHAIN=local stops `go`
+# from downloading a different toolchain.
+[environment]
+digest_globs = ["go.work", "go.work.sum"]
+
+[tier1]
+# Only the harness package, only the contract tests: a test file elsewhere
+# would run with CRUCIBLE_RESULTS in its environment.
+command = ["go", "test", "-count=1", "-run", "^TestCrucible_INV_", "./harness"]
+contract_tests = ["harness/crucible_contracts_test.go"]
+timeout_seconds = 900
+# A source change that reaches a Node, Python or Go build must not use the
+# network. Modules come from the cache (`[ci] setup` fills it on a runner).
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", NPM_CONFIG_OFFLINE = "true", PIP_NO_INDEX = "1"}
+
+[tier2]
+# A .go file argument needs no ./ prefix; the driver is pinned through driver_paths.
+command = ["go", "run", "harness/telemetry_driver/main.go"]
+driver_paths = ["harness/telemetry_driver/"]
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off"}
+samples = 5000
+rounds = 10
+p99_drift_max = 0.02
+p50_drift_max = 0.02
+bootstrap_samples = 1000
+ci_level = 0.95
+leak_slope_max = 1024.0
+leak_alpha = 0.05
+min_samples = 1000
+timeout_seconds = 1800
+
+# Runs in `bin/crucible ci` only, before Tier 1. Pinned with this file.
+[ci]
+setup = [["go", "mod", "download"]]
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local"}
+
+[attestation]
+ttl_seconds = 3600
