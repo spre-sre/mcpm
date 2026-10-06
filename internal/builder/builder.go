@@ -8,12 +8,22 @@ import (
 	"strings"
 )
 
+// resolveAbs is filepath.Abs; tests replace it to reach its error path.
+var resolveAbs = filepath.Abs
+
 func DetectAndBuild(repoPath string) (*BuildResult, error) {
-	absPath, _ := filepath.Abs(repoPath)
+	absPath, err := resolveAbs(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("could not resolve repository path %q: %w", repoPath, err)
+	}
 
 	// 1. Check for explicit mcp.json
 	manifestPath := filepath.Join(absPath, "mcp.json")
-	if _, err := os.Stat(manifestPath); err == nil {
+	if info, err := os.Stat(manifestPath); err == nil {
+		// A directory is a broken manifest; do not fall through to a build.
+		if info.IsDir() {
+			return nil, fmt.Errorf("invalid mcp.json: %s is a directory", manifestPath)
+		}
 		return buildFromManifest(absPath, manifestPath)
 	}
 
@@ -28,13 +38,13 @@ func DetectAndBuild(repoPath string) (*BuildResult, error) {
 		return buildGo(absPath)
 	}
 
-	return nil, fmt.Errorf("could not detect project type (no mcp.json, package.json, requirements.txt, or go.mod)")
+	return nil, fmt.Errorf("could not detect project type (no mcp.json, package.json, pyproject.toml, requirements.txt, or go.mod)")
 }
 
 func buildFromManifest(repoPath, manifestPath string) (*BuildResult, error) {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not read mcp.json: %w", err)
 	}
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
