@@ -4,7 +4,6 @@
     "cmd/add.go::glob.func1": 15,
     "internal/builder/node.go::buildNode": 11,
     "internal/builder/node.go::findMonorepoEntry": 14,
-    "internal/builder/python.go::buildPython": 11,
     "internal/tui/helpers.go::updateClientSelection": 12,
     "internal/tui/installer.go::Model.Update": 13,
     "internal/tui/installer.go::Model.View": 12,
