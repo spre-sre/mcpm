@@ -3,8 +3,6 @@ package injector
 import (
 	"fmt"
 	"os/exec"
-	"path/filepath"
-	"strings"
 
 	"mcpm/internal/builder"
 )
@@ -18,22 +16,9 @@ type McpServerDef struct {
 }
 
 func updateClaudeCode(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
-	// Extract server name from path
-	// Look for .mcp/servers/<name> pattern
-	name := "mcp-server"
-	if len(result.Args) > 0 {
-		path := result.Args[0]
-		// Find "servers" in path and get the next component
-		parts := strings.Split(path, string(filepath.Separator))
-		for i, part := range parts {
-			if part == "servers" && i+1 < len(parts) {
-				name = parts[i+1]
-				break
-			}
-		}
-	}
-	if name == "" || name == "." {
-		name = filepath.Base(result.Command)
+	name, err := serverName(result)
+	if err != nil {
+		return err
 	}
 
 	// Build command args for claude mcp add

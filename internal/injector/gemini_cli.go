@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"mcpm/internal/builder"
 )
@@ -60,6 +59,11 @@ func loadGeminiConfig(path string) (GeminiConfig, error) {
 }
 
 func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
+	name, nameErr := serverName(result)
+	if nameErr != nil {
+		return nameErr
+	}
+
 	var configDir, configPath string
 
 	if global {
@@ -86,24 +90,6 @@ func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]str
 	}
 	if cfg.McpServers == nil {
 		cfg.McpServers = make(map[string]McpServerDef)
-	}
-
-	// Extract server name from path
-	// Look for .mcp/servers/<name> pattern
-	name := "mcp-server"
-	if len(result.Args) > 0 {
-		path := result.Args[0]
-		// Find "servers" in path and get the next component
-		parts := strings.Split(path, string(filepath.Separator))
-		for i, part := range parts {
-			if part == "servers" && i+1 < len(parts) {
-				name = parts[i+1]
-				break
-			}
-		}
-	}
-	if name == "" || name == "." {
-		name = filepath.Base(result.Command)
 	}
 
 	cfg.McpServers[name] = McpServerDef{
