@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/go-git/go-git/v5"
 )
@@ -44,9 +43,6 @@ func Clone(url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("git clone failed: %w", err)
 	}
-
-	// Give the filesystem a moment to settle
-	time.Sleep(500 * time.Millisecond)
 
 	return targetPath, nil
 }
