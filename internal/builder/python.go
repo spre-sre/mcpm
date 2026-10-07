@@ -41,11 +41,11 @@ func buildPython(path string) (*BuildResult, error) {
 
 	// Install Deps
 	if exists(filepath.Join(path, "requirements.txt")) {
-		if err := runShellCmd(path, pipPath+" install -r requirements.txt"); err != nil {
+		if err := runCommand(path, pipPath, "install", "-r", "requirements.txt"); err != nil {
 			return nil, err
 		}
 	} else if exists(filepath.Join(path, "pyproject.toml")) {
-		if err := runShellCmd(path, pipPath+" install ."); err != nil {
+		if err := runCommand(path, pipPath, "install", "."); err != nil {
 			return nil, err
 		}
 	}

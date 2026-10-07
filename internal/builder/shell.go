@@ -36,6 +36,18 @@ func runShellCmd(dir string, command string) error {
 	return nil
 }
 
+func runCommand(dir string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(output))
+	}
+	return nil
+}
+
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil

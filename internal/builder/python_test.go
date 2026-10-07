@@ -2,6 +2,7 @@ package builder
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -130,5 +131,75 @@ func TestEnsureVenvDanglingSymlink(t *testing.T) {
 	}
 	if len(calls) == 0 {
 		t.Fatal("expected runner to be called for dangling symlink, got 0 calls")
+	}
+}
+
+func TestBuildPythonSpacesAndInjection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	base := t.TempDir()
+	logFile := filepath.Join(base, "pip.log")
+	dirName := "My Projects/srv;touch INJECTED;#"
+	serverDir := filepath.Join(base, dirName)
+
+	venvBin := filepath.Join(serverDir, ".venv", "bin")
+	if err := os.MkdirAll(venvBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, ".venv", "pyvenv.cfg"), []byte("home = /usr"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(venvBin, "python"), []byte("fake"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pipScript := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do\nprintf '%%s\\n' \"$arg\" >> %q\ndone\n", logFile)
+	if err := os.WriteFile(filepath.Join(venvBin, "pip"), []byte(pipScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(serverDir, "requirements.txt"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "server.py"), []byte("pass"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := DetectAndBuild(serverDir)
+	if err != nil {
+		t.Fatalf("DetectAndBuild failed: %v", err)
+	}
+
+	absServerDir, err := filepath.Abs(serverDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedCmd := filepath.Join(absServerDir, ".venv", "bin", "python")
+	if result.Command != expectedCmd {
+		t.Fatalf("Command = %q, want %q", result.Command, expectedCmd)
+	}
+
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed to read pip log: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	want := []string{"install", "-r", "requirements.txt"}
+	if len(lines) != len(want) {
+		t.Fatalf("pip args = %v, want %v", lines, want)
+	}
+	for i, w := range want {
+		if lines[i] != w {
+			t.Fatalf("pip arg[%d] = %q, want %q", i, lines[i], w)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(serverDir, "INJECTED")); err == nil {
+		t.Fatal("INJECTED file must not exist")
+	}
+	if _, err := os.Stat(filepath.Join(base, "INJECTED")); err == nil {
+		t.Fatal("INJECTED file must not exist in base dir")
 	}
 }
