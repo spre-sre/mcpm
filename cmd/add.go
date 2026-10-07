@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -167,18 +168,20 @@ func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[strin
 		return fmt.Errorf("could not create .gemini dir: %w", err)
 	}
 
-	// Read existing config
-	var cfg map[string]interface{}
-	if data, err := os.ReadFile(configPath); err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-	if cfg == nil {
-		cfg = make(map[string]interface{})
+	cfg, err := loadGeminiSettings(configPath)
+	if err != nil {
+		return err
 	}
 
 	// Get or create mcpServers
-	mcpServers, ok := cfg["mcpServers"].(map[string]interface{})
-	if !ok {
+	var mcpServers map[string]interface{}
+	if existing, exists := cfg["mcpServers"]; exists {
+		var ok bool
+		mcpServers, ok = existing.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("%s: mcpServers is not a JSON object", configPath)
+		}
+	} else {
 		mcpServers = make(map[string]interface{})
 	}
 
@@ -210,6 +213,21 @@ func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[strin
 		return err
 	}
 	return writeSettingsFile(configPath, data, len(env) > 0)
+}
+
+func loadGeminiSettings(path string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]interface{}), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", path, err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("could not parse %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 func writeSettingsFile(path string, data []byte, hasSecrets bool) error {

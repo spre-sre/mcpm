@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +153,129 @@ func TestAddGeminiExistingFileWithoutEnvKeepsMode(t *testing.T) {
 	}
 	if mode := info.Mode().Perm(); mode != 0644 {
 		t.Errorf("got mode %04o, want 0644", mode)
+	}
+}
+
+func TestAddGeminiCommentedJSONReturnsError(t *testing.T) {
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(gemDir, "settings.json")
+	original := []byte("{\n// user comment\n\"theme\": \"dark\",\n\"mcpServers\": {\"keep-me\": {\"type\": \"stdio\", \"command\": \"x\"}}\n}")
+	if err := os.WriteFile(settingsPath, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := addToGeminiCLI(cwd, "srv", "node", []string{"/x.js"}, map[string]string{}, "stdio", false)
+	if err == nil {
+		t.Fatal("expected error for commented JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), settingsPath) {
+		t.Errorf("error should contain file path %q, got: %v", settingsPath, err)
+	}
+
+	after, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("file was modified despite parse error")
+	}
+}
+
+func TestAddGeminiMcpServersNotObjectReturnsError(t *testing.T) {
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(gemDir, "settings.json")
+	original := []byte(`{"mcpServers": []}`)
+	if err := os.WriteFile(settingsPath, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := addToGeminiCLI(cwd, "srv", "node", []string{"/x.js"}, map[string]string{}, "stdio", false)
+	if err == nil {
+		t.Fatal("expected error for mcpServers as array, got nil")
+	}
+	if !strings.Contains(err.Error(), settingsPath) {
+		t.Errorf("error should contain file path %q, got: %v", settingsPath, err)
+	}
+
+	after, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(original, after) {
+		t.Error("file was modified despite mcpServers type error")
+	}
+}
+
+func TestAddGeminiValidFileKeepsExistingSettings(t *testing.T) {
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(gemDir, "settings.json")
+	initial := `{"theme": "dark", "mcpServers": {"keep-me": {"type": "stdio", "command": "x"}}}`
+	if err := os.WriteFile(settingsPath, []byte(initial), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := addToGeminiCLI(cwd, "new-srv", "node", []string{"/y.js"}, map[string]string{}, "stdio", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["theme"] != "dark" {
+		t.Error("theme key was lost")
+	}
+	mcpServers, ok := result["mcpServers"].(map[string]interface{})
+	if !ok {
+		t.Fatal("mcpServers not found or not an object")
+	}
+	if _, ok := mcpServers["keep-me"]; !ok {
+		t.Error("existing server keep-me was lost")
+	}
+	if _, ok := mcpServers["new-srv"]; !ok {
+		t.Error("new server new-srv was not added")
+	}
+}
+
+func TestAddGeminiNoFileCreatesOne(t *testing.T) {
+	cwd := t.TempDir()
+
+	err := addToGeminiCLI(cwd, "fresh", "node", []string{"/z.js"}, map[string]string{}, "stdio", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	settingsPath := filepath.Join(cwd, ".gemini", "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	mcpServers, ok := result["mcpServers"].(map[string]interface{})
+	if !ok {
+		t.Fatal("mcpServers not found or not an object")
+	}
+	if _, ok := mcpServers["fresh"]; !ok {
+		t.Error("server fresh was not created")
 	}
 }
