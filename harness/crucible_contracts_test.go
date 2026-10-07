@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 
 	"mcpm/internal/builder"
 	"mcpm/internal/fetcher"
+	"mcpm/internal/server"
 )
 
 const (
@@ -36,7 +38,10 @@ const (
 )
 
 // Every invariant name from contracts/SPEC.md.
-var invariants = []string{"INV_PROJECT_DETECTED", "INV_MANIFEST_JSON", "INV_SERVER_INSTALLED"}
+var invariants = []string{
+	"INV_PROJECT_DETECTED", "INV_MANIFEST_JSON", "INV_SERVER_INSTALLED",
+	"INV_HOST_PORT_SPLIT", "INV_HOST_WITHOUT_PORT",
+}
 
 // projectMarkers are the root files DetectAndBuild recognizes (README "How It Works").
 var projectMarkers = []string{"mcp.json", "package.json", "pyproject.toml", "requirements.txt", "go.mod"}
@@ -604,4 +609,114 @@ func TestCrucible_INV_SERVER_INSTALLED_random(t *testing.T) {
 			check(t, "INV_SERVER_INSTALLED", serverCode(t, name, label), errServerNotFound, label+" missing "+name)
 		}
 	})
+}
+
+// randomHostName returns a DNS-like name: letters, digits, '-' and '.', no colon.
+func randomHostName(rng *rand.Rand) string {
+	labels := make([]string, 1+rng.Intn(3))
+	for i := range labels {
+		labels[i] = serverName(rng)
+	}
+	return strings.Join(labels, ".")
+}
+
+// randomIPv4 returns a dotted IPv4 address.
+func randomIPv4(rng *rand.Rand) string {
+	return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+}
+
+// randomIPv6 returns an IPv6 address with at least two colons: full, compressed
+// with "::", or with a zone.
+func randomIPv6(rng *rand.Rand) string {
+	groups := make([]string, 8)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("%x", rng.Intn(1<<16))
+	}
+	address := strings.Join(groups, ":")
+	if rng.Intn(2) == 0 {
+		cut := rng.Intn(7)
+		address = strings.Join(groups[:cut], ":") + "::" + strings.Join(groups[cut+2:], ":")
+	}
+	if rng.Intn(4) == 0 {
+		address += "%eth" + fmt.Sprint(rng.Intn(4))
+	}
+	return address
+}
+
+// randomHost returns a host of a random shape, without brackets or a port.
+func randomHost(rng *rand.Rand) string {
+	switch rng.Intn(3) {
+	case 0:
+		return randomHostName(rng)
+	case 1:
+		return randomIPv4(rng)
+	}
+	return randomIPv6(rng)
+}
+
+// randomPort returns a decimal port, or a value net.SplitHostPort also accepts.
+func randomPort(rng *rand.Rand) string {
+	switch rng.Intn(6) {
+	case 0:
+		return ""
+	case 1:
+		return "http"
+	}
+	return fmt.Sprint(rng.Intn(1 << 16))
+}
+
+// checkSplit checks StripHostPort(raw) against the host net.SplitHostPort returns.
+func checkSplit(t *testing.T, raw, label string) {
+	t.Helper()
+	host, _, err := net.SplitHostPort(raw)
+	if err != nil {
+		record("INV_HOST_PORT_SPLIT", false)
+		t.Errorf("INV_HOST_PORT_SPLIT %s: test input %q does not split: %v", label, raw, err)
+		return
+	}
+	checkEqual(t, "INV_HOST_PORT_SPLIT", server.StripHostPort(raw), host, fmt.Sprintf("%s %q", label, raw))
+}
+
+// INV_HOST_PORT_SPLIT: net.SplitHostPort(x) = (h, p, nil) ∧ StripHostPort(x) ≠ h -> REJECT(ERR_HOST_PORT_SPLIT)
+func TestCrucible_INV_HOST_PORT_SPLIT_boundary(t *testing.T) {
+	inputs := []string{
+		"localhost:8080", "[::1]:8080", "127.0.0.1:9000", "example.com:http", ":80", ":", "host:",
+		"[]:80", "[::1]:", "[fe80::1%eth0]:443", "[example.com]:80", "[a:b]:1",
+	}
+	for _, raw := range inputs {
+		checkSplit(t, raw, "boundary")
+	}
+}
+
+func TestCrucible_INV_HOST_PORT_SPLIT_random(t *testing.T) {
+	rng := rand.New(rand.NewSource(crucibleSeed + 3))
+	for i := 0; i < randomCases; i++ {
+		checkSplit(t, net.JoinHostPort(randomHost(rng), randomPort(rng)), fmt.Sprintf("case=%d", i))
+	}
+}
+
+// INV_HOST_WITHOUT_PORT: an unbracketed host whose colon count is not 1 stays
+// unchanged; "[h]" with h ∌ ']' gives h -> REJECT(ERR_HOST_WITHOUT_PORT)
+func TestCrucible_INV_HOST_WITHOUT_PORT_boundary(t *testing.T) {
+	cases := map[string]string{
+		"": "", "example.com": "example.com", "127.0.0.1": "127.0.0.1",
+		"::1": "::1", "::": "::", "2001:db8::1": "2001:db8::1", "fe80::1%eth0": "fe80::1%eth0",
+		"1:2:3:4:5:6:7:8": "1:2:3:4:5:6:7:8",
+		"[::1]":           "::1", "[]": "", "[example.com]": "example.com", "[fe80::1%eth0]": "fe80::1%eth0",
+	}
+	for raw, want := range cases {
+		checkEqual(t, "INV_HOST_WITHOUT_PORT", server.StripHostPort(raw), want, fmt.Sprintf("boundary %q", raw))
+	}
+}
+
+func TestCrucible_INV_HOST_WITHOUT_PORT_random(t *testing.T) {
+	rng := rand.New(rand.NewSource(crucibleSeed + 4))
+	for i := 0; i < randomCases; i++ {
+		host := randomHost(rng) // no brackets; 0 colons or at least 2
+		raw, want := host, host
+		if rng.Intn(2) == 0 {
+			raw = "[" + host + "]"
+		}
+		checkEqual(t, "INV_HOST_WITHOUT_PORT", server.StripHostPort(raw), want, fmt.Sprintf("case=%d %q", i, raw))
+	}
 }

@@ -1,9 +1,11 @@
 # mcpm contract
 
-Invariants over the public entry points of `mcpm/internal/builder` and
-`mcpm/internal/fetcher`. The contract tests are in
+Invariants over the public entry points of `mcpm/internal/builder`,
+`mcpm/internal/fetcher` and `mcpm/internal/server`. The contract tests are in
 `harness/crucible_contracts_test.go`. Each test calls the real function and
-maps its error to a code below.
+maps its error to a code below. `server.StripHostPort` returns no error, so
+for its invariants the code names the wrong result that makes the gate
+reject the change.
 
 ## Invariants
 
@@ -13,6 +15,10 @@ maps its error to a code below.
   Source: README.md "Custom (mcp.json)"; internal/builder/builder.go buildFromManifest; required runCmd: maintainer decision, 2026-10-06.
 - INV_SERVER_INSTALLED: os.Stat(cwd/.mcp/servers/name) reports not-exist ⇒ fetcher.GetServerPath(name) fails -> REJECT(ERR_SERVER_NOT_FOUND)
   Source: README.md "Update an Installed Server" and "How It Works" step 1; internal/fetcher/git.go GetServerPath.
+- INV_HOST_PORT_SPLIT: net.SplitHostPort(x) = (h, p, nil) ∧ server.StripHostPort(x) ≠ h -> REJECT(ERR_HOST_PORT_SPLIT)
+  Source: GitHub issue spre-sre/mcpm#7 rule 1 ("[::1]:8080" -> "::1", matching net.SplitHostPort); contracts/host_test.go at 2d103b7.
+- INV_HOST_WITHOUT_PORT: (x ∌ '[', ']' ∧ count(x, ':') ≠ 1 ∧ server.StripHostPort(x) ≠ x) ∨ (x = "[" h "]" ∧ h ∌ ']' ∧ server.StripHostPort(x) ≠ h) -> REJECT(ERR_HOST_WITHOUT_PORT)
+  Source: GitHub issue spre-sre/mcpm#7 rule 2 (bare IPv6 such as "::1" stays unchanged); "[::1]" -> "::1", "example.com" and "" from contracts/host_test.go at 2d103b7.
 
 The accept side of each invariant is also checked:
 
@@ -47,6 +53,8 @@ The accept side of each invariant is also checked:
 | ERR_PROJECT_UNDETECTED | -1 | No mcp.json, package.json, pyproject.toml, requirements.txt or go.mod in the repository root. |
 | ERR_MANIFEST_INVALID | -2 | mcp.json exists but does not decode into the Manifest type. |
 | ERR_SERVER_NOT_FOUND | -3 | No entry with that name under .mcp/servers/. |
+| ERR_HOST_PORT_SPLIT | -4 | StripHostPort disagrees with the host that net.SplitHostPort returns. |
+| ERR_HOST_WITHOUT_PORT | -5 | StripHostPort changed a host without a port, or did not remove the brackets of "[host]". |
 
 ## Gaps
 
