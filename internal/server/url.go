@@ -12,5 +12,8 @@ func NormalizeEndpoint(raw string) string {
 		s = "/" + s
 	}
 	s = strings.TrimRight(s, "/")
+	if s == "" {
+		return "/"
+	}
 	return s
 }
