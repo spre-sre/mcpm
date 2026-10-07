@@ -106,6 +106,10 @@ func (m UpdateModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m UpdateModel) Err() error {
+	return m.err
+}
+
 func (m UpdateModel) View() string {
 	if m.err != nil {
 		return errorStyle.Render(fmt.Sprintf("Error: %v\n", m.err))

@@ -43,13 +43,18 @@ Examples:
 				return
 			}
 
+			var failed bool
 			for _, name := range servers {
 				fmt.Printf("Updating %s...\n", name)
 				if err := updateServer(name, updateGlobal); err != nil {
-					fmt.Printf("  Error: %v\n", err)
+					fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+					failed = true
 				} else {
 					fmt.Printf("  Updated successfully\n")
 				}
+			}
+			if failed {
+				os.Exit(1)
 			}
 			return
 		}
@@ -86,7 +91,8 @@ func updateServer(name string, global bool) error {
 		tui.NewUpdateModel(serverPath, name, global),
 		tea.WithAltScreen(),
 	)
-	if _, err := p.Run(); err != nil {
+	final, runErr := p.Run()
+	if err := tuiError(final, runErr); err != nil {
 		return fmt.Errorf("rebuild failed: %w", err)
 	}
 

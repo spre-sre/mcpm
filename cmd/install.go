@@ -41,11 +41,26 @@ Schemes:
 			tui.NewInstallModel(url, repoRef, installGlobal),
 			tea.WithAltScreen(),
 		)
-		if _, err := p.Run(); err != nil {
-			fmt.Printf("Error: %v\n", err)
+		final, runErr := p.Run()
+		if err := tuiError(final, runErr); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 	},
+}
+
+type tuiErrModel interface {
+	Err() error
+}
+
+func tuiError(final tea.Model, runErr error) error {
+	if runErr != nil {
+		return runErr
+	}
+	if m, ok := final.(tuiErrModel); ok && m.Err() != nil {
+		return m.Err()
+	}
+	return nil
 }
 
 func parseScheme(input string) (string, string) {
