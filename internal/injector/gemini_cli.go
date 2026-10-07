@@ -103,5 +103,15 @@ func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]str
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, data, 0644)
+	return writeSettingsFile(configPath, data, len(env) > 0)
+}
+
+func writeSettingsFile(path string, data []byte, hasSecrets bool) error {
+	if hasSecrets {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return err
+		}
+		return os.Chmod(path, 0600)
+	}
+	return os.WriteFile(path, data, 0644)
 }
