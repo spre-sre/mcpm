@@ -6,10 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
+
+var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 var (
 	addTransport  string
@@ -51,7 +54,7 @@ Examples:
   # Add globally (available in all projects)
   mcpm add myserver /path/to/server --global`,
 	Args: cobra.MinimumNArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
 		commandOrURL := args[1]
 		serverArgs := args[2:]
@@ -62,17 +65,18 @@ Examples:
 			addGeminiCLI = true
 		}
 
-		// Parse environment variables
-		env := make(map[string]string)
-		for _, e := range addEnvVars {
-			parts := strings.SplitN(e, "=", 2)
-			if len(parts) == 2 {
-				env[parts[0]] = parts[1]
-			}
+		// Validate and parse environment variables
+		env, err := parseEnvVars(addEnvVars)
+		if err != nil {
+			return err
 		}
 
-		// Detect transport type if not specified
-		if addTransport == "" {
+		// Validate transport if specified, otherwise auto-detect
+		if addTransport != "" {
+			if err := validateTransport(addTransport); err != nil {
+				return err
+			}
+		} else {
 			if strings.HasPrefix(commandOrURL, "http://") || strings.HasPrefix(commandOrURL, "https://") {
 				addTransport = "http"
 			} else {
@@ -110,6 +114,8 @@ Examples:
 				}
 			}
 		}
+
+		return nil
 	},
 }
 
@@ -204,6 +210,31 @@ func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[strin
 		return err
 	}
 	return os.WriteFile(configPath, data, 0644)
+}
+
+func parseEnvVars(values []string) (map[string]string, error) {
+	env := make(map[string]string)
+	for _, e := range values {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid environment variable %q: must be KEY=VALUE", e)
+		}
+		key := parts[0]
+		if !envKeyRe.MatchString(key) {
+			return nil, fmt.Errorf("invalid environment variable %q: key must match [A-Za-z_][A-Za-z0-9_]*", e)
+		}
+		env[key] = parts[1]
+	}
+	return env, nil
+}
+
+func validateTransport(transport string) error {
+	switch transport {
+	case "stdio", "http", "sse":
+		return nil
+	default:
+		return fmt.Errorf("invalid transport %q: must be stdio, http, or sse", transport)
+	}
 }
 
 func init() {
