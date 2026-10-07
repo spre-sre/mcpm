@@ -1,11 +1,14 @@
 {
   "genesis": "60fbae26dbbbd777b990ff6161b4ef04e418c14c",
   "pins": {
-    ".crucible/config.toml": "f90e8736a74ae3fd2c95955cfa95d7dfd2ee9a6c58ae35f1aa5fa7ee861f4dc4",
+    ".crucible/baseline.json": "05202be421c678d05bd7f921be788cc4388c41be6fe5fcc2c700aa6258f84daa",
+    ".crucible/config.toml": "ce02f99b704b98d389b506ff6fdd90626c128c86a05cf504459c8110f693c955",
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
     "bin/crucible": "efb3fc52d93071c753028f3e5f88081cc4e815bd7254b352ae698dd889e070d4",
-    "contracts/SPEC.md": "a90aaeb9f0fefe46f4544b9bf2bae4a1e686220abd67081a7708b018ae5a2347",
+    "cmd/gate-ast/main.go": "813fd556453250c906c15ac6699c228df052979d635cf974ad4da4818b1dda8b",
+    "contracts/SPEC.md": "6686bfe48563ee566fdc585541620b9c8d0e94cd38e4bcb6526652928f9c9c88",
+    "contracts/host_test.go": "a68a6e4e5735dc35aa8bf2efe30fb0eac6fea91bcd0161ef6eef0f7787e0d62a",
     "go.mod": "b5d4b8c7fea4ca0b2d6dba309b526a3d0d1a1dc260bf813c3858b6089b2c1dee",
     "go.sum": "7b5b79d1a85e6dde66282448f6459657886198cf92ca1f9969c42cd558b7f2ed",
     "harness/crucible_contracts_test.go": "e9ee335d8123fb64613de6f0f3507a554f0d2f92dc3e29838f7771d92b9d1a87",

@@ -8,13 +8,13 @@ func StripHostPort(host string) string {
 	}
 
 	if strings.HasPrefix(host, "[") {
-		if i := strings.LastIndex(host, "]"); i != -1 {
-			return host[:i+1]
+		if i := strings.IndexByte(host, ']'); i != -1 {
+			return host[1:i]
 		}
 		return host
 	}
 
-	if i := strings.LastIndex(host, ":"); i != -1 {
+	if i := strings.IndexByte(host, ':'); i != -1 && i == strings.LastIndex(host, ":") {
 		return host[:i]
 	}
 

@@ -9,6 +9,7 @@ trusted_paths = [
   "contracts/",
   "harness/",
   "harness/telemetry_driver/",     # the Tier 2 driver (main.go): named in driver_paths
+  "cmd/gate-ast/",                 # the AST gate: more specific than the cmd/ source path, so pinned
   "go.mod",
   "go.sum",
   "go.work",
@@ -20,8 +21,12 @@ trusted_paths = [
 ]
 
 [ast]
-command = []
-none_reason = "No AST engine for Go in this kit; complexity is not ratcheted. Recorded under ## Gaps in contracts/SPEC.md."
+# The Go archetype gate (architecture.md section 14): McCabe <= 10 per function,
+# with the pinned .crucible/baseline.json ratchet for pre-adoption code. main.go
+# is not an argument: a source file named in argv breaks command closure.
+command = ["go", "run", "./cmd/gate-ast", "-json", "-limit", "10", "./internal", "./cmd"]
+none_reason = ""
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off"}
 
 # .gitignore ignores go.work, and an ignored workspace file changes which code
 # `go` loads. GOWORK=off in every command disables it; the digests below also

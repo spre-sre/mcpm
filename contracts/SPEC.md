@@ -50,7 +50,8 @@ The accept side of each invariant is also checked:
 
 ## Gaps
 
-- No AST engine for Go in this kit; complexity is not ratcheted. Recorded under ## Gaps in contracts/SPEC.md.
+- Go: no entropy check and no source-rule engine. Step 0 runs cmd/gate-ast (McCabe <= 10 per function; 12 pre-adoption functions grandfathered in .crucible/baseline.json, which may only go down).
+- main.go is not scanned by the AST gate (a source file in the gate's argv breaks command closure); it has one function with McCabe 1.
 - Go: code under test shares the test process; it could write CRUCIBLE_RESULTS or call os.Exit. Not statically checked.
 - The functions return plain `fmt.Errorf` errors, not sentinel errors. The tests map an error to a code by its message prefix, so a reworded message fails Tier 1 until a human updates the tests.
 - `cmd` rules (argument counts, URL schemes in `parseScheme`, transport detection, `-e KEY=VALUE` parsing) are unexported, and `cmd.Execute` calls `os.Exit`. No contract covers them without a source change.
