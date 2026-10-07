@@ -2,10 +2,9 @@
   "functions": {
     "cmd/add.go::addToGeminiCLI": 11,
     "cmd/add.go::glob.func1": 15,
-    "internal/builder/node.go::buildNode": 13,
+    "internal/builder/node.go::buildNode": 11,
     "internal/builder/node.go::findMonorepoEntry": 14,
     "internal/builder/python.go::buildPython": 11,
-    "internal/injector/gemini_cli.go::updateGeminiCLI": 13,
     "internal/tui/helpers.go::updateClientSelection": 12,
     "internal/tui/installer.go::Model.Update": 13,
     "internal/tui/installer.go::Model.View": 12,
