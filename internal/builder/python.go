@@ -6,17 +6,32 @@ import (
 	"runtime"
 )
 
-func buildPython(path string) (*BuildResult, error) {
-	// Create venv
-	venvPath := filepath.Join(path, ".venv")
-	// Force python3
-	if err := runShellCmd(path, "python3 -m venv .venv"); err != nil {
-		// Fallback to just python
-		if err := runShellCmd(path, "python -m venv .venv"); err != nil {
-			return nil, fmt.Errorf("failed to create venv: %w", err)
-		}
+func ensureVenv(repoPath string, run func(dir, command string) error) error {
+	venvPath := filepath.Join(repoPath, ".venv")
+	interpreterPath := filepath.Join(venvPath, "bin", "python")
+	if runtime.GOOS == "windows" {
+		interpreterPath = filepath.Join(venvPath, "Scripts", "python.exe")
+	}
+	cfgPath := filepath.Join(venvPath, "pyvenv.cfg")
+
+	if exists(interpreterPath) && exists(cfgPath) {
+		return nil
 	}
 
+	if err := run(repoPath, "python3 -m venv .venv"); err != nil {
+		if err2 := run(repoPath, "python -m venv .venv"); err2 != nil {
+			return fmt.Errorf("failed to create venv: %w", err2)
+		}
+	}
+	return nil
+}
+
+func buildPython(path string) (*BuildResult, error) {
+	if err := ensureVenv(path, runShellCmd); err != nil {
+		return nil, err
+	}
+
+	venvPath := filepath.Join(path, ".venv")
 	pipPath := filepath.Join(venvPath, "bin", "pip")
 	pythonPath := filepath.Join(venvPath, "bin", "python")
 	if runtime.GOOS == "windows" {
@@ -46,8 +61,6 @@ func buildPython(path string) (*BuildResult, error) {
 	}
 
 	if entryPoint == "" {
-		// Fallback: try to see if the package installed a CLI bin?
-		// For now, fail if no script found.
 		return nil, fmt.Errorf("could not auto-detect python entry point")
 	}
 
