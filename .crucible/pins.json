@@ -6,7 +6,7 @@
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
     "bin/crucible": "efb3fc52d93071c753028f3e5f88081cc4e815bd7254b352ae698dd889e070d4",
-    "cmd/gate-ast/main.go": "813fd556453250c906c15ac6699c228df052979d635cf974ad4da4818b1dda8b",
+    "cmd/gate-ast/main.go": "f787900f4e984863bdfbcc8442c6b578bcc03d5cc42e884ce314fc712689c049",
     "contracts/SPEC.md": "aae7da17dc347eb3e854d538f428f8632a43973612ddb0d1954d51c2de882030",
     "go.mod": "b5d4b8c7fea4ca0b2d6dba309b526a3d0d1a1dc260bf813c3858b6089b2c1dee",
     "go.sum": "7b5b79d1a85e6dde66282448f6459657886198cf92ca1f9969c42cd558b7f2ed",

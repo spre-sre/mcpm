@@ -7,8 +7,11 @@
 //
 // Counting (base 1 per unit): +1 for each if, for, range, non-default case
 // and non-default select case, and each && or ||. Every function declaration
-// and every function literal is a separate unit; a literal is not counted
-// into its enclosing function. Exit codes: 0 pass, 1 violations, 2 error.
+// is a unit, and every function literal inside it counts toward it, so a
+// closure (immediately invoked or not) cannot split one function's branches
+// into units that each pass. A literal outside any function declaration
+// (for example a cobra RunE in a var) is its own unit, glob.funcN, and the
+// literals inside it count toward it. Exit codes: 0 pass, 1 violations, 2 error.
 package main
 
 import (
@@ -495,7 +498,7 @@ func fileUnits(ctx *scope, parsed *ast.File) []unit {
 		switch item := decl.(type) {
 		case *ast.FuncDecl:
 			if item.Body != nil {
-				units = append(units, measureTree(ctx, declName(item), item.Pos(), item.Body)...)
+				units = append(units, measureUnit(ctx, declName(item), item.Pos(), item.Body))
 			}
 		case *ast.GenDecl:
 			units = append(units, globalLits(ctx, item)...)
@@ -504,45 +507,47 @@ func fileUnits(ctx *scope, parsed *ast.File) []unit {
 	return units
 }
 
-// globalLits measures function literals outside any function declaration.
+// globalLits measures the outermost function literals outside any function
+// declaration, one unit each (numbered in source order per file).
 func globalLits(ctx *scope, decl *ast.GenDecl) []unit {
 	var units []unit
-	_, lits := measure(decl)
-	for _, lit := range lits {
+	for _, lit := range outermostLits(decl) {
 		ctx.globals++
 		name := fmt.Sprintf("glob.func%d", ctx.globals)
-		units = append(units, measureTree(ctx, name, lit.Pos(), lit.Body)...)
+		units = append(units, measureUnit(ctx, name, lit.Pos(), lit.Body))
 	}
 	return units
 }
 
-// measureTree returns the unit for body and, separately, one for each
-// function literal inside it (numbered in source order).
-func measureTree(ctx *scope, name string, pos token.Pos, body *ast.BlockStmt) []unit {
-	score, lits := measure(body)
-	units := []unit{{key: ctx.rel + "::" + name, file: ctx.rel, name: name,
-		line: ctx.fset.Position(pos).Line, score: score}}
-	for index, lit := range lits {
-		inner := fmt.Sprintf("%s.func%d", name, index+1)
-		units = append(units, measureTree(ctx, inner, lit.Pos(), lit.Body)...)
-	}
-	return units
-}
-
-// measure returns the McCabe score of root and its direct function literals,
-// which it does not descend into.
-func measure(root ast.Node) (int, []*ast.FuncLit) {
-	score := 1
+// outermostLits returns the function literals in root that are not inside
+// another function literal.
+func outermostLits(root ast.Node) []*ast.FuncLit {
 	var lits []*ast.FuncLit
 	ast.Inspect(root, func(node ast.Node) bool {
-		if lit, ok := node.(*ast.FuncLit); ok {
+		lit, ok := node.(*ast.FuncLit)
+		if ok {
 			lits = append(lits, lit)
-			return false
 		}
+		return !ok
+	})
+	return lits
+}
+
+// measureUnit returns the unit for body, scored over everything inside it.
+func measureUnit(ctx *scope, name string, pos token.Pos, body *ast.BlockStmt) unit {
+	return unit{key: ctx.rel + "::" + name, file: ctx.rel, name: name,
+		line: ctx.fset.Position(pos).Line, score: measure(body)}
+}
+
+// measure returns the McCabe score of root. It descends into function
+// literals, so their branches count toward the unit that contains them.
+func measure(root ast.Node) int {
+	score := 1
+	ast.Inspect(root, func(node ast.Node) bool {
 		score += weight(node)
 		return true
 	})
-	return score, lits
+	return score
 }
 
 func weight(node ast.Node) int {
