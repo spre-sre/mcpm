@@ -23,12 +23,10 @@ func Clone(url string) (string, error) {
 		return "", fmt.Errorf("failed to create .mcp directory: %w", err)
 	}
 
-	// Derive folder name from URL (e.g., server-filesystem)
-	parts := strings.Split(url, "/")
-	repoName := strings.TrimSuffix(parts[len(parts)-1], ".git")
-	// Add timestamp to avoid collisions or simple overwrites for now
-	// Ideally we check if it exists and pull, but for safety lets use a unique-ish name
-	// actually for a manager, we usually want one instance.
+	repoName, err := repoNameFromURL(url)
+	if err != nil {
+		return "", err
+	}
 	targetPath := filepath.Join(baseDir, repoName)
 
 	if _, err := os.Stat(targetPath); err == nil {
@@ -90,6 +88,16 @@ func GetServerPath(name string) (string, error) {
 	}
 
 	return serverPath, nil
+}
+
+func repoNameFromURL(url string) (string, error) {
+	trimmed := strings.TrimRight(url, "/")
+	parts := strings.Split(trimmed, "/")
+	name := strings.TrimSuffix(parts[len(parts)-1], ".git")
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		return "", fmt.Errorf("cannot derive repository name from URL %q", url)
+	}
+	return name, nil
 }
 
 // ListServers returns a list of installed server names
