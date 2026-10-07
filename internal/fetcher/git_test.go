@@ -8,7 +8,7 @@ import (
 )
 
 func TestClone_TrailingSlash(t *testing.T) {
-	tmp := t.TempDir()
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	orig, _ := os.Getwd()
 	t.Cleanup(func() { os.Chdir(orig) })
 	os.Chdir(tmp)
@@ -26,7 +26,7 @@ func TestClone_TrailingSlash(t *testing.T) {
 }
 
 func TestClone_TrailingSlashDotGit(t *testing.T) {
-	tmp := t.TempDir()
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	orig, _ := os.Getwd()
 	t.Cleanup(func() { os.Chdir(orig) })
 	os.Chdir(tmp)
