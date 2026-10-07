@@ -34,7 +34,7 @@ Examples:
   # Remove from global configuration
   mcpm remove myserver --global`,
 	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
 
 		// Default to both if neither specified
@@ -50,9 +50,13 @@ Examples:
 			scope = "user"
 		}
 
+		cmd.SilenceUsage = true
+		errs := make(map[string]error)
+
 		if removeClaudeCode {
 			if err := removeFromClaudeCode(cwd, name, scope); err != nil {
-				fmt.Printf("Error removing from Claude Code: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error removing from Claude Code: %v\n", err)
+				errs["Claude Code"] = err
 			} else {
 				if removeGlobal {
 					fmt.Printf("Removed %s from Claude Code (global)\n", name)
@@ -64,7 +68,8 @@ Examples:
 
 		if removeGeminiCLI {
 			if err := removeFromGeminiCLI(cwd, name, removeGlobal); err != nil {
-				fmt.Printf("Error removing from Gemini CLI: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error removing from Gemini CLI: %v\n", err)
+				errs["Gemini CLI"] = err
 			} else {
 				if removeGlobal {
 					fmt.Printf("Removed %s from Gemini CLI (global)\n", name)
@@ -73,6 +78,8 @@ Examples:
 				}
 			}
 		}
+
+		return clientFailures("remove", errs)
 	},
 }
 

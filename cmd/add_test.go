@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -277,5 +278,43 @@ func TestAddGeminiNoFileCreatesOne(t *testing.T) {
 	}
 	if _, ok := mcpServers["fresh"]; !ok {
 		t.Error("server fresh was not created")
+	}
+}
+
+func TestClientFailuresNoErrors(t *testing.T) {
+	errs := map[string]error{}
+	if err := clientFailures("add", errs); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+func TestClientFailuresOneError(t *testing.T) {
+	errs := map[string]error{
+		"Gemini CLI": fmt.Errorf("could not parse settings"),
+	}
+	err := clientFailures("add", errs)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "Gemini CLI") {
+		t.Errorf("expected error to name Gemini CLI, got: %v", err)
+	}
+}
+
+func TestClientFailuresTwoErrors(t *testing.T) {
+	errs := map[string]error{
+		"Claude Code": fmt.Errorf("command not found"),
+		"Gemini CLI":  fmt.Errorf("could not parse settings"),
+	}
+	err := clientFailures("remove", errs)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Claude Code") {
+		t.Errorf("expected error to name Claude Code, got: %v", err)
+	}
+	if !strings.Contains(msg, "Gemini CLI") {
+		t.Errorf("expected error to name Gemini CLI, got: %v", err)
 	}
 }

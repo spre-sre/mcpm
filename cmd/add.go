@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -92,9 +93,13 @@ Examples:
 			scope = "user"
 		}
 
+		cmd.SilenceUsage = true
+		errs := make(map[string]error)
+
 		if addClaudeCode {
 			if err := addToClaudeCode(cwd, name, commandOrURL, serverArgs, env, addTransport, scope); err != nil {
-				fmt.Printf("Error adding to Claude Code: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error adding to Claude Code: %v\n", err)
+				errs["Claude Code"] = err
 			} else {
 				if addGlobal {
 					fmt.Printf("Added %s to Claude Code (global)\n", name)
@@ -106,7 +111,8 @@ Examples:
 
 		if addGeminiCLI {
 			if err := addToGeminiCLI(cwd, name, commandOrURL, serverArgs, env, addTransport, addGlobal); err != nil {
-				fmt.Printf("Error adding to Gemini CLI: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error adding to Gemini CLI: %v\n", err)
+				errs["Gemini CLI"] = err
 			} else {
 				if addGlobal {
 					fmt.Printf("Added %s to Gemini CLI (global)\n", name)
@@ -116,7 +122,7 @@ Examples:
 			}
 		}
 
-		return nil
+		return clientFailures("add", errs)
 	},
 }
 
@@ -263,6 +269,18 @@ func validateTransport(transport string) error {
 	default:
 		return fmt.Errorf("invalid transport %q: must be stdio, http, or sse", transport)
 	}
+}
+
+func clientFailures(action string, errs map[string]error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(errs))
+	for name := range errs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("failed to %s server in %s", action, strings.Join(names, ", "))
 }
 
 func init() {
