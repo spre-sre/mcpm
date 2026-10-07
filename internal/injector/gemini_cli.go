@@ -2,6 +2,7 @@ package injector
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +27,9 @@ func (c *GeminiConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var m map[string]json.RawMessage
-	json.Unmarshal(data, &m)
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
 	delete(m, "mcpServers")
 	c.OtherFields = m
 	return nil
@@ -39,6 +42,21 @@ func (c GeminiConfig) MarshalJSON() ([]byte, error) {
 	}
 	output["mcpServers"] = c.McpServers
 	return json.MarshalIndent(output, "", "  ")
+}
+
+func loadGeminiConfig(path string) (GeminiConfig, error) {
+	var cfg GeminiConfig
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cfg, nil
+	}
+	if err != nil {
+		return cfg, fmt.Errorf("could not read %s: %w", path, err)
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("could not parse %s: %w", path, err)
+	}
+	return cfg, nil
 }
 
 func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
@@ -62,9 +80,9 @@ func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]str
 		return fmt.Errorf("could not create .gemini dir: %w", err)
 	}
 
-	var cfg GeminiConfig
-	if data, err := os.ReadFile(configPath); err == nil {
-		json.Unmarshal(data, &cfg)
+	cfg, err := loadGeminiConfig(configPath)
+	if err != nil {
+		return err
 	}
 	if cfg.McpServers == nil {
 		cfg.McpServers = make(map[string]McpServerDef)
