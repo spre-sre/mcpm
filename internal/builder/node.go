@@ -2,6 +2,7 @@ package builder
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,9 +10,22 @@ import (
 )
 
 type PackageJSON struct {
+	Name    string            `json:"name"`
 	Scripts map[string]string `json:"scripts"`
 	Main    string            `json:"main"`
 	Bin     interface{}       `json:"bin"`
+}
+
+func readPackageJSON(path string) (PackageJSON, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return PackageJSON{}, fmt.Errorf("could not read %s: %w", path, err)
+	}
+	var pkg PackageJSON
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return PackageJSON{}, fmt.Errorf("invalid package.json at %s: %w", path, err)
+	}
+	return pkg, nil
 }
 
 func commandExists(cmd string) bool {
@@ -39,12 +53,8 @@ func findMonorepoEntry(path string) string {
 		}
 
 		// Check package.json for bin or main
-		pkgJSON := filepath.Join(pkgPath, "package.json")
-		if exists(pkgJSON) {
-			data, _ := os.ReadFile(pkgJSON)
-			var pkg PackageJSON
-			json.Unmarshal(data, &pkg)
-
+		pkg, err := readPackageJSON(filepath.Join(pkgPath, "package.json"))
+		if err == nil {
 			if pkg.Main != "" {
 				mainPath := filepath.Join(pkgPath, pkg.Main)
 				if exists(mainPath) {
@@ -67,17 +77,9 @@ func findMonorepoEntry(path string) string {
 			continue
 		}
 		pkgPath := filepath.Join(packagesDir, entry.Name())
-		pkgJSON := filepath.Join(pkgPath, "package.json")
 
-		if exists(pkgJSON) {
-			data, _ := os.ReadFile(pkgJSON)
-			var pkg struct {
-				Name string `json:"name"`
-				Bin  interface{} `json:"bin"`
-			}
-			json.Unmarshal(data, &pkg)
-
-			// Check if this looks like an MCP package
+		pkg, err := readPackageJSON(filepath.Join(pkgPath, "package.json"))
+		if err == nil {
 			if strings.Contains(pkg.Name, "mcp") || pkg.Bin != nil {
 				distEntry := filepath.Join(pkgPath, "dist", "index.js")
 				if exists(distEntry) {
@@ -90,7 +92,25 @@ func findMonorepoEntry(path string) string {
 	return ""
 }
 
+func findStandardEntry(path string, pkg PackageJSON) string {
+	entryFile := "index.js"
+	if pkg.Main != "" {
+		entryFile = pkg.Main
+	}
+	if exists(filepath.Join(path, "dist", "index.js")) {
+		entryFile = filepath.Join("dist", "index.js")
+	} else if exists(filepath.Join(path, "build", "index.js")) {
+		entryFile = filepath.Join("build", "index.js")
+	}
+	return filepath.Join(path, entryFile)
+}
+
 func buildNode(path string) (*BuildResult, error) {
+	pkg, err := readPackageJSON(filepath.Join(path, "package.json"))
+	if err != nil {
+		return nil, err
+	}
+
 	mgr := "npm"
 	if exists(filepath.Join(path, "yarn.lock")) && commandExists("yarn") {
 		mgr = "yarn"
@@ -103,11 +123,6 @@ func buildNode(path string) (*BuildResult, error) {
 	if err := runShellCmd(path, mgr+" install"); err != nil {
 		return nil, err
 	}
-
-	// Build if script exists
-	pkgData, _ := os.ReadFile(filepath.Join(path, "package.json"))
-	var pkg PackageJSON
-	json.Unmarshal(pkgData, &pkg)
 
 	if _, hasBuild := pkg.Scripts["build"]; hasBuild {
 		if err := runShellCmd(path, mgr+" run build"); err != nil {
@@ -125,17 +140,7 @@ func buildNode(path string) (*BuildResult, error) {
 
 	// If not found in monorepo, use standard detection
 	if absEntry == "" {
-		entryFile := "index.js"
-		if pkg.Main != "" {
-			entryFile = pkg.Main
-		}
-		// Check dist/
-		if exists(filepath.Join(path, "dist", "index.js")) {
-			entryFile = filepath.Join("dist", "index.js")
-		} else if exists(filepath.Join(path, "build", "index.js")) {
-			entryFile = filepath.Join("build", "index.js")
-		}
-		absEntry = filepath.Join(path, entryFile)
+		absEntry = findStandardEntry(path, pkg)
 	}
 
 	return &BuildResult{
