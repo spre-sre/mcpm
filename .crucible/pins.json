@@ -2,7 +2,7 @@
   "genesis": "60fbae26dbbbd777b990ff6161b4ef04e418c14c",
   "pins": {
     ".crucible/baseline.json": "05202be421c678d05bd7f921be788cc4388c41be6fe5fcc2c700aa6258f84daa",
-    ".crucible/config.toml": "ce02f99b704b98d389b506ff6fdd90626c128c86a05cf504459c8110f693c955",
+    ".crucible/config.toml": "205c609adcc8e9a8b51056f6bf7e18bf6c009801652fe4177b633133d372aebe",
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
     "bin/crucible": "efb3fc52d93071c753028f3e5f88081cc4e815bd7254b352ae698dd889e070d4",

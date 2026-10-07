@@ -38,7 +38,7 @@ digest_globs = ["go.work", "go.work.sum"]
 [tier1]
 # Only the harness package, only the contract tests: a test file elsewhere
 # would run with CRUCIBLE_RESULTS in its environment.
-command = ["go", "test", "-count=1", "-run", "^TestCrucible_INV_", "./harness"]
+command = ["go", "test", "-count=1", "-run", "^TestCrucible_INV_", "./harness", "./cmd/...", "./internal/...", "./harness/..."]
 contract_tests = ["harness/crucible_contracts_test.go"]
 timeout_seconds = 900
 # A source change that reaches a Node, Python or Go build must not use the
