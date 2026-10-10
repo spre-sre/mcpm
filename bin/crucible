@@ -12,7 +12,14 @@ mcp, ci, preflight, and the hook entry points hook-pre-commit, hook-commit-msg,
 hook-post-commit, hook-pre-push (run from the pinned checker snapshot).
 """
 
+import os
 import sys
+
+# G16: run isolated (-I) so that no work-tree directory (bin/, the current directory) and no
+# PYTHONPATH or user site comes before the standard library. A planted argparse.py or json.py
+# must never run. Checked before any other import. Imports of this file as a module do nothing.
+if __name__ == "__main__" and not sys.flags.isolated:
+    os.execv(sys.executable, [sys.executable, "-I", *sys.argv])
 
 sys.dont_write_bytecode = True  # never write __pycache__ into gated or pinned trees
 
@@ -20,23 +27,22 @@ import argparse  # noqa: E402
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
 import importlib.util  # noqa: E402
-import io  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
-import os  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import shutil  # noqa: E402
 import signal  # noqa: E402
+import stat  # noqa: E402
 import subprocess  # noqa: E402
-import tarfile  # noqa: E402
 import tempfile  # noqa: E402
 import time  # noqa: E402
 import tomllib  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "scripts"))
+# Appended, never inserted first: a stdlib-named file in scripts/ must not shadow the standard library.
+sys.path.append(str(HERE.parent / "scripts"))
 
 import mint_attestation as ma  # noqa: E402
 import verify_pins as vp  # noqa: E402
@@ -85,12 +91,14 @@ def tail(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None = None,
-             split: bool = False):
+             split: bool = False, ws: Path | None = None):
     """Run an argv list (never a shell) with a timeout, in its own process
     group so a timeout kills the whole tree. Returns (returncode, output,
     timed_out, seconds). returncode is 127 when the program cannot start. With
-    split, stderr is relayed to our stderr and `output` is stdout alone."""
-    env = dict(os.environ)  # the CLI adds only the section's env table and CRUCIBLE_* (12.1)
+    split, stderr is relayed to our stderr and `output` is stdout alone. `ws`
+    is the repository: the command's own git calls then get the hardened
+    configuration (architecture 16.1) and lose the location variables."""
+    env = vp.gate_environment(os.environ, ws)  # plus the section's env table and CRUCIBLE_* (12.1)
     env.update(env_extra or {})
     started = time.monotonic()
     try:
@@ -271,7 +279,7 @@ def run_ast(ws: Path, cfg: dict) -> dict:
                 "warning": f"no AST engine: {reason}"}
     code, output, timed_out, seconds = run_argv(vp.expand_command(command), ws,
                                                 AST_TIMEOUT_SECONDS, env_extra=cfg["ast"]["env"],
-                                                split=True)
+                                                split=True, ws=ws)
     result = {"command": command, "exit_code": code, "duration_seconds": round(seconds, 3),
               "report": None}
     if timed_out:
@@ -314,7 +322,8 @@ def run_step0(ws: Path, cfg: dict, rules) -> dict:
     reasons = []
     if closure:
         reasons.append("command closure: these files are run or read by the gate commands but "
-                       "are not pinned: " + ", ".join(closure))
+                       "are not pinned (a git-ignored one is the environment only when a human "
+                       "admits it in [gate] ignored_allow): " + ", ".join(closure))
     if not ast["passed"]:
         reasons.append(f"AST gate failed: {ast.get('error') or 'see step0.ast.report'}")
     reasons += [f"SPEC.md: {e}" for e in spec_errors]
@@ -398,7 +407,7 @@ def run_tier1(ws: Path, cfg: dict) -> dict:
         code, output, timed_out, seconds = run_argv(
             vp.expand_command(command), ws, cfg["tier1"]["timeout_seconds"],
             env_extra={**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results),
-                       "CRUCIBLE_RESULTS_NONCE": nonce})
+                       "CRUCIBLE_RESULTS_NONCE": nonce}, ws=ws)
         out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
                    timed_out=timed_out)
         if timed_out or code != 0:
@@ -425,6 +434,7 @@ def trust_gate(ws: Path, result: dict):
     tree) or None after recording the failure in `result`."""
     try:
         state, trust, secret, cfg, rules = vp.require_anchor(ws)
+        vp.require_sound_repository(ws)
         tree = vp.working_tree(ws, rules)
         vp.require_pins(trust, tree, rules, "work tree")
         vp.require_environment(ws, trust, cfg, rules)
@@ -470,6 +480,55 @@ def gate_stages(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
     return True
 
 
+def ignored_files_pass(ws: Path, cfg: dict, rules, result: dict, when: str) -> bool:
+    """B1. False, with `result` failed (exit 1, stage step0), when a git-ignored file in the
+    repository is not admitted by a pinned `[gate] ignored_allow` glob. The pins, the token
+    and the closure cannot see such a file, but test tools can load it."""
+    report = vp.ignored_report(ws, rules, cfg)
+    if report is None:
+        return True
+    result["ignored_files"] = {key: report[key] for key in ("count", "files", "truncated")}
+    result["reasons"].append(report["message"])
+    fail(result, "step0", EXIT_GATE, f"git-ignored files found {when}")
+    return False
+
+
+def checked_stages(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
+    """gate_stages bracketed by the ignored-file check (B2): before Step 0, so no gate code
+    runs over an unaccounted file, and after Tier 1, which may have written one."""
+    return (ignored_files_pass(ws, cfg, rules, result, "before Step 0")
+            and gate_stages(ws, cfg, rules, tree, result)
+            and ignored_files_pass(ws, cfg, rules, result, "after Tier 1"))
+
+
+def record_tier2(result: dict, t2: dict) -> None:
+    """Put the Tier 2 summary into `result`; a violation found around Tier 2 also sets the
+    top-level `ignored_files`, as every other stage does."""
+    result["tier2"] = tier2_summary(t2)
+    if "ignored_files" in t2:
+        result["ignored_files"] = t2["ignored_files"]
+
+
+def ignored_tier2_result(report: dict, when: str) -> dict:
+    """A run_tier2-shaped failure (exit 1, stage step0) for a git-ignored file found `when`."""
+    return {"verdict": "ERROR_IGNORED_FILES", "stage": "step0",
+            "reasons": [report["message"], f"git-ignored files found {when}"],
+            "ignored_files": {key: report[key] for key in ("count", "files", "truncated")}}
+
+
+def checked_tier2(ws: Path, cfg: dict, rules, **options) -> dict:
+    """run_tier2 bracketed by the ignored-file check (B2): before the drivers start and, when
+    the verdict is a pass, after they finish. A failing verdict is kept as it is."""
+    report = vp.ignored_report(ws, rules, cfg)
+    if report is not None:
+        return ignored_tier2_result(report, "before Tier 2")
+    out = run_tier2(ws, cfg, rules, **options)
+    if out["verdict"] not in GATE_PASS_VERDICTS:
+        return out
+    report = vp.ignored_report(ws, rules, cfg)
+    return out if report is None else ignored_tier2_result(report, "after Tier 2")
+
+
 def issue_token(ws: Path, secret: bytes, cfg: dict, tree: dict, result: dict, level: str,
                 verdict: str, tier2: dict | None) -> dict:
     report = {"step0": result["step0"], "tier1": result["tier1"], "tier2": tier2}
@@ -499,16 +558,10 @@ def load_telemetry_math(ws: Path):
     return module
 
 
-def extract_head(ws: Path, destination: Path) -> None:
-    data = vp.git(ws, "archive", "--format=tar", "HEAD", timeout=600)
-    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-        if hasattr(tarfile, "data_filter"):
-            archive.extractall(destination, filter="data")
-        else:  # pragma: no cover - old interpreters
-            for member in archive.getmembers():
-                if member.name.startswith(("/", "..")) or ".." in Path(member.name).parts:
-                    raise KitError(f"unsafe path in git archive: {member.name}")
-            archive.extractall(destination)
+def extract_head(ws: Path, destination: Path, commit: str = "HEAD") -> None:
+    """The Tier 2 baseline tree: `commit` written from verified raw objects
+    (architecture 16.4), not by `git archive`."""
+    vp.extract_commit(ws, commit, destination)
 
 
 def command_for(ws: Path, command: list[str], cwd: Path, rules) -> list[str]:
@@ -554,7 +607,7 @@ def run_driver(ws: Path, tree: Path, command: list[str], rules, samples: int, se
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Tier 2 time budget exhausted")
-    code, output, timed_out, _ = run_argv(argv, tree, remaining, env_extra=env)
+    code, output, timed_out, _ = run_argv(argv, tree, remaining, env_extra=env, ws=ws)
     if timed_out:
         raise TimeoutError("the telemetry driver timed out")
     if code != 0:
@@ -580,9 +633,9 @@ def driver_problems(tree: Path, cfg: dict, rules, drivers: list[str], label: str
 
 def baseline_config_bytes(ws: Path, head: str | None) -> bytes | None:
     """HEAD's own .crucible/config.toml, or None when HEAD has none."""
-    if not head or not vp.git_ok(ws, "cat-file", "-e", f"{head}:{vp.CONFIG_REL}"):
+    if not head:
         return None
-    return vp.git(ws, "show", f"{head}:{vp.CONFIG_REL}", timeout=60)
+    return vp.committed_blob(ws, head, vp.CONFIG_REL)
 
 
 def baseline_has_tier2(raw_config: bytes) -> bool:
@@ -641,7 +694,7 @@ def prepare_baseline(ws: Path, head: str, base_dir: Path, raw_config: bytes) -> 
     """Extract HEAD and read ITS config (12.3). Returns (cfg, rules, drivers,
     problems): the baseline is measured with its own command, env and drivers."""
     base_dir.mkdir()
-    extract_head(ws, base_dir)
+    extract_head(ws, base_dir, head)
     try:
         base_cfg = vp.parse_config(raw_config.decode())
     except (ConfigError, UnicodeDecodeError) as exc:
@@ -730,7 +783,7 @@ def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
     except TimeoutError as exc:
         out.update(verdict="ERROR_TIMEOUT", stage="timeout", reasons=[str(exc)])
         return out
-    except (KitError, ValueError, OSError, tarfile.TarError) as exc:
+    except (KitError, ValueError, OSError) as exc:
         out["reasons"].append(str(exc))
         return out
     finally:
@@ -832,7 +885,7 @@ def cmd_verify(ws: Path, args) -> dict:
     if gate is None:
         return result
     _state, _trust, secret, cfg, rules, tree = gate
-    if not gate_stages(ws, cfg, rules, tree, result):
+    if not checked_stages(ws, cfg, rules, tree, result):
         return result
     issue_token(ws, secret, cfg, tree, result, "verify", "PASS", None)
     result["verdict"] = "PASS"
@@ -845,10 +898,10 @@ def cmd_telemetry(ws: Path, args) -> dict:
     if gate is None:
         return result
     state, trust, _secret, cfg, rules, _tree = gate
-    t2 = run_tier2(ws, cfg, rules, seed=getattr(args, "seed", None),
-                   genesis=trust.get("genesis"),
-                   prior_promotions=bool(ma.promotion_commits(state)))
-    result["tier2"] = tier2_summary(t2)
+    t2 = checked_tier2(ws, cfg, rules, seed=getattr(args, "seed", None),
+                       genesis=trust.get("genesis"),
+                       prior_promotions=bool(ma.promotion_commits(state)))
+    record_tier2(result, t2)
     result["verdict"] = t2["verdict"]
     if t2["verdict"] not in GATE_PASS_VERDICTS:
         result["reasons"] += t2["reasons"]
@@ -861,40 +914,238 @@ def stage_gated(ws: Path, rules) -> list[str]:
     return sorted(p for p in paths if rules.is_gated(p) and not vp.is_local_state(p))
 
 
+HIDDEN_REMEDY = {
+    "skip-worktree": "git update-index --no-skip-worktree {path} (or git sparse-checkout disable)",
+    "assume-unchanged": "git update-index --no-assume-unchanged {path}",
+}
+
+
+def hidden_bits(tag: str) -> list[str]:
+    """The index bits that `ls-files -v` shows in `tag`: S is skip-worktree, a lower-case tag
+    is assume-unchanged (s is both)."""
+    bits = ["skip-worktree"] if tag in "Ss" else []
+    return bits + (["assume-unchanged"] if tag.islower() else [])
+
+
+def hidden_entries(ws: Path, rules, only: list[str] | None = None) -> list[tuple[str, list[str]]]:
+    """(path, bits) of each gated index entry that git hides from the work tree: skip-worktree
+    (sparse checkout sets it too) or assume-unchanged. `only` limits the check to those paths."""
+    found = []
+    for record in vp.split_z(vp.git(ws, "ls-files", "-v", "-z")):
+        path, bits = record[2:], hidden_bits(record[:1])
+        if bits and (only is None or path in only) and (rules is None or rules.is_gated(path)) \
+                and not vp.is_local_state(path):
+            found.append((path, bits))
+    return found
+
+
+def hidden_message(entries: list[tuple[str, list[str]]]) -> str:
+    """The refusal text: each path, its bits and the command that clears them."""
+    parts = [f"{path} ({' and '.join(bits)}): " + " or ".join(HIDDEN_REMEDY[bit].format(path=path)
+                                                              for bit in bits)
+             for path, bits in entries[:5]]
+    more = f"; and {len(entries) - 5} more" if len(entries) > 5 else ""
+    return ("the index hides the work-tree state of gated paths, so git status does not show "
+            "what promote would commit: " + "; ".join(parts) + more)
+
+
+def hidden_refusal(ws: Path, rules, result: dict) -> dict | None:
+    """The failed result (exit 1, stage step0) when a gated path is hidden in the index, else None."""
+    entries = hidden_entries(ws, rules)
+    return fail(result, "step0", EXIT_GATE, hidden_message(entries)) if entries else None
+
+
+def zero_oid(ws: Path) -> str:
+    """The all-zero object id of this repository's hash width (40 or 64 digits)."""
+    width = len(vp.git(ws, "hash-object", "--stdin", input_bytes=b"").decode().strip())
+    return "0" * width
+
+
+def file_mode(path: Path, recorded: str | None = None) -> str:
+    """The index mode for a regular file. `recorded` is the mode git already
+    records for the path when core.fileMode is false (the file's own bit is not
+    to be believed then); otherwise the owner execute bit decides."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise KitError(f"{path.name}: not a regular file; it cannot be staged")
+    if recorded is not None:
+        return recorded
+    return "100755" if info.st_mode & stat.S_IXUSR else "100644"
+
+
+def core_file_mode(ws: Path) -> bool:
+    """The effective core.fileMode (all scopes, clean environment); git's default is true."""
+    proc = vp._probe(ws, "config", "--type=bool", "--get", "core.fileMode")
+    if proc.returncode not in (0, 1):
+        raise KitError(f"git config core.fileMode failed: {proc.stderr.decode(errors='replace').strip()}")
+    return not (proc.returncode == 0 and proc.stdout.strip() == b"false")
+
+
+def index_modes(ws: Path, paths: set[str]) -> dict[str, str]:
+    """path -> mode of each of `paths` that the index holds (`ls-files -s -z`)."""
+    modes = {}
+    for record in vp.split_z(vp.git(ws, "ls-files", "-s", "-z")):
+        meta, _, name = record.partition("\t")
+        if name in paths:
+            modes[name] = meta.split()[0]
+    return modes
+
+
+def head_modes(ws: Path) -> dict[str, str]:
+    """path -> mode of every non-directory entry of HEAD, from one re-hashed walk of its trees."""
+    head = vp.head_commit(ws)
+    return {path: mode for mode, _, path in vp.tree_entries(ws, head)} if head else {}
+
+
+def recorded_modes(ws: Path, live: list[str]) -> dict[str, str] | None:
+    """None when core.fileMode is true (the file decides). Otherwise path -> the mode
+    git already records: the index entry, else HEAD's entry, else 100644 (M4)."""
+    if core_file_mode(ws):
+        return None
+    modes = index_modes(ws, set(live))
+    missing = [path for path in live if path not in modes]
+    committed = head_modes(ws) if missing else {}
+    modes.update({path: committed.get(path, "100644") for path in missing})
+    return {path: mode if mode in ("100644", "100755") else "100644"
+            for path, mode in modes.items()}
+
+
+def hash_files(ws: Path, paths: list[str]) -> list[str]:
+    """Hash the files raw into the object store (`hash-object -w --no-filters
+    --stdin-paths`; the `./` prefix keeps a leading quote from being unquoted)
+    and return their ids in order."""
+    listing = "".join(f"./{path}\n" for path in paths).encode("utf-8", "surrogateescape")
+    oids = vp.git(ws, "hash-object", "-w", "--no-filters", "--stdin-paths",
+                  input_bytes=listing, timeout=600).decode().split()
+    if len(oids) != len(paths):
+        raise KitError("git hash-object returned the wrong number of ids")
+    return oids
+
+
+def index_records(ws: Path, live: list[str], gone: list[str]) -> list[str]:
+    """`update-index --index-info` records: mode, id and path for each file that
+    exists, mode 0 and the all-zero id for each that is gone."""
+    records = []
+    if live:
+        modes = recorded_modes(ws, live) or {}
+        records += [f"{file_mode(ws / path, modes.get(path))} {oid}\t{path}"
+                    for path, oid in zip(live, hash_files(ws, live))]
+    if gone:
+        records += [f"0 {zero_oid(ws)}\t{path}" for path in gone]
+    return records
+
+
+def stage_paths(ws: Path, paths: list[str]) -> None:
+    """Stage the work-tree content of `paths` without any filter (A5.1): each
+    existing file is hashed raw (hash_files) and the index entries are written
+    with `update-index -z --index-info`; a path that no longer exists is removed
+    from the index. There is no `git add`, so no clean filter, no attributes and
+    no core.autocrlf can change what is committed."""
+    if any("\n" in path or "\0" in path for path in paths):
+        raise KitError("a gated path holds a newline or NUL; it cannot be staged")
+    hidden = hidden_entries(ws, None, paths)
+    if hidden:
+        raise KitError(hidden_message(hidden))
+    live = [path for path in paths if os.path.lexists(ws / path)]
+    records = index_records(ws, live, [path for path in paths if path not in live])
+    if records:
+        # update-index writes the index, and git smudges racily clean entries it did not
+        # restage through their clean/process filter: switch every driver off here too.
+        vp.git(ws, "update-index", "-z", "--index-info", timeout=600, config=vp.filter_off_config(ws),
+               input_bytes=("\0".join(records) + "\0").encode("utf-8", "surrogateescape"))
+
+
+def refuse_config_hooks(ws: Path) -> None:
+    """Git 2.54 runs `hook.<name>.command` (with `hook.<name>.event`) even when
+    core.hooksPath is pinned, and A2.4 reads only local config. Read every scope
+    (global, system, GIT_CONFIG_GLOBAL, includes) before the commit and refuse on
+    any hit; a failed read refuses too (P16). A promisor setting in any scope is refused
+    here too (I2)."""
+    vp.refuse_partial_clone_config(ws)
+    keys = vp.config_keys(ws, r"^hook\.")
+    if keys:
+        raise TrustError(f"git config sets {', '.join(keys)}; git would run a configured hook "
+                         "during the commit. Remove the hook.* settings from your git "
+                         "configuration (any scope) and retry")
+
+
+def promotion_trailer_problem(ws: Path, secret: bytes, commit: str) -> str | None:
+    """Why `commit` does not carry a valid promotion trailer, or None when it does."""
+    try:
+        level = ma.verify_commit_trailer(ws, secret, commit)
+    except KitError as exc:
+        return str(exc)
+    return None if level == "promotion" else f"new commit carries a '{level}' trailer, not promotion"
+
+
+def staged_mismatch(ws: Path, rules, payload: dict) -> dict | None:
+    """How the staged gated tree differs from the promoted one, or None when equal."""
+    staged = vp.staged_tree(ws, rules)
+    return None if staged == payload["files"] else vp.diff_maps(payload["files"], staged)
+
+
+def refuse_admission(result: dict, stage: str, code: int, reason: str) -> dict:
+    """`fail` for the admission block: the verdict stays what the gate decided (FAIL if none)."""
+    return fail(result, stage, code, reason, verdict=result["verdict"] or "FAIL")
+
+
+def promote_gate(ws: Path, result: dict):
+    """trust_gate, then the hook.* and trailer command refusals: all come before Tier 1 and
+    Tier 2 run and before a token exists. None means `result` holds the failure."""
+    gate = trust_gate(ws, result)
+    if gate is None or hooks_refusal(ws, result) is not None:
+        return None
+    return None if hidden_refusal(ws, gate[4], result) is not None else gate
+
+
+def hooks_refusal(ws: Path, result: dict) -> dict | None:
+    """The failed result when git config holds a hook.* key (refuse_config_hooks) or a trailer
+    command (ma.refuse_trailer_commands, P25), else None."""
+    try:
+        refuse_config_hooks(ws)
+        ma.refuse_trailer_commands(ws)
+    except KitError as exc:
+        return refuse_admission(result, "trust", EXIT_TRUST, str(exc))
+    return None
+
+
 def admit(ws: Path, secret: bytes, rules, payload: dict, message: str, result: dict) -> dict:
-    """git add of the gated paths, then git commit through the hooks. A SIGTERM
-    during this block is held until it ends (defer_sigterm)."""
+    """Stage the gated paths without filters (stage_paths), then git commit through
+    the pinned hooks, unsigned. A SIGTERM during this block is held until it ends
+    (defer_sigterm)."""
     old_head = vp.head_commit(ws)
+    try:
+        refuse_config_hooks(ws)
+        filter_pairs = vp.filter_off_config(ws)  # read before the index changes
+    except KitError as exc:
+        return refuse_admission(result, "trust", EXIT_TRUST, str(exc))
     with ma.defer_sigterm():
         paths = stage_gated(ws, rules)
         if paths:
-            vp.git(ws, "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul",
-                   input_bytes=b"\0".join(f":(literal){p}".encode("utf-8", "surrogateescape")
-                                          for p in paths), timeout=600)
-        staged = vp.staged_tree(ws, rules)
-        if staged != payload["files"]:
-            return fail(result, "admission", EXIT_GATE,
-                        f"staged gated tree differs from the promoted tree: "
-                        f"{vp.diff_maps(payload['files'], staged)}; not committing",
-                        verdict=result["verdict"] or "FAIL")
+            stage_paths(ws, paths)
+        mismatch = staged_mismatch(ws, rules, payload)
+        if mismatch:
+            return refuse_admission(result, "admission", EXIT_GATE,
+                                    f"staged gated tree differs from the promoted tree: "
+                                    f"{mismatch}; not committing")
         say("ADMISSION: committing the promoted tree through the hooks")
-        proc = subprocess.run(["git", "-C", str(ws), "commit", "-m", message],
-                              capture_output=True, timeout=COMMIT_TIMEOUT_SECONDS)
+        # No --work-tree here: git would hand GIT_WORK_TREE to the hooks, which refuse it.
+        # The pinned hooksPath comes from the helper; unsigned and filter-free from the pairs;
+        # no auto maintenance (it runs programs named in config, e.g. gc.recentObjectsHook).
+        proc = vp.run_git(ws, ["commit", "-m", message], timeout=COMMIT_TIMEOUT_SECONDS,
+                          work_tree=False, extra_env=vp.commit_identity_env(),
+                          config=[("commit.gpgSign", "false"), ("maintenance.auto", "false"),
+                                  ("gc.auto", "0"), *filter_pairs])
     sys.stderr.write(proc.stderr.decode(errors="replace"))
     new_head = vp.head_commit(ws)
     if proc.returncode != 0 or new_head == old_head:
-        return fail(result, "admission", EXIT_GATE,
-                    "git commit failed or HEAD did not move: "
-                    + tail(proc.stderr.decode(errors="replace"))[-600:],
-                    verdict=result["verdict"] or "FAIL")
-    try:
-        level = ma.verify_commit_trailer(ws, secret, new_head)
-        if level != "promotion":
-            raise ma.AttestationError(f"new commit carries a '{level}' trailer, not promotion")
-    except KitError as exc:
-        return fail(result, "admission", EXIT_GATE,
-                    f"commit {new_head[:12]} was created but its trailer is not valid: {exc}",
-                    verdict=result["verdict"] or "FAIL")
+        return refuse_admission(result, "admission", EXIT_GATE,
+                                "git commit failed or HEAD did not move: "
+                                + tail(proc.stderr.decode(errors="replace"))[-600:])
+    problem = promotion_trailer_problem(ws, secret, new_head)
+    if problem:
+        return refuse_admission(result, "admission", EXIT_GATE,
+                                f"commit {new_head[:12]} was created but its trailer is not valid: {problem}")
     result.update(admitted=True, commit=new_head)
     say(f"ADMITTED as {new_head[:12]}")
     return result
@@ -910,7 +1161,7 @@ def cmd_promote(ws: Path, args) -> dict:
     except KitError as exc:
         return fail(result, "admission", EXIT_GATE, str(exc))
     ma.remove_token(ws)
-    gate = trust_gate(ws, result)
+    gate = promote_gate(ws, result)
     if gate is None:
         return result
     state, trust, secret, cfg, rules, tree = gate
@@ -919,11 +1170,11 @@ def cmd_promote(ws: Path, args) -> dict:
         return fail(result, "trust", EXIT_TRUST,
                     f"the pinned genesis commit {genesis[:12]} is not an ancestor of HEAD: the "
                     "history was rewritten or replaced; promote refuses")
-    if not gate_stages(ws, cfg, rules, tree, result):
+    if not checked_stages(ws, cfg, rules, tree, result):
         return result
-    t2 = run_tier2(ws, cfg, rules, seed=getattr(args, "seed", None), genesis=genesis,
-                   prior_promotions=bool(ma.promotion_commits(state)))
-    result["tier2"] = tier2_summary(t2)
+    t2 = checked_tier2(ws, cfg, rules, seed=getattr(args, "seed", None), genesis=genesis,
+                       prior_promotions=bool(ma.promotion_commits(state)))
+    record_tier2(result, t2)
     result["verdict"] = t2["verdict"]
     if t2["verdict"] not in GATE_PASS_VERDICTS:
         result["reasons"] += t2["reasons"]
@@ -951,8 +1202,23 @@ def cmd_install_hooks(ws: Path, args) -> dict:
 
 
 def porcelain_clean(ws: Path) -> bool:
-    out = vp.split_z(vp.git(ws, "status", "--porcelain=v1", "-z", "--no-renames"))
+    """No tracked or untracked change besides the kit's local state. `git status` may refresh
+    the index through a clean filter, so every filter is switched off, and a submodule's own
+    local filter is kept out by --ignore-submodules=dirty (I1). --untracked-files=all keeps
+    a `status.showUntrackedFiles=no` setting (any config scope) from hiding an untracked file
+    (B5). A driver name that cannot be switched off raises KitError."""
+    out = vp.split_z(vp.git(ws, "status", "--porcelain=v1", "-z", "--no-renames",
+                            "--untracked-files=all", "--ignore-submodules=dirty",
+                            config=vp.filter_off_config(ws)))
     return not [e for e in out if not vp.is_local_state(e[3:])]
+
+
+def status_clean(ws: Path) -> bool | None:
+    """porcelain_clean, or None when git cannot answer (status still reports)."""
+    try:
+        return porcelain_clean(ws)
+    except KitError:
+        return None
 
 
 def token_status(ws: Path, anchor, head: str | None) -> dict:
@@ -976,12 +1242,29 @@ def token_status(ws: Path, anchor, head: str | None) -> dict:
     return status
 
 
+def status_ignored(ws: Path, anchor) -> dict:
+    """B1 as `status` shows it: the git-ignored files no glob admits and those a glob does,
+    from the pinned config when there is an anchor, else the work-tree config. Lists; never
+    fails (`error` says why a list is missing)."""
+    out = {"violations": [], "violation_count": 0, "allowed": [], "allowed_count": 0,
+           "worktrees": [], "truncated": False, "error": None}
+    try:
+        cfg = anchor[3] if anchor else vp.load_config(ws / vp.CONFIG_REL)
+        split = vp.ignored_files(ws, vp.GateRules(cfg), cfg)
+    except KitError as exc:
+        return {**out, "error": str(exc)}
+    limit = vp.IGNORED_JSON_LIMIT
+    return {**out, "violations": split["violations"][:limit], "allowed": split["allowed"][:limit],
+            "violation_count": len(split["violations"]), "allowed_count": len(split["allowed"]),
+            "worktrees": split["worktrees"],
+            "truncated": max(len(split["violations"]), len(split["allowed"])) > limit}
+
+
 def cmd_status(ws: Path, args) -> dict:
     result = new_result("status")
+    git_report = vp.git_binding_report(ws)  # binds the recorded git; status never fails on it
     head = vp.head_commit(ws)
-    branch = subprocess.run(["git", "-C", str(ws), "symbolic-ref", "--short", "-q", "HEAD"],
-                            capture_output=True, text=True,
-                            timeout=vp.GIT_TIMEOUT_SECONDS).stdout.strip() or None
+    branch = vp.git(ws, "symbolic-ref", "--short", "-q", "HEAD", check=False).decode().strip() or None
     state = vp.state_dir(ws, create=False)
     anchor = None
     pin_status, differences, anchor_error = "NO_ANCHOR", {"modified": [], "added": [], "removed": []}, None
@@ -1007,7 +1290,9 @@ def cmd_status(ws: Path, args) -> dict:
     result.update(
         closure_exempt=closure["exempt"], closure_unpinned=closure["unpinned"],
         closure_files=closure["closure_files"], environment_differences=environment_changes,
-        verdict=pin_status, head=head, branch=branch, clean=porcelain_clean(ws),
+        ignored_files=status_ignored(ws, anchor),
+        verdict=pin_status, head=head, branch=branch, clean=status_clean(ws), git=git_report,
+        git_state=vp.repository_state(ws),
         pin_status=pin_status, pin_differences=differences, anchor_error=anchor_error,
         anchor=None if trust is None else {"kid": trust["kid"], "genesis": trust.get("genesis"),
                                            "pinned_at": trust.get("pinned_at"),
@@ -1048,8 +1333,7 @@ def cmd_mcp(ws: Path, args) -> dict:
     if not server.is_file():
         return fail(result, None, EXIT_USAGE, f"{server} not found")
     os.chdir(ws)
-    flags = [vp.ISOLATED_FLAG] if anchored else []
-    os.execv(sys.executable, [sys.executable, *flags, str(server), *argv_tail])
+    os.execv(sys.executable, [sys.executable, vp.ISOLATED_FLAG, str(server), *argv_tail])
     return result  # not reached
 
 
@@ -1082,19 +1366,24 @@ def cmd_preflight(ws: Path, args) -> dict:
     result = new_result("preflight")
     cfg = vp.load_config(ws / vp.CONFIG_REL)
     rules = vp.GateRules(cfg)
+    vp.require_sound_repository(ws)
+    if not ignored_files_pass(ws, cfg, rules, result, "before the environment check"):
+        return result
     if not preflight_environment(ws, result):
         return result
     try:
         tree = vp.working_tree(ws, rules)
     except PathViolation as exc:
         return fail(result, "step0", EXIT_GATE, str(exc))
-    if not gate_stages(ws, cfg, rules, tree, result):
+    if not checked_stages(ws, cfg, rules, tree, result):
         return result
     smoke = run_tier2_smoke(ws, cfg, rules)
     result["tier2"] = smoke
     if not smoke["ok"]:
         result["reasons"] += smoke["reasons"]
         return fail(result, smoke["stage"] or "tier2", EXIT_GATE, "the Tier 2 driver smoke run failed")
+    if not ignored_files_pass(ws, cfg, rules, result, "after the Tier 2 smoke run"):
+        return result
     result["verdict"] = "PASS"
     say("PREFLIGHT PASSED: Step 0, Tier 1 and the Tier 2 driver smoke run are clean; "
         "no token issued (a human pins, then run verify)")
@@ -1148,7 +1437,7 @@ def run_ci_setup(ws: Path, cfg: dict) -> str | None:
         say(f"CI setup {number}/{len(commands)}: {' '.join(argv)}")
         code, output, timed_out, _ = run_argv(vp.expand_command(argv), ws,
                                               cfg["ci"]["timeout_seconds"],
-                                              env_extra=cfg["ci"]["env"])
+                                              env_extra=cfg["ci"]["env"], ws=ws)
         if timed_out:
             return (f"[ci] setup command {number} ({argv[0]}) timed out after "
                     f"{cfg['ci']['timeout_seconds']} seconds")
@@ -1156,6 +1445,17 @@ def run_ci_setup(ws: Path, cfg: dict) -> str | None:
             return f"[ci] setup command {number} ({argv[0]}) exited with {code}: " \
                    f"{tail(output)[-500:]}"
     return None
+
+
+def ci_setup_checked(ws: Path, cfg: dict, rules, result: dict) -> dict | None:
+    """`[ci] setup` bracketed by the ignored-file check (B2): setup runs committed code that
+    is often unpinned. Returns the failed `result`, or None when all three steps passed."""
+    if not ignored_files_pass(ws, cfg, rules, result, "before [ci] setup"):
+        return result
+    failure = run_ci_setup(ws, cfg)
+    if failure:
+        return fail(result, "setup", EXIT_GATE, failure)
+    return None if ignored_files_pass(ws, cfg, rules, result, "after [ci] setup") else result
 
 
 def range_base(ws: Path, spec_range: str | None) -> str | None:
@@ -1168,8 +1468,12 @@ def range_base(ws: Path, spec_range: str | None) -> str | None:
         right = right[1:]
         left = vp.git(ws, "merge-base", left or "HEAD", right or "HEAD",
                       check=False).decode().strip()
-    rev = vp.git(ws, "rev-parse", "--verify", "-q", f"{left or 'HEAD'}^{{commit}}",
-                 check=False).decode().strip()
+    # The peeled id when git prints one (an annotated tag names its commit).
+    # Otherwise the unpeeled id: rev-parse prints nothing for a rewritten loose
+    # commit, and that must reach the re-hash in base_pins_state, not read as "no base".
+    name = left or "HEAD"
+    rev = vp.git(ws, "rev-parse", "--verify", "-q", f"{name}^{{commit}}", check=False).decode().strip()
+    rev = rev or vp.git(ws, "rev-parse", "--verify", "-q", name, check=False).decode().strip()
     return rev or None
 
 
@@ -1177,12 +1481,13 @@ def base_pins_state(ws: Path, base: str | None, mirror: dict) -> tuple[str, dict
     """Compare the committed mirror with the one at the range base. ("absent",
     {}) when the base has none (the adoption), ("same", {}) or ("changed",
     delta)."""
-    if not base or not vp.git_ok(ws, "cat-file", "-e", f"{base}:{vp.PINS_MIRROR_REL}"):
+    raw = vp.committed_blob(ws, base, vp.PINS_MIRROR_REL) if base else None
+    if raw is None:
         return "absent", {}
     try:
-        old = json.loads(vp.git(ws, "show", f"{base}:{vp.PINS_MIRROR_REL}", timeout=60))
+        old = json.loads(raw)
         old_pins = old["pins"]
-    except (KitError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         return "changed", {"modified": [vp.PINS_MIRROR_REL], "added": [], "removed": []}
     delta = vp.diff_maps(old_pins, mirror["pins"])
     if old.get("genesis") != mirror.get("genesis"):
@@ -1199,6 +1504,7 @@ def cmd_ci(ws: Path, args) -> dict:
     result["signatures_verified"] = False
     result["note"] = ("CI has no secret: trailer signatures are NOT verified here "
                       "(format, tree and parent only); pre-push verifies signatures locally")
+    vp.require_sound_repository(ws)
     try:
         cfg = vp.load_config(ws / vp.CONFIG_REL)
         rules = vp.GateRules(cfg)
@@ -1230,9 +1536,9 @@ def cmd_ci(ws: Path, args) -> dict:
         return fail(result, "trust", EXIT_TRUST,
                     f"trusted inputs changed since the range base {str(base)[:12]}: human review "
                     f"required ({base_delta})")
-    failure = run_ci_setup(ws, cfg)
-    if failure:
-        return fail(result, "setup", EXIT_GATE, failure)
+    failed = ci_setup_checked(ws, cfg, rules, result)
+    if failed:
+        return failed
     try:
         tree, delta = pins_delta()
     except KitError as exc:
@@ -1240,7 +1546,7 @@ def cmd_ci(ws: Path, args) -> dict:
     if any(delta.values()):
         return fail(result, "setup", EXIT_GATE,
                     f"[ci] setup changed pinned files: {delta}; setup must only create local files")
-    if not gate_stages(ws, cfg, rules, tree, result):
+    if not checked_stages(ws, cfg, rules, tree, result):
         return result
     try:
         commits = commit_range(ws, args.range, genesis)
@@ -1267,11 +1573,11 @@ def cmd_ci(ws: Path, args) -> dict:
 
 def run_hook(name: str, args) -> int:
     try:
-        ws = vp.repo_toplevel(Path.cwd())
+        ws, index = vp.hook_workspace()  # recorded git, A2 and the A3 environment rules
         if name == "hook-pre-commit":
-            return ma.hook_pre_commit(ws)
+            return ma.hook_pre_commit(ws, index)
         if name == "hook-commit-msg":
-            return ma.hook_commit_msg(ws, args.msg_file)
+            return ma.hook_commit_msg(ws, args.msg_file, index)
         if name == "hook-post-commit":
             return ma.hook_post_commit(ws)
         return ma.hook_pre_push(ws, args.remote, sys.stdin.read().splitlines())
@@ -1374,6 +1680,8 @@ def emit(result: dict, json_mode: bool) -> None:
                          + "\n")
         for reason in result.get("reasons", []):
             sys.stdout.write(f"  - {reason}\n")
+        for problem in (result.get("git_state") or {}).get("problems", []):
+            sys.stdout.write(f"  - git state: {problem}\n")
     sys.stdout.flush()
 
 

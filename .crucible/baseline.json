@@ -1,4 +1,10 @@
 {
+  "_provenance": {
+    "engine_sha256": "f3db0b1494f01d1ac645c6f8826aa40a982d5fb2ed915a16c37bb7944c6231ff",
+    "genesis_commit": "60fbae26dbbbd777b990ff6161b4ef04e418c14c",
+    "timestamp": "2026-10-10T06:29:56Z",
+    "version": 2
+  },
   "functions": {
     "cmd/add.go::addToGeminiCLI": 11,
     "cmd/add.go::glob.func1": 15,
@@ -11,5 +17,5 @@
     "internal/tui/updater.go::UpdateModel.View": 11,
     "internal/tui/updater.go::UpdateModel.updateClientSelection": 13
   },
-  "version": 1
+  "version": 2
 }

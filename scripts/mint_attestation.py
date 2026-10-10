@@ -23,7 +23,6 @@ import json
 import re
 import secrets
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -260,9 +259,7 @@ def parse_trailer(message: str, repo: Path) -> dict | None:
     core.commentChar, the `---` divider and comment blocks are read exactly as
     when the hook inserted it. Text after a divider and earlier paragraphs are
     not trailers. More than one attestation trailer means None, never a guess."""
-    proc = subprocess.run(["git", "-C", str(repo), "interpret-trailers", "--parse"],
-                          input=message.encode(), capture_output=True,
-                          timeout=vp.GIT_TIMEOUT_SECONDS)
+    proc = vp.run_git(repo, ["interpret-trailers", "--parse"], input_bytes=message.encode())
     if proc.returncode != 0:
         return None
     lines = [line for line in proc.stdout.decode(errors="replace").split("\n")
@@ -271,9 +268,7 @@ def parse_trailer(message: str, repo: Path) -> dict | None:
 
 
 def scissors_re(ws: Path) -> re.Pattern:
-    out = subprocess.run(["git", "-C", str(ws), "config", "--get", "core.commentChar"],
-                         capture_output=True, text=True, timeout=vp.GIT_TIMEOUT_SECONDS
-                         ).stdout.strip()
+    out = vp.git(ws, "config", "--get", "core.commentChar", check=False).decode().strip()
     char = r"\S+" if out == "auto" else re.escape(out or "#")
     return re.compile(rf"^{char} -{{24}} >8 -{{24}}$")
 
@@ -306,11 +301,23 @@ def stored_message_forms(ws: Path, text: str) -> list[str]:
     return forms
 
 
+def refuse_trailer_commands(ws: Path) -> None:
+    """interpret-trailers runs a configured trailer command. The A2 check reads only
+    local config, so read every scope here (global, system, GIT_CONFIG_GLOBAL) and
+    refuse before the command can run."""
+    keys = vp.config_keys(ws, r"^trailer\..+\.(cmd|command)$")  # a failed read raises: fails closed
+    if keys:
+        raise AttestationError(
+            f"git config sets {', '.join(keys)}; git would run it while adding the trailer. "
+            "Remove the trailer command from your git configuration (any scope) and retry")
+
+
 def insert_trailer(ws: Path, msg_file: Path, value: str) -> None:
     """Add the signed trailer with `git interpret-trailers --in-place
     --if-exists add`, then check that git still finds exactly this trailer in
     every stored form of the message. Otherwise restore the file and raise: a
     commit whose trailer git cannot find would be refused by pre-push for good."""
+    refuse_trailer_commands(ws)
     original = msg_file.read_bytes()
     vp.git(ws, "interpret-trailers", "--in-place", "--if-exists", "add",
            "--trailer", f"{TRAILER_KEY}: {value}", str(msg_file))
@@ -360,16 +367,18 @@ def check_trailer(fields: dict | None, tree: str, secret: bytes, parent: str | N
 
 
 def commit_tree_oid(ws: Path, commit: str) -> str:
-    return vp.git(ws, "rev-parse", f"{commit}^{{tree}}").decode().strip()
+    return vp.read_commit(ws, commit).tree
 
 
 def commit_first_parent(ws: Path, commit: str) -> str | None:
-    parents = vp.git(ws, "rev-list", "--parents", "-n", "1", commit).decode().split()[1:]
+    parents = vp.read_commit(ws, commit).parents
     return parents[0] if parents else None
 
 
 def commit_message(ws: Path, commit: str) -> str:
-    return vp.git(ws, "log", "-1", "--format=%B", commit).decode(errors="replace")
+    """The commit message as stored, parsed from the raw commit object (A4.2):
+    `git log` would re-encode it and could run a configured signature program."""
+    return vp.read_commit(ws, commit).message.decode("utf-8", errors="replace")
 
 
 def verify_commit_trailer(ws: Path, secret: bytes, commit: str) -> str:
@@ -395,11 +404,15 @@ def commit_paths(ws: Path, commit: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def hook_context(ws: Path):
-    """(state, trust, secret, cfg, rules): the pinned anchor, or TrustError."""
+    """(state, trust, secret, cfg, rules): the pinned anchor, or TrustError. The
+    hook's environment was checked by vp.hook_workspace before this."""
     return vp.require_anchor(ws)
 
 
-def hook_pre_commit(ws: Path) -> int:
+def hook_pre_commit(ws: Path, index: Path | None = None) -> int:
+    """`index` is the validated GIT_INDEX_FILE of the commit (vp.hook_workspace),
+    or None: every index read below uses it, so `git commit <paths>` and
+    `git commit -a` are judged on the tree git will commit."""
     try:
         state, trust, secret, _cfg, rules = hook_context(ws)
     except KitError as exc:
@@ -407,9 +420,9 @@ def hook_pre_commit(ws: Path) -> int:
         return 1
     (state / vp.PENDING_FILE).unlink(missing_ok=True)  # a marker from an aborted commit is stale
     try:
-        changed = vp.staged_changes(ws)
-        vp.reject_non_ascii(list(changed) + vp.index_listing(ws) + vp.work_tree_listing(ws),
-                            "the index or work tree")
+        changed = vp.staged_changes(ws, index)
+        vp.reject_non_ascii(list(changed) + vp.index_listing(ws, index)
+                            + vp.work_tree_listing(ws, index), "the index or work tree")
         forbidden = sorted(p for p in changed if vp.is_local_state(p))
         if forbidden:
             raise AttestationError(f"local attestation state must never be committed: {forbidden}")
@@ -422,7 +435,7 @@ def hook_pre_commit(ws: Path) -> int:
         token = read_token(ws)
         payload = check_token(token, secret, trust["kid"], consumed_nonces(state),
                               vp.head_commit(ws))
-        staged = vp.staged_tree(ws, rules)
+        staged = vp.staged_tree(ws, rules, index)
         check_token_files(payload, staged)
         vp.require_pins(trust, staged, rules, "staged")
     except (KitError, OSError) as exc:
@@ -435,7 +448,7 @@ def hook_pre_commit(ws: Path) -> int:
     return 0
 
 
-def hook_commit_msg(ws: Path, msg_file: Path) -> int:
+def hook_commit_msg(ws: Path, msg_file: Path, index: Path | None = None) -> int:
     """Append the signed trailer when pre-commit admitted a token."""
     try:
         state, trust, secret, _cfg, rules = hook_context(ws)
@@ -454,15 +467,23 @@ def hook_commit_msg(ws: Path, msg_file: Path) -> int:
         say(f"COMMIT REJECTED: {exc}")
         return 1
     try:
-        # Re-check everything: an editor runs between pre-commit and here and
-        # could have restaged the index. The token comes from the pending copy
-        # in STATE, not from the work tree.
+        # Re-check everything against the index as it is now. Git fixes the commit's tree
+        # right after pre-commit, so this read guards against an index swapped between
+        # pre-commit's re-read and here. The token comes from the pending copy in STATE,
+        # not from the work tree.
         head = vp.head_commit(ws)
         payload = check_token(pending, secret, trust["kid"], consumed_nonces(state), head)
-        staged = vp.staged_tree(ws, rules)
+        # One index read (G14): write-tree first, then the check and the signature use the
+        # tree id it printed. A second read of the index (staged_tree, then write-tree) would
+        # let a process that swaps .git/index between them get a trailer for an unverified tree.
+        # git smudges a racily clean entry through the clean filter whenever it writes an
+        # index, and this hook runs with the clean environment (the caller's -c pairs are
+        # gone), so the user's own filter driver is switched off here as well.
+        tree = vp.git(ws, "write-tree", index_file=index,
+                      config=vp.filter_off_config(ws)).decode().strip()
+        staged = vp.gated_tree_map(ws, tree, rules)
         check_token_files(payload, staged)
         vp.require_pins(trust, staged, rules, "staged")
-        tree = vp.git(ws, "write-tree").decode().strip()
         value = _mint(secret, payload, tree, head)
         insert_trailer(ws, msg_file, value)
     except (KitError, OSError, ValueError) as exc:

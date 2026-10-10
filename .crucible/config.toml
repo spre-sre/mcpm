@@ -19,6 +19,10 @@ trusted_paths = [
   ".crucible/config.toml",
   ".crucible/baseline.json",
 ]
+# Git-ignored paths a human admits at repin (kit 2.1.0, architecture.md 17).
+# settings.local.json enables the crucible MCP server in Claude Code; .mcp.json
+# starts it; .crucible/tasks/ is a worker tool's state. No gate command loads them.
+ignored_allow = [".claude/settings.local.json", ".mcp.json", ".crucible/tasks/**"]
 
 [ast]
 # The Go archetype gate (architecture.md section 14): McCabe <= 10 per function,
