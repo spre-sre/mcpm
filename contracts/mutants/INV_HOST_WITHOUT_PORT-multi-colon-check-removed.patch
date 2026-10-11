@@ -1,0 +1,10 @@
+Crucible-Mutant: INV_HOST_WITHOUT_PORT
+Description: strip at the first colon of a bare IPv6 host, which has more than one colon
+
+diff --git a/internal/server/host.go b/internal/server/host.go
+index 6789cae..13b8799 100644
+--- a/internal/server/host.go
++++ b/internal/server/host.go
+@@ -17 +17 @@ func StripHostPort(host string) string {
+-	if i := strings.IndexByte(host, ':'); i != -1 && i == strings.LastIndex(host, ":") {
++	if i := strings.IndexByte(host, ':'); i != -1 {

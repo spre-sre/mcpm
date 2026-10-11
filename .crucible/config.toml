@@ -72,5 +72,14 @@ timeout_seconds = 1800
 setup = [["go", "mod", "download"]]
 env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local"}
 
+[mutation]
+mutants = [
+  "contracts/mutants/INV_PROJECT_DETECTED-go-sum-detected.patch",
+  "contracts/mutants/INV_MANIFEST_JSON-runcmd-check-removed.patch",
+  "contracts/mutants/INV_SERVER_INSTALLED-notexist-check-removed.patch",
+  "contracts/mutants/INV_HOST_PORT_SPLIT-keep-colon.patch",
+  "contracts/mutants/INV_HOST_WITHOUT_PORT-multi-colon-check-removed.patch",
+]
+
 [attestation]
 ttl_seconds = 3600

@@ -1,0 +1,10 @@
+Crucible-Mutant: INV_HOST_PORT_SPLIT
+Description: keep the colon after the host when a single port is stripped
+
+diff --git a/internal/server/host.go b/internal/server/host.go
+index 6789cae..4da1cc8 100644
+--- a/internal/server/host.go
++++ b/internal/server/host.go
+@@ -18 +18 @@ func StripHostPort(host string) string {
+-		return host[:i]
++		return host[:i+1]

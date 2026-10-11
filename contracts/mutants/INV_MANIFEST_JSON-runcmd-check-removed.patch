@@ -1,0 +1,10 @@
+Crucible-Mutant: INV_MANIFEST_JSON
+Description: skip the empty runCmd check so a manifest without runCmd is accepted
+
+diff --git a/internal/builder/builder.go b/internal/builder/builder.go
+index 93c752c..9f6cee3 100644
+--- a/internal/builder/builder.go
++++ b/internal/builder/builder.go
+@@ -54 +54 @@ func buildFromManifest(repoPath, manifestPath string) (*BuildResult, error) {
+-	if strings.TrimSpace(m.RunCmd) == "" {
++	if false && strings.TrimSpace(m.RunCmd) == "" {

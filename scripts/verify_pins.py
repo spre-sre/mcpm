@@ -452,6 +452,79 @@ def _setup_commands(table: dict) -> list[list[str]]:
     return [list(cmd) for cmd in value]
 
 
+MUTATION_KEYS = ("mutants", "waived", "command", "timeout_seconds", "budget_seconds", "controls",
+                 "no_controls_reason")
+MUTATION_BUDGET_DEFAULT = 3600
+INVARIANT_NAME_RE = re.compile(r"INV_[A-Z0-9_]+")
+PRINTABLE_ASCII_RE = re.compile(r"[ -~]+")   # a reason reaches the PIN prompt: no ESC, no bidirectional character
+
+
+def _mutant_list(table: dict) -> list[str]:
+    """`[mutation] mutants`: an explicit list of file paths. No glob, no directory, no repeat."""
+    paths = _path_list(table, "mutants", "mutation")
+    for path in paths:
+        if path.endswith("/") or any(ch in path for ch in "*?[]"):
+            raise ConfigError(f"mutation.mutants: {path!r} must name one file (no glob, no directory)")
+    if len(set(paths)) != len(paths):
+        raise ConfigError("mutation.mutants lists a file twice")
+    return paths
+
+
+def _waived_table(table: dict) -> dict[str, str]:
+    value = table.get("waived", {})
+    if not isinstance(value, dict):
+        raise ConfigError('mutation.waived must be a table of INV_NAME = "reason"')
+    for name, reason in value.items():
+        if not INVARIANT_NAME_RE.fullmatch(name):
+            raise ConfigError(f"mutation.waived: {name!r} is not an invariant name (INV_...)")
+        if not isinstance(reason, str) or not reason.strip() or not PRINTABLE_ASCII_RE.fullmatch(reason):
+            raise ConfigError(f"mutation.waived.{name} must be a non-empty reason of printable ASCII")
+    return dict(value)
+
+
+def _mutation_command(table: dict) -> list[str]:
+    command = _string_list(table, "command", "mutation", required=False)
+    if not all(command):
+        raise ConfigError("mutation.command must not hold an empty string")
+    return command
+
+
+def _flag(table: dict, key: str, default: bool, where: str) -> bool:
+    value = table.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}.{key} must be true or false")
+    return value
+
+
+def parse_mutation(table: dict) -> dict:
+    """The `[mutation]` table (G12 level 1). A missing table is `mutants = []`. An unknown key
+    is an error, so a typo cannot pass as an empty list. `controls = false` needs a reason."""
+    unknown = sorted(set(table) - set(MUTATION_KEYS))
+    if unknown:
+        raise ConfigError(f"[mutation] has unknown keys: {', '.join(unknown)}")
+    reason = table.get("no_controls_reason", "")
+    if not isinstance(reason, str) or (reason and not PRINTABLE_ASCII_RE.fullmatch(reason)):
+        raise ConfigError("mutation.no_controls_reason must be printable ASCII")
+    out = {"mutants": _mutant_list(table), "waived": _waived_table(table),
+           "command": _mutation_command(table),
+           "timeout_seconds": _number(table, "timeout_seconds", 0, "mutation", minimum=0),
+           "budget_seconds": _number(table, "budget_seconds", MUTATION_BUDGET_DEFAULT, "mutation",
+                                     minimum=1),
+           "controls": _flag(table, "controls", True, "mutation"), "no_controls_reason": reason}
+    if not out["controls"] and not reason.strip():
+        raise ConfigError("mutation.controls = false needs a non-empty mutation.no_controls_reason "
+                          "(the same text must appear under ## Gaps in SPEC.md)")
+    return out
+
+
+def check_mutant_paths(cfg: dict, rules: "GateRules") -> None:
+    """A mutant file is a pinned file: the agent cannot change it after the human repin."""
+    for path in cfg["mutation"]["mutants"]:
+        if not rules.pin_entry(path):
+            raise ConfigError(f"mutation.mutants: {path} must be a pinned file "
+                              "(put its directory under [gate] trusted_paths)")
+
+
 def parse_config(text: str) -> dict:
     """Parse and validate config.toml. Fail closed: a missing or malformed
     config is a ConfigError. An EMPTY command is accepted here and fails the
@@ -468,6 +541,7 @@ def parse_config(text: str) -> dict:
     attestation = _section(data, "attestation", False)
     environment = _section(data, "environment", False)
     ci = _section(data, "ci", False)
+    mutation = _section(data, "mutation", False)
 
     cfg = {
         "project": {"name": str(project.get("name", ""))},
@@ -488,6 +562,7 @@ def parse_config(text: str) -> dict:
         "environment": {"digest_globs": _string_list(environment, "digest_globs", "environment",
                                                      required=False)},
     }
+    cfg["mutation"] = parse_mutation(mutation)
     for entry in cfg["environment"]["digest_globs"]:
         _check_entry(entry, "environment.digest_globs")
     for ref in cfg["gate"]["protected_refs"]:
@@ -522,7 +597,7 @@ def parse_config(text: str) -> dict:
         tier2_cfg["smoke_samples"] = _number(tier2_cfg, "smoke_samples", 1, "tier2",
                                              integer=True, minimum=1)
     cfg["tier2"] = tier2_cfg
-    GateRules(cfg)  # validates every path entry
+    check_mutant_paths(cfg, GateRules(cfg))  # validates every path entry
     return cfg
 
 
@@ -638,7 +713,8 @@ def command_closure(ws: Path, cfg: dict, rules: GateRules) -> dict:
     closure_files: set[str] = set()
     closure_dirs: set[str] = set()
     named: list[str] = []
-    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"]):
+    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"],
+                    cfg["mutation"]["command"]):
         for element in expand_command(command):
             named += named_repo_paths(ws, element)
     named += [p for p in cfg["tier2"].get("driver_paths", []) if (ws / p).exists()]
@@ -1656,15 +1732,22 @@ def state_dir(ws: Path, create: bool = True) -> Path:
     return path
 
 
-def read_nofollow(path: Path) -> bytes:
+def read_nofollow(path: Path, limit: int | None = None) -> bytes:
+    """The file's bytes (at most `limit` when given), never through a symlink. O_NONBLOCK keeps a FIFO
+    from blocking the open; the raw descriptor is checked before any read, and closed on every refusal."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise PathViolation(f"{path}: cannot open without following symlinks: {exc}") from exc
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise PathViolation(f"{path}: not a regular file")
-        return handle.read()
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        return handle.read() if limit is None else handle.read(limit)
 
 
 def write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -1697,6 +1780,12 @@ IGNORED_JSON_LIMIT = 200   # files a JSON report carries (the count is always co
 IGNORED_REVIEW_LIMIT = 200  # files per glob that install-hooks prints for the human to review
 IGNORED_WARNING = ("delete only files that this task or a gate command created; any other file "
                    "belongs to the human (settings, secrets): stop and ask")
+
+# Files that the kit installs or that an editor writes: the message never offers to delete them.
+KIT_FILES = frozenset({".mcp.json", ".claude/mcp.json", ".claude/settings.local.json"})
+KIT_FILE_ADVICE = "a kit or editor file: a human admits it in [gate] ignored_allow; do not delete it"
+STATE_DIR_ADVICE = ("a tool's state directory: a human may admit `<dir>/**` at repin; "
+                    "the agent stops and asks")
 
 
 def ignored_listing(ws: Path) -> list[str]:
@@ -1843,7 +1932,8 @@ def closure_names(ws: Path, cfg: dict) -> set[str]:
     Tier 2 commands, the driver paths, the contract tests and the baseline. The message
     never tells anyone to delete one of them."""
     names = {cfg["ast"]["baseline"], *cfg["tier1"]["contract_tests"], *cfg["tier2"].get("driver_paths", [])}
-    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"]):
+    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"],
+                    cfg["mutation"]["command"]):
         for element in expand_command(command):
             names.update(named_repo_paths(ws, element))
     return names
@@ -1854,10 +1944,28 @@ def _shown(text: str) -> str:
     return text if is_plain_ascii(text) else ascii(text)[1:-1]
 
 
+def _gate_named(paths: list[str], named: set[str]) -> bool:
+    """True when a listed file is one that a gate command runs or reads (a kit file has its own advice)."""
+    return any(p in named and p not in KIT_FILES for p in paths)
+
+
+def _keep_lines(paths: list[str]) -> list[str]:
+    """The advice for kit and editor files: no delete command, a human admits them."""
+    return [KIT_FILE_ADVICE] if any(p in KIT_FILES for p in paths) else []
+
+
+def _state_dir_lines(split: dict, rules: GateRules) -> list[str]:
+    """The hint for a tool's state directory, when a listed file sits in a directory that a glob
+    could admit: not a nested repository, not a misplaced worktree and not a gated path."""
+    hint = any("/" in p and not p.endswith("/") and p not in split["misplaced"]
+               and not rules.gated_by_config(p) for p in split["violations"])
+    return [STATE_DIR_ADVICE] if hint else []
+
+
 def _advice_lines(paths: list[str], named: set[str], misplaced: set[str] = frozenset()) -> list[str]:
     """Advice for the entries that get no delete command: a linked worktree in the wrong
-    place, a nested repository (an entry that ends in '/') and a file that a gate command
-    runs or reads."""
+    place, a nested repository (an entry that ends in '/'), a file that a gate command
+    runs or reads, and a kit or editor file."""
     lines = []
     if any(p in misplaced for p in paths):
         lines.append("a linked worktree of this repository is admitted only under .worktrees/ at the "
@@ -1867,10 +1975,10 @@ def _advice_lines(paths: list[str], named: set[str], misplaced: set[str] = froze
     if any(p.endswith("/") and p not in misplaced for p in paths):
         lines.append("a nested repository that is not a linked worktree of this repository has "
                      "no delete command: move it out of the repository, or ask the human")
-    if any(p in named for p in paths):
+    if _gate_named(paths, named):
         lines.append("a gate command runs or reads a file listed above: a human must admit it; "
                      "do not delete it")
-    return lines
+    return lines + _keep_lines(paths)
 
 
 def _delete_lines(paths: list[str], named: set[str], misplaced: set[str] = frozenset()) -> list[str]:
@@ -1976,13 +2084,13 @@ def ignored_report(ws: Path, rules: GateRules, cfg: dict | None = None,
     violations = split["violations"]
     if not violations:
         return None
-    named = closure_names(ws, cfg) if cfg else set()
+    named = (closure_names(ws, cfg) if cfg else set()) | KIT_FILES
     each = len(violations) <= IGNORED_LIST_LIMIT and all(is_plain_ascii(p) for p in violations)
     lines = _ignored_each(ws, violations, named, set(split["misplaced"]), rules) if each else _ignored_grouped(ws, split, named)
     head = _ignored_head(len(violations), len(split["misplaced"]))
     return {"count": len(violations), "files": violations[:IGNORED_JSON_LIMIT],
             "truncated": len(violations) > IGNORED_JSON_LIMIT,
-            "message": "\n".join([head, *lines, IGNORED_WARNING])}
+            "message": "\n".join([head, *lines, *_state_dir_lines(split, rules), IGNORED_WARNING])}
 
 
 def _directory_counts(files: list[str]) -> list[tuple[str, int]]:
@@ -2011,9 +2119,12 @@ def report_ignored_files(ws: Path, rules: GateRules, cfg: dict | None = None) ->
     with the files it admits, then the ignored files no glob admits, in the words `verify`
     would use. Lists only; it never refuses."""
     split = ignored_files(ws, rules, cfg)
+    report = ignored_report(ws, rules, cfg, split)
+    if not split["allowed"] and report is None:
+        show(f"  ignored   {plural(len(rules.allow), 'allow rule')}, 0 files admitted")
+        return
     for pattern, _ in rules.allow:
         _say_admitted(pattern, [p for p in split["allowed"] if rules.allowing_glob(p) == pattern])
-    report = ignored_report(ws, rules, cfg, split)
     if report is not None:
         say("  " + report["message"].replace("\n", "\n  "))
 
@@ -2270,6 +2381,800 @@ def mirror_text(trust_like: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# G12 level 1: mutants (architecture 19). A mutant is a small patch that the kit applies itself.
+# ---------------------------------------------------------------------------
+
+MUTANT_KEY_RE = re.compile(r"^Crucible-Mutant: (INV_[A-Z0-9_]+)$")
+MUTANT_DESCRIPTION_RE = re.compile(r"^Description: (?=[ ]*[!-~])([ -~]{1,200})$")
+# The text after the second @@ is never printed or used. A tab and printable Unicode are allowed (git writes
+# the function line there); C0 controls except tab, DEL, C1 controls, line separators and bidi marks are not.
+HUNK_TEXT = r"[^\x00-\x08\x0a-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]*"
+HUNK_HEADER_RE = re.compile(r"^@@ -([0-9]{1,9})(?:,([0-9]{1,9}))? \+([0-9]{1,9})(?:,([0-9]{1,9}))? @@(?: " + HUNK_TEXT + ")?$")
+GIT_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
+INDEX_LINE_RE = re.compile(r"^index [0-9a-f]{7,64}\.\.[0-9a-f]{7,64}(?: 100(?:644|755))?$")
+PATCH_PATH_RE = re.compile(r"^[!-~]+$")
+NO_NEWLINE_MARKER = "\\ No newline at end of file"
+FORBIDDEN_DIFF_LINES = ("new file", "deleted file", "rename ", "copy ", "similarity ", "old mode",
+                        "new mode", "Binary files", "GIT binary patch")
+MAX_HUNKS, MAX_ADDED_LINES = 3, 10
+MAX_MUTANT_BYTES = 64 * 1024
+
+
+class MutantError(ValueError):
+    """A mutant file that breaks the format (spec A2), or a patch that no longer applies."""
+
+
+def _mutant_header(lines: list[str]) -> tuple[str, str]:
+    """The two header lines and the blank line after them."""
+    if len(lines) < 3 or lines[2] != "":
+        raise MutantError("the header is exactly two lines (Crucible-Mutant, Description) "
+                          "and one blank line")
+    key, description = MUTANT_KEY_RE.match(lines[0]), MUTANT_DESCRIPTION_RE.match(lines[1])
+    if not key:
+        raise MutantError("line 1 must be 'Crucible-Mutant: INV_<NAME>'")
+    if not description:
+        raise MutantError("line 2 must be 'Description: <1 to 200 printable ASCII characters>'")
+    return key[1], description[1]
+
+
+def _patch_path(text: str, prefix: str) -> str:
+    if text.startswith('"'):
+        raise MutantError("quoted paths are not allowed")
+    if "/dev/null" in text:
+        raise MutantError("/dev/null (a new or deleted file) is not allowed")
+    if not text.startswith(prefix) or not PATCH_PATH_RE.match(text):
+        raise MutantError(f"the path {text!r} must be plain ASCII and start with {prefix}")
+    path = text[len(prefix):]
+    if path.startswith("/") or ".." in path.split("/") or posixpath.normpath(path) != path:
+        raise MutantError(f"the path {path!r} must be a normalized relative path without '..'")
+    return path
+
+
+def _git_header_paths(lines: list[str]) -> set[str]:
+    """The paths of an optional first `diff --git a/<p> b/<p>` line."""
+    if not lines or not lines[0].startswith("diff --git "):
+        return set()
+    git = GIT_HEADER_RE.match(lines[0])
+    if not git:
+        raise MutantError("the 'diff --git' line must be 'diff --git a/<p> b/<p>' without quotes")
+    return {git[1], git[2]}
+
+
+def _file_header(lines: list[str]) -> tuple[str, list[str]]:
+    """Optional `diff --git` and `index` lines, then `--- a/<p>` and `+++ b/<p>`."""
+    git_paths = _git_header_paths(lines)
+    position = 1 if git_paths else 0
+    if position < len(lines) and INDEX_LINE_RE.match(lines[position]):
+        position += 1
+    if position < len(lines) and not lines[position].startswith("--- "):
+        raise MutantError(_unexpected(lines[position]))
+    if len(lines) < position + 2 or not lines[position + 1].startswith("+++ "):
+        raise MutantError("expected '--- a/<path>' and '+++ b/<path>' after the header")
+    old = _patch_path(lines[position][4:], "a/")
+    new = _patch_path(lines[position + 1][4:], "b/")
+    if old != new or git_paths - {old}:
+        raise MutantError("a mutant changes one file: the a/ and b/ paths differ")
+    return old, lines[position + 2:]
+
+
+def _unexpected(line: str) -> str:
+    for prefix in FORBIDDEN_DIFF_LINES:
+        if line.startswith(prefix):
+            return f"'{prefix.strip()}' is not allowed"
+    if line.startswith(("diff --git", "--- ", "+++ ")):
+        return "a second file section is not allowed"
+    return f"unexpected line {line[:40]!r}"
+
+
+def _more_lines(lines: list[str], position: int, counts_open: bool) -> bool:
+    """True while the counted lines are missing, or a no-newline marker is next."""
+    return counts_open or (position < len(lines) and lines[position].startswith("\\"))
+
+
+def _mark_no_newline(entries: list, line: str) -> None:
+    if line != NO_NEWLINE_MARKER or not entries or entries[-1][2]:
+        raise MutantError(f"unexpected line {line[:40]!r}")
+    entries[-1][2] = True
+
+
+def _hunk_lines(lines: list[str], position: int, want_old: int, want_new: int) -> tuple[list, int]:
+    """The body of one hunk: exactly the counted lines, and the no-newline markers between them."""
+    entries, old, new = [], 0, 0          # entry: [kind, text, line has no newline]
+    while _more_lines(lines, position, old < want_old or new < want_new):
+        if position >= len(lines):
+            raise MutantError("a hunk ends before its line counts are reached")
+        line, position = lines[position], position + 1
+        if line.startswith("\\"):
+            _mark_no_newline(entries, line)
+        elif line[:1] in (" ", "-", "+"):
+            entries.append([line[0], line[1:], False])
+            old, new = old + (line[0] != "+"), new + (line[0] != "-")
+        else:
+            raise MutantError(_unexpected(line))
+    if (old, new) != (want_old, want_new):
+        raise MutantError("a hunk has more lines than its header counts")
+    return entries, position
+
+
+def _line_bytes(entry: list) -> bytes:
+    return (entry[1] + ("" if entry[2] else "\n")).encode()
+
+
+def _make_hunk(start: int, entries: list) -> dict:
+    return {"old_start": start,
+            "old": [_line_bytes(e) for e in entries if e[0] != "+"],
+            "new": [_line_bytes(e) for e in entries if e[0] != "-"],
+            "removed": [e[1] for e in entries if e[0] == "-"],
+            "added": [e[1] for e in entries if e[0] == "+"]}
+
+
+def _hunks(lines: list[str]) -> list[dict]:
+    hunks, position = [], 0
+    while position < len(lines):
+        header = HUNK_HEADER_RE.match(lines[position])
+        if not header:
+            raise MutantError(_unexpected(lines[position]))
+        want_old = 1 if header[2] is None else int(header[2])
+        want_new = 1 if header[4] is None else int(header[4])
+        entries, position = _hunk_lines(lines, position + 1, want_old, want_new)
+        hunks.append(_make_hunk(int(header[1]), entries))
+    return hunks
+
+
+def _squash(lines: list[str]) -> str:
+    return "".join("".join(lines).split())
+
+
+def _check_no_newline(hunks: list[dict]) -> None:
+    """A line without a newline is the last line of the file: the last line of the last hunk."""
+    for number, hunk in enumerate(hunks, 1):
+        for side in (hunk["old"], hunk["new"]):
+            inner = side if number < len(hunks) else side[:-1]
+            if any(not line.endswith(b"\n") for line in inner):
+                raise MutantError(f"hunk {number} has a no-newline marker that is not at the end of the file")
+
+
+def _hunk_rules(hunks: list[dict]) -> None:
+    if not 1 <= len(hunks) <= MAX_HUNKS:
+        raise MutantError(f"a mutant has 1 to {MAX_HUNKS} hunks, found {len(hunks)}")
+    if sum(len(h["added"]) for h in hunks) > MAX_ADDED_LINES:
+        raise MutantError(f"a mutant adds at most {MAX_ADDED_LINES} lines in all")
+    _check_no_newline(hunks)
+    end = 1
+    for number, hunk in enumerate(hunks, 1):
+        if not hunk["removed"]:
+            raise MutantError(f"hunk {number} removes no line")
+        if _squash(hunk["removed"]) == _squash(hunk["added"]):
+            raise MutantError(f"hunk {number} changes only whitespace")
+        if hunk["old_start"] < end:
+            raise MutantError(f"hunk {number} starts inside the previous hunk or before line 1")
+        end = hunk["old_start"] + len(hunk["old"])
+
+
+def parse_mutant(raw: bytes) -> dict:
+    """Strict parse of a mutant file (spec A2). Raises MutantError on anything outside the format."""
+    if len(raw) > MAX_MUTANT_BYTES:
+        raise MutantError(f"the file is larger than {MAX_MUTANT_BYTES} bytes")
+    if b"\r" in raw:
+        raise MutantError("CR and CRLF line ends are not allowed")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MutantError(f"the file is not UTF-8: {exc}") from exc
+    if not text.endswith("\n"):
+        raise MutantError("the file must end with a newline")
+    lines = text[:-1].split("\n")
+    invariant, description = _mutant_header(lines)
+    target, rest = _file_header(lines[3:])
+    hunks = _hunks(rest)
+    _hunk_rules(hunks)
+    return {"invariant": invariant, "description": description, "target": target, "hunks": hunks}
+
+
+def split_lines(data: bytes) -> list[bytes]:
+    """The lines of `data` with their newline; a last line without one stays as it is."""
+    parts = data.split(b"\n")
+    last = parts.pop()
+    return [part + b"\n" for part in parts] + ([last] if last else [])
+
+
+def apply_mutant(data: bytes, hunks: list[dict]) -> bytes:
+    """Apply the hunks byte-exact: no fuzz, no offset, no git. A hunk whose context is not at its
+    line is stale (MutantError). Hunks are in ascending order, so they apply from the last one."""
+    lines = split_lines(data)
+    total = len(lines)
+    for number in range(len(hunks), 0, -1):
+        hunk = hunks[number - 1]
+        start, count = hunk["old_start"] - 1, len(hunk["old"])
+        if hunk["new"] and not hunk["new"][-1].endswith(b"\n") and start + count != total:
+            raise MutantError(f"hunk {number} ends without a newline but is not at the end of the file")
+        if lines[start:start + count] != hunk["old"]:
+            raise MutantError(f"hunk {number} does not match the file at line {hunk['old_start']} "
+                              "(the mutant is stale; write it again against the current source)")
+        lines[start:start + count] = hunk["new"]
+    return b"".join(lines)
+
+
+SPEC_REL = "contracts/SPEC.md"
+INVARIANT_RE = re.compile(r"^- (INV_[A-Z0-9_]+): (\S.*?) -> REJECT\((ERR_[A-Z0-9_]+)\)\s*$")
+GAPS_HEADING_RE = re.compile(r"^##\s+Gaps\s*$", re.IGNORECASE)
+
+
+def gaps_text(text: str) -> str:
+    """The text under the `## Gaps` heading of SPEC.md (up to the next heading
+    of level 1 or 2), whitespace-normalized. Fenced blocks are ignored."""
+    collected: list[str] = []
+    in_fence = in_gaps = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.match(r"^#{1,2}\s", line):
+            in_gaps = bool(GAPS_HEADING_RE.match(line))
+            continue
+        if in_gaps:
+            collected.append(line)
+    return " ".join(" ".join(collected).split())
+
+
+def invariant_names(text: str) -> list[str]:
+    """The names of the well-formed invariant lines of SPEC.md, in order. Fenced blocks are ignored."""
+    names, in_fence = [], False
+    for line in text.splitlines():
+        match = None if in_fence else INVARIANT_RE.match(line)
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif match:
+            names.append(match[1])
+    return list(dict.fromkeys(names))
+
+
+def _no_link_on_path(ws: Path, rel: str) -> None:
+    """MutantError when `rel`, or a directory on its path, is a symlink."""
+    current = ws
+    for part in rel.split("/"):
+        current = current / part
+        if current.is_symlink():
+            raise MutantError(f"{rel}: a symlink is on the path")
+
+
+def _readable_file(ws: Path, listing: set[str], rel: str) -> bytes:
+    if rel not in listing:
+        raise MutantError(f"{rel}: not a file of the work tree (the path is case-exact, "
+                          "and git must not ignore it)")
+    _no_link_on_path(ws, rel)
+    try:
+        return read_nofollow(ws / rel)
+    except KitError as exc:
+        raise MutantError(str(exc)) from exc
+
+
+def _target_data(ws: Path, rules: GateRules, listing: set[str], target: str) -> bytes:
+    if rules.pin_entry(target):
+        raise MutantError(f"{target}: a pinned file; a mutant changes a source file")
+    if not rules.is_source(target):
+        raise MutantError(f"{target}: not a source file ([gate] source_paths)")
+    return _readable_file(ws, listing, target)
+
+
+def load_mutant(ws: Path, rules: GateRules, listing: set[str], rel: str) -> dict:
+    """Parse the mutant file `rel` and apply it to the current target. `problem` says why it cannot be used."""
+    entry = {"path": rel, "invariant": None, "description": None, "target": None, "hunks": [],
+             "problem": None}
+    try:
+        entry.update(parse_mutant(_readable_file(ws, listing, rel)))
+        apply_mutant(_target_data(ws, rules, listing, entry["target"]), entry["hunks"])
+    except MutantError as exc:
+        entry["problem"] = f"{rel}: {exc}"
+    return entry
+
+
+def _in_gaps(reason: str, gaps: str) -> bool:
+    return " ".join(reason.split()) in gaps
+
+
+def _coverage_rows(names: list[str], mutants: list[dict]) -> tuple[dict, list[str]]:
+    rows = {name: {"mutants": [], "waived": None} for name in names}
+    problems = []
+    for mutant in mutants:
+        row = rows.get(mutant["invariant"])
+        if row is not None:
+            row["mutants"].append(mutant["path"])
+        elif mutant["invariant"]:
+            problems.append(f"{mutant['path']}: names {mutant['invariant']}, which SPEC.md does not define")
+    return rows, problems
+
+
+def _waiver_problems(rows: dict, waived: dict, gaps: str) -> list[str]:
+    problems = []
+    for name, reason in waived.items():
+        if name not in rows:
+            problems.append(f"[mutation] waived names {name}, which SPEC.md does not define")
+            continue
+        rows[name]["waived"] = reason
+        if not _in_gaps(reason, gaps):
+            problems.append(f"waiver for {name}: the reason must also appear under ## Gaps in {SPEC_REL}")
+    return problems
+
+
+def _uncovered_problems(rows: dict) -> list[str]:
+    problems = []
+    for name, row in rows.items():
+        if row["mutants"] and row["waived"] is not None:
+            problems.append(f"{name} is both mutated and waived; keep one")
+        elif not row["mutants"] and row["waived"] is None:
+            problems.append(f"{name} has no mutant and no waiver: write a mutant (archetype README, section "
+                            "Mutants) or a waiver with a reason that also appears under ## Gaps")
+    return problems
+
+
+def mutation_static_check(ws: Path, cfg: dict, rules: GateRules) -> dict:
+    """Spec A3.1. Runs no configured command: the config rules, every mutant file (format, target,
+    applies to the current tree), the coverage rule, and the Gaps text of the waivers."""
+    settings = cfg["mutation"]
+    check = {"ok": False, "problems": [], "mutants": [], "coverage": {}, "waived": dict(settings["waived"]),
+             "controls": settings["controls"], "no_controls_reason": settings["no_controls_reason"]}
+    try:
+        text = read_nofollow(ws / SPEC_REL).decode()
+        listing = set(work_tree_listing(ws))
+    except (KitError, UnicodeDecodeError) as exc:
+        check["problems"].append(f"cannot read the inputs of the mutation check: {exc}")
+        return check
+    gaps = gaps_text(text)
+    check["mutants"] = [load_mutant(ws, rules, listing, rel) for rel in settings["mutants"]]
+    rows, problems = _coverage_rows(invariant_names(text), check["mutants"])
+    problems += _waiver_problems(rows, settings["waived"], gaps) + _uncovered_problems(rows)
+    if not settings["controls"] and not _in_gaps(settings["no_controls_reason"], gaps):
+        problems.append(f"mutation.no_controls_reason must also appear under ## Gaps in {SPEC_REL}")
+    problems = [m["problem"] for m in check["mutants"] if m["problem"]] + problems
+    check.update(coverage=rows, problems=problems, ok=not problems)
+    return check
+
+
+def mutation_summary(check: dict) -> dict:
+    """The check as JSON: the same facts without the parsed hunks."""
+    mutants = [{key: m[key] for key in ("path", "invariant", "description", "target", "problem")}
+               for m in check["mutants"]]
+    return {"ok": check["ok"], "problems": check["problems"], "mutants": mutants,
+            "coverage": check["coverage"], "waived": check["waived"],
+            "invariants": len(check["coverage"]),
+            "waived_count": sum(1 for row in check["coverage"].values() if row["waived"] is not None),
+            "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
+
+
+KIT_VERSION = "3.0.1"  # tests/test_kit_version.py keeps this equal to the VERSION file
+MUTATION_DIRNAME = "mutation"
+PASS_FILE = "pass.json"
+ATTEMPTS_FILE = "attempts.json"
+
+
+JSON_READ_LIMIT = 64 * 1024
+
+
+def _real_directory(path: Path) -> None:
+    """Nothing, or TrustError when `path` exists and is a symlink or not a directory (lstat, so a link
+    is never followed)."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise TrustError(f"{path} cannot be inspected ({exc.strerror}): remove it (a human)") from exc
+    if not stat.S_ISDIR(mode):
+        raise TrustError(f"{path} is not a directory the kit made: remove it (a human)")
+
+
+def mutation_dir(ws: Path, create: bool = False) -> Path:
+    """`<git-common-dir>/crucible/mutation`, mode 0700 when created. It is the only trust state that
+    may exist before the first pin (spec A4). Every call checks the state directory and this one with
+    lstat: a non-directory, or one that cannot be inspected, raises TrustError. A symlinked `crucible` state
+    directory is resolved by state_path and does not raise (a kit-wide fix is deferred); a symlinked
+    `mutation` directory raises."""
+    state = state_path(ws)
+    path = state / MUTATION_DIRNAME
+    _real_directory(state)
+    _real_directory(path)
+    if create:
+        state_dir(ws, create=True)
+        path.mkdir(mode=0o700, exist_ok=True)
+        if stat.S_IMODE(path.stat().st_mode) != 0o700:
+            path.chmod(0o700)
+    return path
+
+
+def _read_json_object(path: Path) -> dict | None:
+    """A small JSON object from `path`, or None for anything else (missing, link, too big, damaged,
+    nested too deep): these files are untrusted input and `status` must never fail on them."""
+    try:
+        raw = read_nofollow(path, limit=JSON_READ_LIMIT + 1)
+        data = json.loads(raw.decode()) if len(raw) <= JSON_READ_LIMIT else None
+    except (KitError, OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_side(ws: Path, name: str) -> dict | None:
+    """A record file for reading. A refused or unreadable directory reads as no file."""
+    try:
+        return _read_json_object(mutation_dir(ws) / name)
+    except (KitError, OSError):
+        return None
+
+
+def read_pass(ws: Path) -> dict | None:
+    """The pass record, or None when it is missing or damaged."""
+    return _read_side(ws, PASS_FILE)
+
+
+def delete_pass(ws: Path) -> None:
+    path = mutation_dir(ws) / PASS_FILE
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise TrustError(f"{path} cannot be removed ({exc.strerror}): remove it (a human)") from exc
+
+
+def failed_runs(ws: Path) -> int:
+    """Stage runs that failed since the last pass (0 when the counter is missing or damaged)."""
+    count = (_read_side(ws, ATTEMPTS_FILE) or {}).get("failed_runs")
+    return count if type(count) is int and count >= 0 else 0
+
+
+def set_failed_runs(ws: Path, count: int) -> None:
+    path = mutation_dir(ws, create=True) / ATTEMPTS_FILE
+    try:
+        write_private(path, (json.dumps({"failed_runs": max(count, 0)}) + "\n").encode())
+    except OSError as exc:
+        raise TrustError(f"{path} cannot be written ({exc.strerror}): remove it (a human)") from exc
+
+
+def bump_failed_runs(ws: Path) -> None:
+    set_failed_runs(ws, failed_runs(ws) + 1)
+
+
+MUTANT_OUTCOMES = ("killed", "survived", "not judged")      # what classify_mutant in bin/crucible returns
+
+
+def _mutant_shape_ok(mutant) -> bool:
+    return (isinstance(mutant, dict) and all(type(mutant.get(key)) is str and is_plain_ascii(mutant[key])
+                                              for key in ("path", "invariant"))
+            and mutant.get("outcome") in MUTANT_OUTCOMES)
+
+
+def record_shape_problems(record: dict) -> list[str]:
+    """The fields of a pass record the PIN table prints, checked for shape. The file is writable by an
+    agent: only the field name is reported, never the value."""
+    mutants = record.get("mutants")
+    checks = {"mutants": isinstance(mutants, list) and all(_mutant_shape_ok(m) for m in mutants),
+              "failed_runs": type(record.get("failed_runs")) is int and record["failed_runs"] >= 0,
+              "seed": type(record.get("seed")) is int}
+    return [f"the pass record is damaged: {name}" for name, good in checks.items() if not good]
+
+
+def _outcome_problems(record: dict, summary: dict) -> list[str]:
+    """The record must list exactly the mutants the static check lists, each killed. A kit-written
+    record always does; a thin or edited one shows less than the human is asked to trust. Call it only
+    after record_shape_problems found nothing."""
+    listed = {(m["path"], m["invariant"]) for m in summary["mutants"]}
+    shown = [(m["path"], m["invariant"]) for m in record["mutants"]]
+    killed = all(m["outcome"] == "killed" for m in record["mutants"])
+    if set(shown) == listed and len(shown) == len(listed) and killed:
+        return []
+    return ["the pass record does not show every mutant killed"]
+
+
+def record_problems(record: dict | None, ws: Path, tree: dict, pin_digest: str, config_sha: str,
+                    summary: dict) -> list[str]:
+    """Why `record` does not match the tree being pinned (spec A4), or []: the repository root, the
+    digest of the full gated map, the pin digest and the config hash must all be equal, and the
+    outcomes must show every listed mutant killed (`summary` is mutation_summary of the static check)."""
+    if record is None:
+        return ["there is no mutation pass record"]
+    expected = {"repo_root": str(ws.resolve()), "gated_digest": files_digest(tree),
+                "pin_digest": pin_digest, "config_sha256": config_sha}
+    shape = record_shape_problems(record)
+    return ([f"the pass record's {key} does not match the tree being pinned"
+             for key, value in expected.items() if record.get(key) != value]
+            + shape + ([] if shape else _outcome_problems(record, summary)))
+
+
+def _shown_name(name: str) -> str:
+    """An entry name for a message: as is when printable ASCII, else repr() so no control character
+    reaches the terminal."""
+    return name if is_plain_ascii(name) else repr(name)
+
+
+def _listing(folder: Path) -> list[Path]:
+    try:
+        return sorted(folder.iterdir())
+    except OSError as exc:
+        raise KitError(f"{folder} cannot be read: {exc.strerror}; a human checks its mode") from exc
+
+
+def _mutation_folder_extras(folder: Path) -> list[str]:
+    """Entries of `mutation/` other than the two regular files the CLI writes."""
+    if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+        return [f"{MUTATION_DIRNAME} (not a plain directory)"]
+    if not folder.is_dir():
+        return []
+    return [f"{MUTATION_DIRNAME}/{_shown_name(entry.name)}" for entry in _listing(folder)
+            if entry.name not in (PASS_FILE, ATTEMPTS_FILE) or entry.is_symlink() or not entry.is_file()]
+
+
+def unexpected_state_entries(ws: Path) -> list[str]:
+    """What the state directory holds that may not exist before the first pin (spec A4): anything but
+    `mutation/` with `pass.json` and `attempts.json`. A planted secret would be reused by the pin."""
+    state = state_dir(ws, create=False)
+    if state.is_symlink():          # dead until the kit-wide state-dir symlink fix lands: state_path resolves it
+        return [f"{state.name} (a symlink)"]
+    if not state.is_dir():
+        return []
+    found = [_shown_name(entry.name) for entry in _listing(state) if entry.name != MUTATION_DIRNAME]
+    return found + _mutation_folder_extras(state / MUTATION_DIRNAME)
+
+
+def _mutant_name(path: str, invariant: str) -> str:
+    """The mutant file name without its folder, its `INV_<NAME>-` prefix and `.patch`."""
+    name = posixpath.basename(path)
+    name = name[:-len(".patch")] if name.endswith(".patch") else name
+    for sep in ("-", "_"):
+        if name.startswith(invariant + sep) and len(name) > len(invariant) + 1:
+            return name[len(invariant) + 1:]
+    return name
+
+
+def _invariant_rows(summary: dict, outcomes: dict) -> list[list[str]]:
+    by_path = {mutant["path"]: mutant for mutant in summary["mutants"]}
+    rows = []
+    for name, row in summary["coverage"].items():
+        if row["waived"] is not None:
+            rows.append([name, "-", "-", "waived"])
+            continue
+        for index, path in enumerate(row["mutants"]):
+            rows.append([name if index == 0 else "", _shown(_mutant_name(path, name)),
+                         _shown(by_path[path]["target"]), outcomes.get(path, "not run")])
+    return rows
+
+
+def _mutation_verdict(summary: dict, record: dict | None, outcomes: dict) -> str:
+    """The summary line under the table: the kill count, the waiver count, the controls, and the
+    failed runs before the pass (only with a matching record)."""
+    controls = ("controls on" if summary["controls"]
+                else f"controls OFF (reason: {summary['no_controls_reason']})")
+    waived = f"{summary['waived_count']} of {summary['invariants']} invariants waived"
+    if not outcomes and record is None:
+        return f"no matching mutation pass record; {waived}, {controls}"
+    killed = sum(1 for m in summary["mutants"] if outcomes.get(m["path"]) == "killed")
+    return (f"PASS: {killed}/{len(summary['mutants'])} mutants killed, {waived}, {controls}, "
+            f"{plural(record['failed_runs'], 'failed mutation run')} before this pass")
+
+
+def mutation_table_lines(summary: dict, record: dict | None, matching: bool) -> list[str]:
+    """What a human reads before the PIN prompt: a table of each invariant with its mutants and their
+    outcome in the matching record (a waiver shows `waived`), then one summary line and each waiver
+    reason."""
+    record = record if matching else None
+    outcomes = {m["path"]: m["outcome"] for m in record["mutants"]} if record else {}
+    rows = _invariant_rows(summary, outcomes)
+    lines = box_table(["INVARIANT", "MUTANT", "TARGET", "RESULT"], rows, squeeze=1) if rows else []
+    lines.append(f"  mutation  {_mutation_verdict(summary, record, outcomes)}")
+    lines += [f"  waived    {name}: {row['waived']}" for name, row in summary["coverage"].items()
+              if row["waived"] is not None]
+    return lines
+
+
+def _unexpected_state_message(ws: Path) -> str:
+    return (f"the trust state directory {state_dir(ws, create=False)} holds "
+            + ", ".join(unexpected_state_entries(ws))
+            + " before the first pin. A planted file could be reused as the signing secret, and a first pin "
+              "that failed part-way leaves such files (a secret, a .checker-* directory). A human removes "
+              "exactly these entries, then pins")
+
+
+def ensure_secret(ws: Path, state: Path, first_pin: bool) -> None:
+    """Create the signing secret. A first pin looks at the state directory again after the human
+    answered, and creates the secret with O_EXCL, so a file planted while the prompt waited is refused,
+    never kept. A repin keeps the secret it has."""
+    if not first_pin:
+        if not (state / SECRET_FILE).exists():
+            create_secret(state)
+        return
+    if unexpected_state_entries(ws):
+        raise KitError(_unexpected_state_message(ws))
+    try:
+        create_secret(state)
+    except FileExistsError as exc:
+        raise KitError("a signing secret appeared while the PIN prompt waited; nothing was pinned") from exc
+
+
+def mutation_gate(ws: Path, cfg: dict, rules: GateRules, tree: dict, pin_digest: str,
+                  config_bytes: bytes, refuse: bool, first_pin: bool) -> None:
+    """The mutation check at the pin (spec A4). It prints the table and the record status. With
+    `refuse`, it raises KitError for an unexpected first-pin state, a failed static check, or a
+    missing or stale record. It runs no configured command."""
+    if refuse and first_pin and unexpected_state_entries(ws):
+        raise KitError(_unexpected_state_message(ws))
+    check = mutation_static_check(ws, cfg, rules)
+    record = read_pass(ws)
+    summary = mutation_summary(check)
+    problems = record_problems(record, ws, tree, pin_digest, sha256_hex(config_bytes), summary)
+    show("")
+    for line in mutation_table_lines(summary, record, not problems):
+        show(line)
+    for line in check["problems"]:
+        show(f"  problem   {line}")
+    if not refuse:
+        show("  record    " + ("a matching mutation pass record exists" if not problems else problems[0]))
+        return
+    if check["problems"] or problems:
+        raise KitError("the mutation check does not allow this pin: "
+                       + "; ".join(check["problems"] + problems)
+                       + ". An agent runs python3 bin/crucible mutation --json first")
+
+
+# ---------------------------------------------------------------------------
+# The repin review: what a human reads before the PIN prompt, as bordered tables
+
+BOX_UNICODE = "┌┬┐├┼┤└┴┘─│"
+BOX_ASCII = "+++++++++-|"
+PIN_KIND_ORDER = ("spec", "tests", "driver", "mutant", "config", "baseline", "build", "kit", "env")
+# Kinds a human reads file by file: never folded into one row.
+PIN_KINDS_TO_READ = ("spec", "tests", "driver")
+FOLD_JOIN_LIMIT = 40
+
+
+def show(line: str) -> None:
+    """A review line without the `crucible:` prefix (table rows and the summary block)."""
+    print(line, file=sys.stderr, flush=True)
+
+
+def _box_chars() -> str:
+    """Light Unicode borders on a UTF-8 terminal; ASCII for TERM=dumb, pipes in other encodings and logs."""
+    encoding = (getattr(sys.stderr, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    return BOX_UNICODE if encoding == "utf8" and os.environ.get("TERM") != "dumb" else BOX_ASCII
+
+
+def _cut_middle(text: str, width: int, ellipsis: str) -> str:
+    if len(text) <= width:
+        return text
+    keep = width - len(ellipsis)
+    return text[:(keep + 1) // 2] + ellipsis + text[len(text) - keep // 2:]
+
+
+def _squeezed(rows: list[list[str]], widths: list[int], column: int, ellipsis: str) -> list[list[str]]:
+    """Narrow `column` (in `widths`, in place) so the table fits the terminal; cut its cells in the middle."""
+    excess = sum(widths) + 3 * len(widths) + 1 - shutil.get_terminal_size((120, 24)).columns
+    if excess <= 0:
+        return rows
+    widths[column] = max(20, widths[column] - excess)
+    return [[_cut_middle(str(c), widths[column], ellipsis) if i == column else c for i, c in enumerate(row)]
+            for row in rows]
+
+
+def box_table(headers: list[str], rows: list[list[str]], squeeze: int | None = None) -> list[str]:
+    """A table with thin borders. When it is wider than the terminal, the `squeeze` column is cut
+    in the middle (never below 20 characters)."""
+    chars = _box_chars()
+    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers))]
+    if squeeze is not None:
+        rows = _squeezed(rows, widths, squeeze, "…" if chars == BOX_UNICODE else "...")
+    top_l, top_m, top_r, mid_l, mid_m, mid_r, bot_l, bot_m, bot_r, flat, wall = chars
+
+    def rule(left: str, middle: str, right: str) -> str:
+        return left + middle.join(flat * (w + 2) for w in widths) + right
+
+    def line(cells: list[str]) -> str:
+        return wall + wall.join(f" {str(c).ljust(w)} " for c, w in zip(cells, widths)) + wall
+
+    return [rule(top_l, top_m, top_r), line(headers), rule(mid_l, mid_m, mid_r),
+            *[line(row) for row in rows], rule(bot_l, bot_m, bot_r)]
+
+
+def _kind_sets(cfg: dict) -> list[tuple[str, set[str], tuple[str, ...]]]:
+    """(kind, exact paths, directory prefixes) in the order a path is matched."""
+    def named(*commands) -> set[str]:
+        return {lexical_normalize(str(c)) or str(c) for command in commands for c in (command or [])}
+    drivers = tuple(d.rstrip("/") + "/" for d in cfg["tier2"].get("driver_paths", []))
+    engine = named(cfg["ast"]["command"])     # the AST engine the config names: kit machinery
+    return [("spec", {SPEC_REL}, ()),
+            ("tests", set(cfg["tier1"]["contract_tests"]) | named(cfg["tier1"]["command"],
+                                                                    cfg["mutation"]["command"]), ()),
+            ("driver", {d.rstrip("/") for d in drivers}, drivers),
+            ("mutant", set(cfg["mutation"]["mutants"]), ()),
+            ("config", {CONFIG_REL, PINS_MIRROR_REL}, ()),
+            ("baseline", {cfg["ast"]["baseline"]}, ()),
+            ("kit", set(MACHINERY) | engine, tuple(e.rstrip("/") + "/" for e in engine if "." not in posixpath.basename(e)))]
+
+
+def pin_kind(path: str, cfg: dict) -> str:
+    """What a pinned path is to the human who judges it; anything else is a build input."""
+    for kind, exact, prefixes in _kind_sets(cfg):
+        if path in exact or path.startswith(prefixes or ("\0",)):
+            return kind
+    return "build"
+
+
+def _folded(kind: str, paths: list[str]) -> str | None:
+    """One cell for several added files of one kind, or None when one cell would hide the names."""
+    if kind == "kit":
+        return plural(len(paths), "machinery file")
+    joined = ", ".join(_shown(p) for p in paths)
+    if len(joined) <= FOLD_JOIN_LIMIT:
+        return joined
+    common = posixpath.commonpath(paths) if all("/" in p for p in paths) else ""
+    return f"{_shown(common)}/ ({len(paths)} files)" if common else None
+
+
+def pin_review_rows(delta: dict, env_delta: dict, cfg: dict) -> list[list[str]]:
+    """KIND / CHANGE / PATH rows: changed, then removed, then added; by kind; added files of a kind a
+    human does not read file by file are folded into one row."""
+    words = (("modified", "changed"), ("removed", "removed"), ("added", "added"))
+    rows: list[list[str]] = []
+    for key, word in words:
+        groups: dict[str, list[str]] = collections.defaultdict(list)
+        for path in delta[key]:
+            groups[pin_kind(path, cfg)].append(path)
+        for path in env_delta[key]:
+            groups["env"].append(path)
+        for kind in PIN_KIND_ORDER:
+            paths = sorted(groups.get(kind, []))
+            folded = (_folded(kind, paths) if key == "added" and kind not in PIN_KINDS_TO_READ
+                      and len(paths) > 1 else None)
+            if folded is not None:
+                rows.append([kind, word, folded])
+            else:
+                rows.extend([kind, word, _shown(p)] for p in paths)
+    return rows
+
+
+def pin_review_hash_rows(delta: dict, env_delta: dict, old: dict, new: dict, old_env: dict,
+                         environment: dict, cfg: dict) -> list[list[str]]:
+    """--verbose: every path with its old and new sha256 prefix, nothing folded."""
+    rows = []
+    for key, word in (("modified", "changed"), ("removed", "removed"), ("added", "added")):
+        for path in sorted(delta[key], key=lambda p: (PIN_KIND_ORDER.index(pin_kind(p, cfg)), p)):
+            rows.append([pin_kind(path, cfg), word, _shown(path), old.get(path, "-")[:12], new.get(path, "-")[:12]])
+        for path in sorted(env_delta[key]):
+            rows.append(["env", word, _shown(path), old_env.get(path, "-")[:12], environment.get(path, "-")[:12]])
+    return rows
+
+
+def review_head(first_pin: bool, count: int, delta: dict, env_delta: dict) -> str:
+    changed = len(delta["modified"]) + len(env_delta["modified"])
+    added = len(delta["added"]) + len(env_delta["added"])
+    removed = len(delta["removed"]) + len(env_delta["removed"])
+    what = "first pin" if first_pin else "repin"
+    return (f"{what} review: {plural(count, 'trusted input')} "
+            f"({added} added, {changed} changed, {removed} removed)")
+
+
+def show_pin_review(delta: dict, env_delta: dict, cfg: dict, verbose: bool, current: dict | None,
+                    pins: dict, environment: dict) -> None:
+    """The KIND / CHANGE / PATH table; with --verbose every path with its old and new hash."""
+    if verbose:
+        old_env = (current or {}).get("environment") or {}
+        rows = pin_review_hash_rows(delta, env_delta, (current or {}).get("pins") or {}, pins,
+                                    old_env, environment, cfg)
+        headers = ["KIND", "CHANGE", "PATH", "OLD", "NEW"]
+    else:
+        rows, headers = pin_review_rows(delta, env_delta, cfg), ["KIND", "CHANGE", "PATH"]
+    show("")
+    for line in box_table(headers, rows, squeeze=2):
+        show(line)
+
+
+def check_line(delta: dict) -> str:
+    """The command that shows what changed in the pinned files that were already pinned."""
+    paths = sorted(delta["modified"] + delta["removed"])
+    if not paths:
+        return "  check     read the rows above; read each mutant patch"
+    shown = " ".join(shlex.quote(p) for p in paths[:8]) + (" ..." if len(paths) > 8 else "")
+    return f"  check     git diff HEAD -- {shown}; read each mutant patch"
+
+
+# ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
 
@@ -2394,7 +3299,7 @@ def git_change_notes(current: dict | None, git_path: str) -> list[str]:
     return [f"  git binary: old={current.get('git') or '-'}  new={git_path}"]
 
 
-def install_hooks(ws: Path, repin: bool = False) -> dict:
+def install_hooks(ws: Path, repin: bool = False, verbose: bool = False) -> dict:
     """The human ratification path (section 4). Returns a summary dict."""
     require_human_terminal()
     ws = ws.resolve()
@@ -2434,27 +3339,20 @@ def install_hooks(ws: Path, repin: bool = False) -> dict:
                "hooks_installed": [], "kid": None, "genesis": (current or {}).get("genesis")}
 
     if changed and (current is None or repin):
-        old = current["pins"] if current else {}
-        for kind in ("modified", "added", "removed"):
-            for path in delta[kind]:
-                say(f"  pin {kind:8} {path}  old={old.get(path, '-')[:12]}  "
-                    f"new={pins.get(path, '-')[:12]}")
-        old_env = (current or {}).get("environment") or {}
-        for kind in ("modified", "added", "removed"):
-            for path in env_delta[kind]:
-                say(f"  environment {kind:8} {path}  old={old_env.get(path, '-')[:12]}  "
-                    f"new={environment.get(path, '-')[:12]}")
+        say(review_head(current is None, len(pins), delta, env_delta))
+        show_pin_review(delta, env_delta, cfg, verbose, current, pins, environment)
         if stale_checker:
-            say("  the stored checker snapshot is damaged and will be replaced")
+            show("  checker   the stored checker snapshot is damaged and will be replaced")
         for note in git_notes or [f"  git binary: {git_path}"]:
-            say(note)
+            show(note)
         report_ignored_files(ws, rules, cfg)
+        mutation_gate(ws, cfg, rules, tree, pin_digest, config_bytes, True, current is None)
+        show(check_line(delta))
         word = f"PIN {pin_digest[:8]}"
         answer = input(f"Pin {plural(len(pins), 'trusted input')}? Type '{word}' to confirm: ")
         if answer.strip() != word:
             raise KitError("pin not confirmed; nothing changed")
-        if not (state / SECRET_FILE).exists():
-            create_secret(state)
+        ensure_secret(ws, state, current is None)
         secret = load_secret(state)
         genesis = (current or {}).get("genesis") or committed_genesis(ws) or head_commit(ws)
         digest = take_checker_snapshot(ws, state, config_bytes, pins)
@@ -2472,11 +3370,13 @@ def install_hooks(ws: Path, repin: bool = False) -> dict:
             f"{plural(len(environment), 'environment file')}, kid {trust['kid']}, "
             f"genesis {(genesis or 'none')[:12]}")
     elif changed:
-        for line in describe_diff("work tree vs pinned", delta):
-            say(line)
-        for line in describe_diff("environment vs pinned", env_delta):
-            say(line)
+        say("preview: " + review_head(False, len(pins), delta, env_delta))
+        show_pin_review(delta, env_delta, cfg, verbose, current, pins, environment)
+        for note in git_notes:
+            show(note)
         report_ignored_files(ws, rules, cfg)
+        mutation_gate(ws, cfg, rules, tree, pin_digest, config_bytes, False, False)
+        show(check_line(delta))
         say("trusted inputs differ from the pinned set; the gate rejects them until a human "
             "runs python3 bin/crucible install-hooks --repin")
         summary["kid"] = current["kid"]

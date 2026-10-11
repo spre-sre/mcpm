@@ -2,21 +2,26 @@
   "genesis": "60fbae26dbbbd777b990ff6161b4ef04e418c14c",
   "pins": {
     ".crucible/baseline.json": "7f8318779a30351f34e845a6dd04a2ce479cb64b01ed6001465bc1fd1708eb66",
-    ".crucible/config.toml": "e38b8ae6c16e3532c1859750328ab5ce4e4810166fe9aac295a1b0a0da42a566",
+    ".crucible/config.toml": "6e4c56a0a461f2e87b4b6fdb57541979ffa7a32bd2f9c81d810dcc93a713ed06",
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
-    "bin/crucible": "24477e833468491db30e4a25c7b8bf63bc6dc93125de23f1369962e56262e82c",
-    "cmd/gate-ast/main.go": "f3db0b1494f01d1ac645c6f8826aa40a982d5fb2ed915a16c37bb7944c6231ff",
+    "bin/crucible": "4ee50b00b80df5e07bec24579f58243d52bec11f628a84b2be8a7ea3c6203f71",
+    "cmd/gate-ast/main.go": "50354f194c5731a4367e8022f1817f3d852b5927ef89bbe8c58ae6b150a3a19f",
     "contracts/SPEC.md": "aae7da17dc347eb3e854d538f428f8632a43973612ddb0d1954d51c2de882030",
+    "contracts/mutants/INV_HOST_PORT_SPLIT-keep-colon.patch": "b6e7bf1bd84474f249bd6bc0c2161eacbd8e4bbb9f9f3aa2c35f18bc46a536c1",
+    "contracts/mutants/INV_HOST_WITHOUT_PORT-multi-colon-check-removed.patch": "6d42918e1eb7272910e8a6052c1334ecb19ae74f1125be07e69b9d6c7a1d21c6",
+    "contracts/mutants/INV_MANIFEST_JSON-runcmd-check-removed.patch": "11511a560e95cda735976d733f06022a82d53d7282c2883bfb1a4c8019bd1224",
+    "contracts/mutants/INV_PROJECT_DETECTED-go-sum-detected.patch": "b2510a370ec2a6746accb7f2f61c784c114c28f8aea03d30fab304d21e1bb424",
+    "contracts/mutants/INV_SERVER_INSTALLED-notexist-check-removed.patch": "be633de74267a134749becb20c7cf047bfe7f479c2f9896c71e0aec91323592e",
     "go.mod": "b5d4b8c7fea4ca0b2d6dba309b526a3d0d1a1dc260bf813c3858b6089b2c1dee",
     "go.sum": "7b5b79d1a85e6dde66282448f6459657886198cf92ca1f9969c42cd558b7f2ed",
     "harness/crucible_contracts_test.go": "39b4de8fe601c49ee6e3c57f920debe7ab1c130a66087629869a4065bc533e3f",
     "harness/run_tier1.sh": "a4e28a52a2db943bcfd26eece7f725c3cff34857e3f849fe74e22d863fc0fd84",
     "harness/telemetry_driver/main.go": "702453f85f9b41677119a1e31cd9b44a5880063eca49b2e92e8b6c5c9bf8c7c0",
     "harness/telemetry_math.py": "e9beaef9322f1688e22e75cf9fa56ae4d6a3f4d42384958791fe50eb0b72443e",
-    "scripts/mcp_server.py": "b2c281c41fa98de2f432d370344d2490c5a3feb33dcd32fab3bbaa7a54208359",
+    "scripts/mcp_server.py": "36ff99bf677d802960a7114cd0ff41fc83a40075ea693deaf6a868342912bdb8",
     "scripts/mint_attestation.py": "11ccd1bf2a9f9f4eae1a38a3cfc797904dfe64a1f723517fa7084d8701fb9154",
-    "scripts/verify_pins.py": "51b4bfaacd5445e10556daa961a8233f3adbe77f5bf39bb7b8ed6816297f79b0"
+    "scripts/verify_pins.py": "be75648582e3e9789e0139527f0943956cb84c04475fadea1e8074c4dd2b3499"
   },
   "version": 1
 }

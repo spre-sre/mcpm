@@ -72,7 +72,7 @@ type unit struct {
 	name    string
 	line    int
 	score   int
-	scoreV1 int // counting v1 (literals excluded); read only by -migrate-baseline, removed in kit v3.0
+	scoreV1 int // counting v1 (literals excluded); read only by -migrate-baseline, removed in a later major version
 }
 
 type problem struct {
@@ -657,7 +657,7 @@ func measure(root ast.Node) int {
 }
 
 // measureV1 is counting version 1: it does not descend into function
-// literals. Read only by -migrate-baseline; removed in kit v3.0.
+// literals. Read only by -migrate-baseline; removed in a later major version.
 func measureV1(root ast.Node) int {
 	score := 1
 	ast.Inspect(root, func(node ast.Node) bool {
@@ -748,7 +748,7 @@ func emit(rep report, asJSON bool, stdout, stderr io.Writer) {
 }
 
 // ---------------------------------------------------------------------------
-// Baseline migration, counting v1 -> v2 (G1 spec R4, R5). Removed in kit v3.0.
+// Baseline migration, counting v1 -> v2 (G1 spec R4, R5). Removed in a later major version.
 // ---------------------------------------------------------------------------
 
 var genesisPattern = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)

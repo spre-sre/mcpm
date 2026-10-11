@@ -99,8 +99,9 @@ _NO_ARGS = {"type": "object", "properties": {}, "required": [],
 TOOLS = [
     {"name": "crucible_status",
      "description": "Read-only crucible state: git HEAD and branch, working tree, "
-                    "trusted-input pin status, installed hooks, and attestation token "
-                    "state. Never changes anything.",
+                    "trusted-input pin status, installed hooks, attestation token "
+                    "state, and, from kit 3.0.0, the static check of the mutants under the "
+                    "`mutation` key (a status from an older snapshot lacks it). Never changes anything.",
      "inputSchema": _NO_ARGS},
     {"name": "crucible_inspect_spec",
      "description": "Read-only: parse contracts/SPEC.md into structured JSON (invariants, "

@@ -1,0 +1,10 @@
+Crucible-Mutant: INV_PROJECT_DETECTED
+Description: treat go.sum as a project marker, so a root without any real marker is not rejected
+
+diff --git a/internal/builder/builder.go b/internal/builder/builder.go
+index 93c752c..2c36177 100644
+--- a/internal/builder/builder.go
++++ b/internal/builder/builder.go
+@@ -37 +37 @@ func DetectAndBuild(repoPath string) (*BuildResult, error) {
+-	if exists(filepath.Join(absPath, "go.mod")) {
++	if exists(filepath.Join(absPath, "go.mod")) || exists(filepath.Join(absPath, "go.sum")) {

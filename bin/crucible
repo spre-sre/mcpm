@@ -8,7 +8,7 @@ changed machinery), 4 internal error. Every subprocess is an argv list (never
 a shell string) with a timeout. See reference/architecture.md sections 4 to 9.
 
 Commands: check-ast, verify, telemetry, promote, install-hooks, status, spec,
-mcp, ci, preflight, and the hook entry points hook-pre-commit, hook-commit-msg,
+mcp, ci, preflight, mutation, and the hook entry points hook-pre-commit, hook-commit-msg,
 hook-post-commit, hook-pre-push (run from the pinned checker snapshot).
 """
 
@@ -29,6 +29,7 @@ import hmac  # noqa: E402
 import importlib.util  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
+import random  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import shutil  # noqa: E402
@@ -38,7 +39,7 @@ import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import time  # noqa: E402
 import tomllib  # noqa: E402
-from pathlib import Path  # noqa: E402
+from pathlib import Path, PurePosixPath  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 # Appended, never inserted first: a stdlib-named file in scripts/ must not shadow the standard library.
@@ -49,7 +50,7 @@ import verify_pins as vp  # noqa: E402
 from verify_pins import ConfigError, KitError, PathViolation, TrustError, say  # noqa: E402
 
 EXIT_OK, EXIT_GATE, EXIT_USAGE, EXIT_TRUST, EXIT_INTERNAL = 0, 1, 2, 3, 4
-SPEC_REL = "contracts/SPEC.md"
+SPEC_REL = vp.SPEC_REL
 OUTPUT_TAIL_CHARS = 4000
 AST_TIMEOUT_SECONDS = 600
 MAX_INVARIANTS = 32
@@ -59,10 +60,9 @@ COMMIT_TIMEOUT_SECONDS = 600
 RESULTS_MAX_BYTES = 1_000_000
 SMOKE_MIN_SAMPLES = 100
 
-INVARIANT_RE = re.compile(
-    r"^- (INV_[A-Z0-9_]+): (\S.*?) -> REJECT\((ERR_[A-Z0-9_]+)\)\s*$")
+INVARIANT_RE = vp.INVARIANT_RE
 ERROR_ROW_RE = re.compile(r"^\|\s*(ERR_[A-Z0-9_]+)\s*\|\s*([-+]?\d+)\s*\|\s*(.*?)\s*\|\s*$")
-GAPS_HEADING_RE = re.compile(r"^##\s+Gaps\s*$", re.IGNORECASE)
+GAPS_HEADING_RE = vp.GAPS_HEADING_RE
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,34 @@ def tail(text: str) -> str:
 # Running commands
 # ---------------------------------------------------------------------------
 
+DRAIN_SECONDS = 5
+OUTPUT_CUT_NOTE = b"\n[output cut: a process outside the group kept the pipe open]\n"
+
+
+def _kill_group(proc) -> bytes:
+    """Kill the command's process group and read what it wrote, waiting at most DRAIN_SECONDS. A
+    process that left the group (setsid) may keep the pipe open for good: then the pipes are closed,
+    the partial output is kept and a note says it was cut."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+    try:
+        return proc.communicate(timeout=DRAIN_SECONDS)[0] or b""
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.output or b""
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        proc.wait()
+        return partial + OUTPUT_CUT_NOTE
+
+
 def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None = None,
              split: bool = False, ws: Path | None = None):
     """Run an argv list (never a shell) with a timeout, in its own process
-    group so a timeout kills the whole tree. Returns (returncode, output,
+    group so a timeout kills the whole tree. The command's stdin is /dev/null: a gate
+    command cannot read stdin (architecture 18.3). Returns (returncode, output,
     timed_out, seconds). returncode is 127 when the program cannot start. With
     split, stderr is relayed to our stderr and `output` is stdout alone. `ws`
     is the repository: the command's own git calls then get the hardened
@@ -104,7 +128,7 @@ def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None 
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE if split else subprocess.STDOUT,
-                                start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True)
     except (OSError, ValueError) as exc:
         return 127, f"cannot start {argv[0]!r}: {exc}", False, 0.0
     try:
@@ -113,18 +137,10 @@ def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None 
         if split and err:
             sys.stderr.write(err.decode(errors="replace"))
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
-        out, _ = proc.communicate()
+        out = _kill_group(proc)
         timed_out = True
     except BaseException:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
-        proc.communicate()
+        _kill_group(proc)
         raise
     return proc.returncode, out.decode(errors="replace"), timed_out, time.monotonic() - started
 
@@ -233,23 +249,7 @@ def check_engine_output(code: int, output: str) -> tuple[dict | None, str | None
     return report, None
 
 
-def gaps_text(text: str) -> str:
-    """The text under the `## Gaps` heading of SPEC.md (up to the next heading
-    of level 1 or 2), whitespace-normalized. Fenced blocks are ignored."""
-    collected: list[str] = []
-    in_fence = in_gaps = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if re.match(r"^#{1,2}\s", line):
-            in_gaps = bool(GAPS_HEADING_RE.match(line))
-            continue
-        if in_gaps:
-            collected.append(line)
-    return " ".join(" ".join(collected).split())
+gaps_text = vp.gaps_text  # moved to verify_pins.py: the repin check reads the same Gaps text
 
 
 def none_reason_in_gaps(ws: Path, reason: str) -> bool:
@@ -860,6 +860,481 @@ def tier2_summary(t2: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Mutation stage (G12 level 1, architecture 19)
+# ---------------------------------------------------------------------------
+
+class MutationError(Exception):
+    """A scratch copy that cannot be made, or a run that cannot be judged."""
+
+
+def copy_paths(ws: Path, cfg: dict) -> list[str]:
+    """The work-tree listing (tracked and untracked, not ignored) without the mutant files and the
+    local state. Every path must be plain ASCII."""
+    omit = set(cfg["mutation"]["mutants"])
+    paths = sorted(set(vp.work_tree_listing(ws)))
+    vp.reject_non_ascii(paths, "the work tree")
+    return [p for p in paths if p not in omit and not vp.is_local_state(p)]
+
+
+def copy_file(source: Path, rel: str, target: Path, info, tree: dict, rules, edit) -> None:
+    """Copy one regular file. A gated file is hashed again and must still match the gated map."""
+    data = vp.read_nofollow(source)
+    if rules.is_gated(rel) and vp.sha256_hex(data) != tree.get(rel):
+        raise MutationError(f"{rel}: a gated file changed while the copy was made")
+    if edit is not None and edit[0] == rel:
+        data = edit[1](data)
+    mode = 0o755 if info.st_mode & 0o111 else 0o644
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | vp.NO_FOLLOW, mode)  # never through a planted link
+    with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), mode)
+        handle.write(data)
+
+
+def copy_link(source: Path, rel: str, target: Path, rules, links: list) -> None:
+    """An ungated symlink is copied as a relative link that stays inside the tree."""
+    if rules.is_gated(rel):
+        raise MutationError(f"{rel}: a gated path is a symlink")
+    text = os.readlink(source)
+    if not vp.link_stays_inside(rel, text):
+        raise MutationError(f"{rel}: symlink leaves the tree")
+    os.symlink(text, target)
+    links.append(target)
+
+
+def check_links_inside(dest: Path, links: list) -> None:
+    """Every copied link, followed through other links, still resolves inside the copy."""
+    root = dest.resolve()
+    for link in links:
+        try:
+            resolved = link.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise MutationError(f"{link.relative_to(dest)}: symlink loop or unreadable link: {exc}") from exc
+        if resolved != root and root not in resolved.parents:
+            raise MutationError(f"{link.relative_to(dest)}: symlink leaves the tree")
+
+
+def no_link_in_parents(ws: Path, rel: str) -> None:
+    """Refuse a path with a symlink in a parent component: the open and the mkdir would follow it."""
+    for parent in reversed(PurePosixPath(rel.rstrip("/")).parents):
+        if str(parent) == ".":
+            continue
+        try:
+            info = (ws / parent).lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode):
+            raise MutationError(f"{rel}: a symlink on the path")
+
+
+def copy_entry(ws: Path, rel: str, dest: Path, tree: dict, rules, edit, links: list, skipped: list) -> None:
+    """Copy one listed entry. A symlink is only queued: it is made after every file and directory."""
+    source, target = ws / rel, dest / rel
+    no_link_in_parents(ws, rel)
+    try:
+        info = source.lstat()
+    except FileNotFoundError:
+        if rel in tree:
+            raise MutationError(f"{rel}: a gated file changed during the run") from None
+        return  # tracked but deleted in the work tree
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if stat.S_ISLNK(info.st_mode):
+        links.append((source, rel, target))
+    elif stat.S_ISREG(info.st_mode):
+        copy_file(source, rel, target, info, tree, rules, edit)
+    elif stat.S_ISDIR(info.st_mode) and not rules.is_gated(rel.rstrip("/")):
+        target.mkdir(parents=True, exist_ok=True)
+        skipped.append(rel.rstrip("/"))
+    else:
+        raise MutationError(f"{rel}: not a regular file or a symlink")
+
+
+def copy_tree(ws: Path, rules, tree: dict, paths: list[str], dest: Path, edit=None) -> list[str]:
+    """A fresh copy of the work tree in `dest` (outside the repository): no link into the work tree,
+    the exec bit kept, mtimes now. `edit` is (path, function) and rewrites one file's bytes. An ungated
+    directory entry (a submodule, or a nested repository) becomes an empty directory; the entries are
+    returned, so the report can list them."""
+    pending: list[tuple] = []
+    skipped: list[str] = []
+    for rel in paths:
+        copy_entry(ws, rel, dest, tree, rules, edit, pending, skipped)
+    links: list[Path] = []
+    for source, rel, target in pending:
+        copy_link(source, rel, target, rules, links)
+    check_links_inside(dest, links)
+    return skipped
+
+
+def mutation_command(ws: Path, cfg: dict, rules, copy: Path) -> list[str]:
+    """`[mutation] command`, or the Tier 1 command. Ungated work-tree files become absolute paths."""
+    return command_for(ws, cfg["mutation"]["command"] or cfg["tier1"]["command"], copy, rules)
+
+
+def open_directory(path: str) -> None:
+    """Give the owner full access to `path` when it is a real directory. A link, a file or a missing entry is left alone."""
+    try:
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def open_tree(root: Path) -> None:
+    """Make the root and every real directory below it open to the owner, top-down, before the walk enters it.
+    Links are not followed and not changed. The parent of the root is never touched."""
+    open_directory(str(root))
+    for dirpath, dirnames, _files in os.walk(root, topdown=True, followlinks=False):
+        for name in dirnames:
+            open_directory(os.path.join(dirpath, name))
+
+
+def remove_tree(path: Path) -> None:
+    """Remove a scratch directory, also when a run left a read-only entry in it. This never raises. If the
+    directory is still there afterwards, say so once, with its path."""
+    try:
+        open_tree(path)
+        shutil.rmtree(path)
+    except Exception:  # noqa: BLE001 - a cleanup must not hide the result of the run
+        pass
+    if os.path.lexists(path):
+        say(f"warning: cannot remove the temporary directory {path}; remove it by hand")
+
+
+def run_once(ws: Path, cfg: dict, rules, tree: dict, paths: list[str], scratch: Path, names: list[str],
+             edit, deadline: float) -> dict:
+    """One run in a fresh copy. Every run has the same path pattern and environment, PWD is the copy;
+    only the nonce and the results path differ. The copy and the results file are removed after it.
+    `deadline` is a time.monotonic() value; the time left is measured after the copy is made."""
+    copy = scratch / secrets.token_hex(8)
+    results = scratch / f"results-{secrets.token_hex(8)}.json"
+    nonce = secrets.token_hex(16)
+    run = {"exit_code": None, "timed_out": False, "seconds": 0.0, "report": None, "problems": [],
+           "error": None, "output_tail": "", "skipped": []}
+    try:
+        try:
+            run["skipped"] = copy_tree(ws, rules, tree, paths, copy, edit)
+        except (MutationError, vp.KitError, vp.MutantError, OSError) as exc:
+            return {**run, "error": f"cannot create the copy: {exc}"}
+        run_in_copy(ws, cfg, rules, copy, results, nonce, names, deadline, run)
+    finally:
+        remove_tree(copy)
+        results.unlink(missing_ok=True)
+    return run
+
+
+def run_in_copy(ws: Path, cfg: dict, rules, copy: Path, results: Path, nonce: str, names: list[str],
+                deadline: float, run: dict) -> None:
+    """The command in the copy; its outcome goes into `run`. A run with no time left is a timeout."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        run["timed_out"] = True
+        return
+    timeout = cfg["mutation"]["timeout_seconds"] or cfg["tier1"]["timeout_seconds"]
+    env = {**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results), "CRUCIBLE_RESULTS_NONCE": nonce,
+           "PWD": str(copy)}
+    code, output, timed_out, seconds = run_argv(mutation_command(ws, cfg, rules, copy), copy,
+                                                min(timeout, remaining), env_extra=env, ws=ws)
+    run.update(exit_code=code, timed_out=timed_out, seconds=round(seconds, 3), output_tail=tail(output)[-500:])
+    if not timed_out:
+        run["report"], run["problems"] = check_tier1_results(results, nonce, names)
+
+
+def counts_valid(report: dict | None, names: list[str]) -> bool:
+    """The results file lists exactly the spec invariants, each with integer counts."""
+    if report is None or set(report) != set(names):
+        return False
+    return all(type(entry["cases"]) is int and type(entry["failures"]) is int for entry in report.values())
+
+
+def negative_count(report: dict) -> str:
+    """The first negative count in the results, named; an empty string if there is none."""
+    for name, entry in report.items():
+        for key in ("cases", "failures"):
+            if entry[key] < 0:
+                return f"{name} has a negative {key} count ({entry[key]})"
+    return ""
+
+
+def classify_mutant(run: dict, invariant: str, names: list[str]) -> tuple[str, str]:
+    """(outcome, reason) of a mutant run (spec A3.5). Killed: valid results, and the named invariant
+    has cases > 0 and failures > 0, with any exit code. Survived: exit 0, valid results, cases > 0,
+    failures == 0. Everything else is not judged."""
+    code = run["exit_code"]
+    if run["error"]:
+        return "not judged", run["error"]
+    if run["timed_out"]:
+        return "not judged", "timed out"
+    report = run["report"]
+    if report is None:
+        return "not judged", f"exited {code}: {run['problems'][0] if run['problems'] else 'no results'}"
+    if not counts_valid(report, names):
+        return "not judged", f"exited {code}: the results file must list every invariant with integer counts"
+    negative = negative_count(report)
+    if negative:
+        return "not judged", f"exited {code}: {negative}"
+    entry = report[invariant]
+    if entry["cases"] <= 0:
+        return "not judged", f"exited {code}: {invariant} ran no case"
+    if entry["failures"] > 0:
+        return "killed", ""
+    if code == 0:
+        return "survived", ""
+    return "not judged", f"exited {code}, named invariant shows no failure"
+
+
+def collateral_kills(run: dict, invariant: str) -> list[str]:
+    """The other invariants that also failed in a killed mutant run."""
+    report = run["report"] or {}
+    return sorted(name for name, entry in report.items()
+                  if name != invariant and isinstance(entry.get("failures"), int) and entry["failures"] > 0)
+
+
+def judge_clean(run: dict) -> tuple[str, str]:
+    """(pass or fail, reason) of a calibration or control run, by the Tier 1 rule: exit 0 and valid
+    results with every invariant at cases > 0 and failures == 0."""
+    if run["error"]:
+        return "fail", run["error"]
+    if run["timed_out"]:
+        return "fail", "timed out"
+    if run["exit_code"] != 0:
+        return "fail", f"exited {run['exit_code']}"
+    if run["problems"]:
+        return "fail", "; ".join(run["problems"][:3])
+    return "pass", ""
+
+
+def plan_items(settings: dict, mutants: list[dict], seed: int) -> list[dict]:
+    """The runs of the stage (spec A3.4): calibration first, then the mutants, one control per mutated
+    file (when controls are on) and a second calibration, in an order shuffled by `seed`. The base
+    order is fixed, so the same seed gives the same order."""
+    def item(kind: str, label: str, **fields) -> dict:
+        return {"kind": kind, "label": label, "path": None, "invariant": None, "target": None,
+                "hunks": None, **fields}
+    items = [item("mutant", f"mutant:{m['path']}", path=m["path"], invariant=m["invariant"],
+                  target=m["target"], hunks=m["hunks"]) for m in mutants]
+    if settings["controls"]:
+        items += [item("control", f"control:{target}", target=target)
+                  for target in sorted({m["target"] for m in mutants})]
+    items.append(item("calibration", "calibration-2"))
+    random.Random(seed).shuffle(items)
+    return [item("calibration", "calibration-1")] + items
+
+
+def item_edit(item: dict):
+    """The file rewrite of a run: a mutant applies its hunks, a control adds one newline."""
+    if item["kind"] == "mutant":
+        hunks = item["hunks"]
+        return item["target"], lambda data: vp.apply_mutant(data, hunks)
+    if item["kind"] == "control":
+        return item["target"], lambda data: data + b"\n"
+    return None
+
+
+def execute_plan(ws: Path, cfg: dict, rules, tree: dict, items: list[dict], names: list[str],
+                 scratch: Path) -> tuple[list[dict], bool]:
+    """Run the items in order. Returns (runs, budget_exhausted). The budget caps every run."""
+    deadline = time.monotonic() + cfg["mutation"]["budget_seconds"]
+    paths = copy_paths(ws, cfg)
+    runs = []
+    for item in items:
+        if deadline - time.monotonic() <= 0:
+            return runs, True
+        run = run_once(ws, cfg, rules, tree, paths, scratch, names, item_edit(item), deadline)
+        runs.append({**item, **run})
+        if run["timed_out"] and deadline - time.monotonic() <= 0:
+            return runs, True
+    return runs, False
+
+
+def judge_runs(runs: list[dict], names: list[str]) -> None:
+    """Put `outcome`, `reason` and `collateral` into each run."""
+    for run in runs:
+        run["collateral"] = []
+        if run["kind"] != "mutant":
+            run["outcome"], run["reason"] = judge_clean(run)
+            continue
+        run["outcome"], run["reason"] = classify_mutant(run, run["invariant"], names)
+        if run["outcome"] == "killed":
+            run["collateral"] = collateral_kills(run, run["invariant"])
+
+
+def public_run(run: dict) -> dict:
+    """The JSON form of a run: no hunks, and the output tail only for a run that did not pass."""
+    out = {key: run[key] for key in ("label", "kind", "path", "invariant", "target", "outcome", "reason",
+                                     "collateral", "exit_code", "timed_out", "seconds")}
+    out["cases"] = {name: entry.get("cases") for name, entry in (run["report"] or {}).items()
+                    if isinstance(entry, dict)}
+    if run["outcome"] not in ("pass", "killed"):
+        out["output_tail"] = run["output_tail"]
+    return out
+
+
+def mutant_reason(run: dict) -> str | None:
+    if run["outcome"] == "survived":
+        return (f"mutant {run['path']} survived: {run['invariant']} still passes "
+                "(the tests do not detect this change)")
+    if run["outcome"] == "not judged":
+        return f"mutant {run['path']} not judged: {run['reason']}"
+    return None
+
+
+def run_reason(run: dict, calibration_failed: bool = False) -> str | None:
+    """Why one run fails the stage, or None. A copy error is not a failed test, so a control or a
+    calibration whose copy could not be made says "not run", never "exact bytes". When a calibration
+    failed, the tests or the build fail without any mutant, so a failed control says that instead."""
+    if run["kind"] == "mutant":
+        return mutant_reason(run)
+    if run["error"]:
+        return f"{run['label']} not run: {run['reason']}"
+    if run["outcome"] != "fail":
+        return None
+    if run["kind"] == "control" and calibration_failed:
+        return (f"control for {run['target']} failed ({run['reason']}): the tests or the build fail "
+                "without any mutant; see the calibration")
+    if run["kind"] == "control":
+        return (f"control for {run['target']} failed ({run['reason']}): a test reads this file's "
+                "exact bytes; see [mutation] controls")
+    return f"{run['label']} failed: {run['reason']}"
+
+
+def stage_reasons(runs: list[dict]) -> list[str]:
+    """Why the stage fails: a survivor, a mutant not judged, a failed control or calibration."""
+    calibration_failed = any(run["kind"] == "calibration" and (run["error"] or run["outcome"] == "fail")
+                             for run in runs)
+    return [reason for reason in (run_reason(run, calibration_failed) for run in runs) if reason]
+
+
+def run_mutation_stage(ws: Path, cfg: dict, rules, tree: dict, check: dict, seed: int) -> dict:
+    """The runs and their judgment (spec A3.2 to A3.7). Runs in a scratch directory outside the
+    repository, removed after the stage."""
+    names = list(check["coverage"])
+    items = plan_items(cfg["mutation"], check["mutants"], seed)
+    report = {"seed": seed, "order": [item["label"] for item in items], "runs": [], "passed": False,
+              "timeout": False, "reasons": [], "skipped_entries": []}
+    scratch = Path(tempfile.mkdtemp(prefix="crucible-mutation-")).resolve()
+    try:
+        if scratch == ws.resolve() or ws.resolve() in scratch.parents:
+            report["reasons"].append("the temporary directory is inside the repository; point TMPDIR outside it")
+            return report
+        runs, report["timeout"] = execute_plan(ws, cfg, rules, tree, items, names, scratch)
+        judge_runs(runs, names)
+        report["skipped_entries"] = sorted({entry for run in runs for entry in run["skipped"]})
+        report["runs"] = [public_run(run) for run in runs]
+        report["reasons"] = stage_reasons(runs)
+        report["passed"] = not report["timeout"] and not report["reasons"]
+    finally:
+        remove_tree(scratch)
+    return report
+
+
+def stage_preconditions(ws: Path, cfg: dict, rules) -> list[str]:
+    """Reasons the runs cannot start: no command, or a command that runs unpinned repository files."""
+    if not (cfg["mutation"]["command"] or cfg["tier1"]["command"]):
+        return ["neither [mutation] command nor [tier1] command is set (fail closed)"]
+    unpinned = vp.command_closure(ws, cfg, rules)["unpinned"]
+    if not unpinned:
+        return []
+    return ["command closure: these files are run or read by the gate commands but are not pinned: "
+            + ", ".join(unpinned)]
+
+
+def stage_after_checks(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
+    """After the runs (spec A3.8): the gated map is unchanged, and no git-ignored file appeared."""
+    try:
+        after = vp.working_tree(ws, rules)
+    except PathViolation as exc:
+        fail(result, "mutation", EXIT_GATE, str(exc))
+        return False
+    if after != tree:
+        fail(result, "mutation", EXIT_GATE,
+             f"the gated tree changed while the mutation stage ran: {vp.diff_maps(tree, after)}")
+        return False
+    return ignored_files_pass(ws, cfg, rules, result, "after the mutation stage")
+
+
+def own_cli(ws: Path) -> bool:
+    """True when this CLI is the work tree's own bin/crucible. The gated-map digest in the record
+    covers bin/crucible and scripts/*, so only that CLI can say which machinery ran."""
+    return Path(__file__).resolve() == (ws / "bin" / "crucible").resolve()
+
+
+def build_record(ws: Path, cfg: dict, rules, tree: dict, mutation: dict, failed_before: int) -> dict:
+    """The pass record (spec A4). The digests are of the tree at the start, which the after-checks
+    proved equal to the tree at the end."""
+    pins = {path: digest for path, digest in tree.items() if rules.pin_entry(path)}
+    settings = cfg["mutation"]
+    return {"version": 1, "kit_version": vp.KIT_VERSION, "repo_root": str(ws.resolve()),
+            "gated_digest": vp.files_digest(tree), "pin_digest": vp.files_digest(pins),
+            "config_sha256": vp.sha256_hex(vp.read_nofollow(ws / vp.CONFIG_REL)),
+            "seed": mutation["seed"], "order": mutation["order"],
+            "mutants": [{"path": run["path"], "invariant": run["invariant"], "outcome": run["outcome"]}
+                        for run in mutation["runs"] if run["kind"] == "mutant"],
+            "waived": settings["waived"], "controls": settings["controls"],
+            "no_controls_reason": settings["no_controls_reason"], "failed_runs": failed_before,
+            "created_at": vp.utc_iso(time.time())}
+
+
+def record_pass(ws: Path, cfg: dict, rules, tree: dict, result: dict, seeded: bool = False) -> None:
+    """After a full pass: take back this run's own attempt (counted at the start), then write pass.json
+    and reset the counter. A seeded stage (the agent chose the order, so a test could fail only at the
+    mutant positions) and a foreign CLI write no record and leave the counter as it was."""
+    before = max(vp.failed_runs(ws) - 1, 0)
+    if seeded or not own_cli(ws):
+        vp.set_failed_runs(ws, before)
+        result["mutation"]["record"] = "not written (seed given)" if seeded else "not written"
+        say("no pass record written: " + ("a seed was given; run `mutation` without --seed" if seeded else
+            "this CLI is not the work tree's own bin/crucible"))
+        return
+    record = build_record(ws, cfg, rules, tree, result["mutation"], before)
+    path = vp.mutation_dir(ws, create=True) / vp.PASS_FILE
+    try:
+        vp.write_private(path, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode())
+    except OSError as exc:
+        raise TrustError(f"{path} cannot be written ({exc.strerror}): remove it (a human)") from exc
+    vp.set_failed_runs(ws, 0)
+    result["mutation"]["record"] = "written"
+
+
+def mutation_stage(ws: Path, cfg: dict, rules, tree: dict, result: dict, seed: int | None = None) -> bool:
+    """The whole stage. True when it passed; otherwise `result` holds the failure. Every run first
+    deletes the old pass record. Each run that gets as far as its commands counts as a failed run in
+    attempts.json from its start; a pass takes its own count back. A full pass without --seed writes
+    a new record."""
+    vp.delete_pass(ws)
+    check = vp.mutation_static_check(ws, cfg, rules)
+    result["mutation"] = vp.mutation_summary(check)
+    problems = check["problems"] or stage_preconditions(ws, cfg, rules)
+    if problems:
+        result["reasons"] += problems
+        fail(result, "mutation", EXIT_GATE, "the mutation stage cannot start")
+        return False
+    vp.bump_failed_runs(ws)  # the attempt counts from its start, so a stage that is killed still counts
+    report = run_mutation_stage(ws, cfg, rules, tree, check,
+                                secrets.randbits(31) if seed is None else seed)
+    result["mutation"].update({key: report[key] for key in ("seed", "order", "runs", "passed", "skipped_entries")})
+    if not stage_after_checks(ws, cfg, rules, tree, result):
+        result["reasons"] += report["reasons"]
+        vp.delete_pass(ws)  # test code may have written a plausible record during the run
+        return False
+    if not stage_outcome(result, report):
+        vp.delete_pass(ws)
+        return False
+    record_pass(ws, cfg, rules, tree, result, seeded=seed is not None)
+    return True
+
+
+def stage_outcome(result: dict, report: dict) -> bool:
+    """The verdict of the runs themselves, once the after-checks passed: timeout, a failure, or a pass."""
+    if report["timeout"]:
+        fail(result, "timeout", EXIT_GATE, "the mutation stage ran out of time (budget_seconds)")
+        return False
+    if not report["passed"]:
+        result["reasons"] += report["reasons"]
+        fail(result, "mutation", EXIT_GATE, "the mutation stage failed")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -1190,7 +1665,7 @@ def cmd_promote(ws: Path, args) -> dict:
 def cmd_install_hooks(ws: Path, args) -> dict:
     result = new_result("install-hooks")
     try:
-        summary = vp.install_hooks(ws, repin=args.repin)
+        summary = vp.install_hooks(ws, repin=args.repin, verbose=args.verbose)
     except ConfigError as exc:
         return fail(result, None, EXIT_USAGE, str(exc))
     except KitError as exc:
@@ -1198,6 +1673,28 @@ def cmd_install_hooks(ws: Path, args) -> dict:
     result["verdict"] = "PINNED" if summary["pinned"] else "UNCHANGED"
     result["step0"] = None
     result["install"] = summary
+    return result
+
+
+def cmd_mutation(ws: Path, args) -> dict:
+    """Run the full mutation stage (G12 level 1). It needs no trust anchor, issues no token and does
+    not re-exec into the snapshot: like preflight, it must work before the first pin. It does not check
+    the environment digests either: after a changed interpreter or toolchain it must still be able to
+    write the record that the human repin needs."""
+    result = new_result("mutation")
+    vp.require_sound_repository(ws)
+    vp.delete_pass(ws)  # an early return below must not leave an old record
+    cfg = vp.load_config(ws / vp.CONFIG_REL)
+    rules = vp.GateRules(cfg)
+    if not ignored_files_pass(ws, cfg, rules, result, "before the mutation stage"):
+        return result
+    try:
+        tree = vp.working_tree(ws, rules)
+    except PathViolation as exc:
+        return fail(result, "step0", EXIT_GATE, str(exc))
+    if mutation_stage(ws, cfg, rules, tree, result, args.seed):
+        result["verdict"] = "PASS"
+        say("MUTATION PASSED: every mutant was killed; the calibrations and controls passed")
     return result
 
 
@@ -1260,6 +1757,24 @@ def status_ignored(ws: Path, anchor) -> dict:
             "truncated": max(len(split["violations"]), len(split["allowed"])) > limit}
 
 
+def status_mutation(ws: Path) -> dict:
+    """The static check of the mutants as `status` shows it (spec A5), from the work-tree config (the
+    config the next repin will pin). It lists; it never fails status (`error` says why a list is missing)."""
+    try:
+        cfg = vp.load_config(ws / vp.CONFIG_REL)
+        rules = vp.GateRules(cfg)
+        check = vp.mutation_static_check(ws, cfg, rules)
+        tree = vp.working_tree(ws, rules)
+        pins = {path: digest for path, digest in tree.items() if rules.pin_entry(path)}
+        summary = vp.mutation_summary(check)
+        problems = vp.record_problems(vp.read_pass(ws), ws, tree, vp.files_digest(pins),
+                                      vp.sha256_hex(vp.read_nofollow(ws / vp.CONFIG_REL)), summary)
+    except Exception as exc:  # noqa: BLE001 - status never fails, whatever a hostile mutant file does
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {**summary, "stale": [m["path"] for m in check["mutants"] if m["problem"]],
+            "record_matches": not problems, "record_problems": problems, "error": None}
+
+
 def cmd_status(ws: Path, args) -> dict:
     result = new_result("status")
     git_report = vp.git_binding_report(ws)  # binds the recorded git; status never fails on it
@@ -1290,7 +1805,7 @@ def cmd_status(ws: Path, args) -> dict:
     result.update(
         closure_exempt=closure["exempt"], closure_unpinned=closure["unpinned"],
         closure_files=closure["closure_files"], environment_differences=environment_changes,
-        ignored_files=status_ignored(ws, anchor),
+        ignored_files=status_ignored(ws, anchor), mutation=status_mutation(ws),
         verdict=pin_status, head=head, branch=branch, clean=status_clean(ws), git=git_report,
         git_state=vp.repository_state(ws),
         pin_status=pin_status, pin_differences=differences, anchor_error=anchor_error,
@@ -1359,6 +1874,48 @@ def preflight_environment(ws: Path, result: dict) -> bool:
     return True
 
 
+def repin_coming(ws: Path, tree: dict) -> bool:
+    """True when a human repin is coming: there is no trust anchor, or the pinned set of the work
+    tree differs from the pins. An unreadable anchor counts as coming. Like preflight_environment,
+    this binds no recorded git."""
+    try:
+        state = vp.state_dir(ws, create=False)
+        trust = vp.load_trust(state) if state.is_dir() else None
+        if trust is None:
+            return True
+        pinned = vp.snapshot_config(state)
+        return any(vp.pin_differences(trust, tree, vp.GateRules(pinned)).values())
+    except KitError:
+        return True
+
+
+def pinned_root_elsewhere(ws: Path) -> str | None:
+    """The pinned repository root when `ws` is another work tree (a linked worktree) of a repository
+    that has a trust anchor; None when `ws` is the pinned root, or there is no readable anchor."""
+    try:
+        state = vp.state_dir(ws, create=False)
+        trust = vp.load_trust(state) if state.is_dir() else None
+    except KitError:
+        return None
+    root = trust.get("repo_root") if trust else None
+    return root if isinstance(root, str) and root != str(ws.resolve()) else None
+
+
+def mutation_in_preflight(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
+    """The full stage when a repin is coming; otherwise skipped, and the pass record is not touched.
+    Workers that check a candidate in a linked worktree change source files only, so their pins match.
+    A worker that changes a trusted file also skips: the record and the attempt counter are shared with
+    the pinned work tree, and a record written here would name this path, not the root the pin needs."""
+    if not repin_coming(ws, tree):
+        result["mutation"] = {"skipped": "pins match"}
+        return True
+    root = pinned_root_elsewhere(ws)
+    if root is not None:
+        result["mutation"] = {"skipped": f"not the pinned work tree; run mutation in {root}"}
+        return True
+    return mutation_stage(ws, cfg, rules, tree, result)
+
+
 def cmd_preflight(ws: Path, args) -> dict:
     """Everything `verify` checks that does not need the anchor, plus one Tier 2
     driver smoke run (candidate only). Needs no anchor and issues no token: it
@@ -1376,6 +1933,8 @@ def cmd_preflight(ws: Path, args) -> dict:
     except PathViolation as exc:
         return fail(result, "step0", EXIT_GATE, str(exc))
     if not checked_stages(ws, cfg, rules, tree, result):
+        return result
+    if not mutation_in_preflight(ws, cfg, rules, tree, result):
         return result
     smoke = run_tier2_smoke(ws, cfg, rules)
     result["tier2"] = smoke
@@ -1592,7 +2151,8 @@ def run_hook(name: str, args) -> int:
 
 COMMANDS = {"check-ast": cmd_check_ast, "verify": cmd_verify, "telemetry": cmd_telemetry,
             "promote": cmd_promote, "install-hooks": cmd_install_hooks, "status": cmd_status,
-            "spec": cmd_spec, "mcp": cmd_mcp, "ci": cmd_ci, "preflight": cmd_preflight}
+            "spec": cmd_spec, "mcp": cmd_mcp, "ci": cmd_ci, "preflight": cmd_preflight,
+            "mutation": cmd_mutation}
 HOOK_COMMANDS = ("hook-pre-commit", "hook-commit-msg", "hook-post-commit", "hook-pre-push")
 
 
@@ -1614,9 +2174,12 @@ def build_parser() -> argparse.ArgumentParser:
     promote = add("promote", "verify + telemetry, promotion token, commit through the hooks")
     promote.add_argument("-m", "--message", required=True)
     promote.add_argument("--seed", type=int, default=None)
-    add("install-hooks", "human only: pin the trust anchor and install hooks") \
-        .add_argument("--repin", action="store_true")
+    hooks = add("install-hooks", "human only: pin the trust anchor and install hooks")
+    hooks.add_argument("--repin", action="store_true")
+    hooks.add_argument("--verbose", action="store_true", help="list every pinned path with its old and new hash")
     add("preflight", "pre-ratification check: Step 0, Tier 1, Tier 2 driver smoke run; no anchor, no token")
+    add("mutation", "mutation stage: apply each mutant to a scratch copy and run the tests; no anchor, no token") \
+        .add_argument("--seed", type=int, default=None)
     add("status", "HEAD, pins, hooks, token state")
     add("spec", "parsed contracts/SPEC.md as JSON")
     add("mcp", "serve the crucible over MCP (execs scripts/mcp_server.py)")
