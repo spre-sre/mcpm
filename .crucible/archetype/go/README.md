@@ -18,9 +18,11 @@ tests. Copy, adapt, and remove the `.example` suffix.
 - For each invariant: the accepted boundary, the first rejected value on each
   side, and seeded random inputs (`rand.New(rand.NewSource(seed))`) that check
   the exact error. Map Go errors to the spec error code in one helper.
-- Command: `go test -count=1 -run TestCrucible ./...`. `-count=1` disables
-  the test cache. Check that the output lists your tests (`-v` locally): a run
-  that selects zero tests passes silently.
+- Command: `go test -count=1 -run TestCrucible ./harness`. `-count=1` disables
+  the test cache. The command names the one package that holds the contract tests, not
+  `./...`: `./...` would also run the `TestMain` of an ungated package (see "Implicit loaders"). Check that the output lists your tests (`-v` locally): a run
+  that selects zero tests passes silently. The fragment narrows only the command it names. A Tier 1 shell
+  script that runs `go test ./...` itself is not narrowed: the script must name its packages.
 
 
 ### Tier 1 result protocol (architecture.md 11.1)
@@ -306,11 +308,64 @@ GOFLAGS=-trimpath=false go run ./cmd/gate-ast/main.go -json -verify-migration ./
 
 Use `config.fragment.toml`. Set `source_paths` to the project's packages.
 `trusted_paths` must hold `contracts/`, `harness/`, `cmd/gate-ast/`, `go.mod`, `go.sum`,
-`go.work`, the config and the baseline (the module files select dependencies
-and `replace` directives, so they load code implicitly). `[environment]
+`go.work`, `go.work.sum`, `vendor/`, `.gitignore`, the config and the baseline (the module files select
+dependencies and `replace` directives, so they load code implicitly). `[environment]
 digest_globs` is empty: Go keeps no git-ignored toolchain lockfile. Argv elements that name repo files (none in the
 default commands except through `./harness/...` and the test file) must be
 pinned.
+
+### Implicit loaders
+
+Go loads these files and code without a command naming them. The fragment covers each one.
+
+- `go.mod`, `go.sum`, `go.work`, `go.work.sum`: pinned. `GOWORK=off` in every `env` table keeps a local
+  workspace out; `go.work` and `go.work.sum` stay pinned for the day a project adopts one on purpose.
+  If the repository git-ignores them, enable the commented `digest_globs = ["go.work", "go.work.sum"]`
+  in `config.fragment.toml` so a change refuses `verify`.
+- `vendor/`: pinned as a directory, because a vendored file is code. But `GOFLAGS=-mod=readonly` (below)
+  turns vendor mode OFF: gate commands build from the module cache, and `go mod verify` checks that cache.
+  A vendored project sets `GOFLAGS = "-mod=vendor"` in the `env` tables instead; `go mod verify` then does not
+  cover `vendor/`, and only the pin does.
+- `GOFLAGS`, `GOPROXY`, `GOTOOLCHAIN`, `GOWORK`, `GOENV`: fixed in the `[ast]`, `[tier1]` and `[tier2]` `env`
+  tables (`-mod=readonly`, `off`, `local`, `off`, `off`), and in `[ci]` without `GOPROXY`, because
+  `go mod download` needs the network. A caller's values never reach a gate command (`[environment] pass`, G3).
+  `GOENV=off` makes Go ignore its env file (`go env -w`: `CC`, `CGO_*`, `GOEXPERIMENT`, `GOFLAGS`,
+  `GOMODCACHE`, `GOPATH` and the rest), so that file cannot change a gate build. A setting the build needs from
+  that file (for example a moved `GOMODCACHE` or `GOPATH`) moves into `[environment] pass` (the caller's
+  value) or into the section's `env` table (a fixed value).
+  The migration commands below still set `GOFLAGS=-trimpath=false` by hand, because you run them outside the gate.
+- Other packages: Tier 1 names `./harness`, the one package with the contract tests, so the `TestMain` and
+  `init` of an ungated package never run in Tier 1. A package that the tested code imports is still loaded;
+  it is source (gated by `source_paths`) or a dependency (see "Dependencies").
+- `.gitignore`: pinned, so a new rule cannot hide a file from the ignored-files check.
+
+### Dependencies
+
+`[tier1] before = [["go", "mod", "verify"]]` runs before the Tier 1 command, in the same environment and without
+the `CRUCIBLE_*` variables. It fails Tier 1 (reason `dependency check failed: go exited 1`) when a module in the
+module cache differs from `go.sum`, so an edited cache entry cannot pass. `[ci] setup` (`go mod download`) fills the
+cache on a clean runner; `GOPROXY=off` keeps Tier 1 and Tier 2 offline. `vendor/` is pinned, but with
+`-mod=readonly` the gate builds from the module cache, not from `vendor/`. A vendored project sets
+`-mod=vendor` in the `env` tables, and then `go mod verify` does not cover `vendor/`: only the pin does.
+The mutation stage does not run `before`: the dependencies are the same in every copy.
+
+What stays open: the Go toolchain and standard library on the machine, and a `replace` directive that points
+outside the module (the `go.mod` pin shows the directive, not the target's content).
+
+Gaps line: `go mod verify` checks the module cache against go.sum before Tier 1; gate commands build from that cache (-mod=readonly), and a project that sets -mod=vendor is covered for vendor/ by the pin only, because go mod verify does not cover vendor/; the Go toolchain, the standard library and the target of a replace directive outside the module are not verified.
+
+### Environment (`[environment] pass`)
+
+A gate command (the AST gate, Tier 1, Tier 2, the mutation runs, `[ci] setup`) starts from a short
+allowlist of the caller's variables: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `TERM`, `USER`,
+`LOGNAME`, `SHELL`, `TZ`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and the proxy names (also in lower case).
+`GOFLAGS`, `GOWORK`, `GOPROXY`, `GOTOOLCHAIN`, `CGO_*`, `CC` and the rest do not pass, so a caller cannot
+change what the gate builds. Go needs nothing more: its caches default to directories under `HOME`, so
+`pass` is empty in `config.fragment.toml`. If the project moves a cache, add `GOMODCACHE`, `GOCACHE` or
+`GOPATH` to `pass` (`GOENV=off` means a value from `go env -w` no longer applies). A command that needs
+another variable may fail loudly or silently change behaviour: add the name to `pass`, or set a
+value in the section's `env` table. A human ratifies the list at the repin. `status` shows which `pass`
+names are set, never the values.
 
 ### Git-ignored files (`[gate] ignored_allow`)
 

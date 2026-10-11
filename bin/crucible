@@ -113,16 +113,22 @@ def _kill_group(proc) -> bytes:
         return partial + OUTPUT_CUT_NOTE
 
 
+def env_pass_of(cfg: dict) -> list[str]:
+    """The config's `[environment] pass` entries (G3)."""
+    return cfg["environment"]["pass"]
+
+
 def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None = None,
-             split: bool = False, ws: Path | None = None):
+             split: bool = False, ws: Path | None = None, env_pass=()):
     """Run an argv list (never a shell) with a timeout, in its own process
     group so a timeout kills the whole tree. The command's stdin is /dev/null: a gate
     command cannot read stdin (architecture 18.3). Returns (returncode, output,
     timed_out, seconds). returncode is 127 when the program cannot start. With
     split, stderr is relayed to our stderr and `output` is stdout alone. `ws`
     is the repository: the command's own git calls then get the hardened
-    configuration (architecture 16.1) and lose the location variables."""
-    env = vp.gate_environment(os.environ, ws)  # plus the section's env table and CRUCIBLE_* (12.1)
+    configuration (architecture 16.1) and lose the location variables. The environment
+    is the allowlist plus `env_pass` (config `[environment] pass`), architecture 20.1."""
+    env = vp.gate_environment(os.environ, ws, env_pass)  # plus the section's env table and CRUCIBLE_* (12.1)
     env.update(env_extra or {})
     started = time.monotonic()
     try:
@@ -279,7 +285,7 @@ def run_ast(ws: Path, cfg: dict) -> dict:
                 "warning": f"no AST engine: {reason}"}
     code, output, timed_out, seconds = run_argv(vp.expand_command(command), ws,
                                                 AST_TIMEOUT_SECONDS, env_extra=cfg["ast"]["env"],
-                                                split=True, ws=ws)
+                                                split=True, ws=ws, env_pass=env_pass_of(cfg))
     result = {"command": command, "exit_code": code, "duration_seconds": round(seconds, 3),
               "report": None}
     if timed_out:
@@ -385,10 +391,54 @@ def check_tier1_results(path: Path, nonce: str, names: list[str]) -> tuple[dict 
     return report, problems
 
 
+def run_before(ws: Path, cfg: dict, deadline: float) -> dict | None:
+    """Run the `[tier1] before` dependency checks in order (G8), each in the scrubbed environment plus
+    the `[tier1] env` table and without any CRUCIBLE_* variable. They share the Tier 1 time budget (the
+    deadline). None when all exit 0; otherwise the Tier 1 result fields of the first failure."""
+    for argv in cfg["tier1"].get("before", []):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"exit_code": None, "output_tail": "", "timed_out": True}
+        code, output, timed_out, seconds = run_argv(
+            vp.expand_command(argv), ws, remaining, env_extra=cfg["tier1"]["env"], ws=ws,
+            env_pass=env_pass_of(cfg))
+        if timed_out or code != 0:
+            return {"exit_code": code, "duration_seconds": round(seconds, 3),
+                    "output_tail": tail(output), "timed_out": timed_out,
+                    "error": None if timed_out else f"dependency check failed: {argv[0]} exited {code}"}
+    return None
+
+
+def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: Path) -> dict:
+    """The dependency checks, then the Tier 1 command with its results path in `scratch`; `out` is
+    updated with what happened."""
+    deadline = time.monotonic() + cfg["tier1"]["timeout_seconds"]
+    failure = run_before(ws, cfg, deadline)
+    if failure is not None:
+        return {**out, **failure}
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return {**out, "timed_out": True}
+    results, nonce = scratch / "results.json", secrets.token_hex(16)
+    code, output, timed_out, seconds = run_argv(
+        vp.expand_command(cfg["tier1"]["command"]), ws, remaining,
+        env_extra={**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results),
+                   "CRUCIBLE_RESULTS_NONCE": nonce}, ws=ws, env_pass=env_pass_of(cfg))
+    out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
+               timed_out=timed_out)
+    if timed_out or code != 0:
+        return out
+    report, problems = check_tier1_results(results, nonce, names)
+    out["invariants"] = report
+    if problems:
+        out["error"] = "Tier 1 results rejected: " + "; ".join(problems[:6])
+    return out
+
+
 def run_tier1(ws: Path, cfg: dict) -> dict:
-    """Run `[tier1] command` with the result protocol (section 11.1): a results
-    path in a fresh temp directory outside the repository and a random nonce.
-    Tier 1 passes only if the command exits 0 and the results validate."""
+    """Run the `[tier1] before` dependency checks (G8), then `[tier1] command` with the result
+    protocol (section 11.1): a results path in a fresh temp directory outside the repository and a
+    random nonce. Tier 1 passes only if every check and the command exit 0 and the results validate."""
     command = cfg["tier1"]["command"]
     out = {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": False,
            "invariants": None}
@@ -403,20 +453,7 @@ def run_tier1(ws: Path, cfg: dict) -> dict:
         if scratch == ws.resolve() or ws.resolve() in scratch.parents:
             return {**out, "error": "the temporary directory is inside the repository; point "
                                     "TMPDIR outside it"}
-        results, nonce = scratch / "results.json", secrets.token_hex(16)
-        code, output, timed_out, seconds = run_argv(
-            vp.expand_command(command), ws, cfg["tier1"]["timeout_seconds"],
-            env_extra={**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results),
-                       "CRUCIBLE_RESULTS_NONCE": nonce}, ws=ws)
-        out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
-                   timed_out=timed_out)
-        if timed_out or code != 0:
-            return out
-        report, problems = check_tier1_results(results, nonce, names)
-        out["invariants"] = report
-        if problems:
-            out["error"] = "Tier 1 results rejected: " + "; ".join(problems[:6])
-        return out
+        return tier1_in_scratch(ws, cfg, out, names, scratch)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -600,14 +637,15 @@ def validate_driver_output(path: Path, samples: int) -> tuple[list, list]:
 
 
 def run_driver(ws: Path, tree: Path, command: list[str], rules, samples: int, seed: int,
-               scratch: Path, deadline: float, env: dict | None = None) -> tuple[list, list]:
+               scratch: Path, deadline: float, env: dict | None = None,
+               env_pass=()) -> tuple[list, list]:
     out = scratch / f"out-{secrets.token_hex(4)}.json"
     argv = command_for(ws, command, tree, rules) + [
         "--root", str(tree), "--samples", str(samples), "--seed", str(seed), "--out", str(out)]
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Tier 2 time budget exhausted")
-    code, output, timed_out, _ = run_argv(argv, tree, remaining, env_extra=env, ws=ws)
+    code, output, timed_out, _ = run_argv(argv, tree, remaining, env_extra=env, ws=ws, env_pass=env_pass)
     if timed_out:
         raise TimeoutError("the telemetry driver timed out")
     if code != 0:
@@ -766,10 +804,12 @@ def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
                 if side == "A":
                     lat, mem = run_driver(ws, base_dir, base[0]["tier2"]["command"], base[1],
                                           per_round, round_seed, scratch, deadline,
-                                          env=base[0]["tier2"]["env"])
+                                          env=base[0]["tier2"]["env"],
+                                          env_pass=env_pass_of(cfg))   # `pass` describes the machine: one list for both sides (20.1)
                 else:
                     lat, mem = run_driver(ws, ws, command, rules, per_round, round_seed,
-                                          scratch, deadline, env=tier2["env"])
+                                          scratch, deadline, env=tier2["env"],
+                                          env_pass=env_pass_of(cfg))
                 (base_lat if side == "A" else cand_lat).append(lat)  # one list per round
                 (base_mem if side == "A" else cand_mem).append(mem)  # one series per round
         if not has_baseline:
@@ -836,7 +876,8 @@ def run_tier2_smoke(ws: Path, cfg: dict, rules) -> dict:
     try:
         math_module = load_telemetry_math(ws)
         lat, mem = run_driver(ws, ws, command, rules, count, 1, scratch,
-                              time.monotonic() + tier2["timeout_seconds"], env=tier2["env"])
+                              time.monotonic() + tier2["timeout_seconds"], env=tier2["env"],
+                              env_pass=env_pass_of(cfg))
         median = sorted(lat)[len(lat) // 2]
         out.update(latency_median_ns=median, latency_max_ns=max(lat), memory_points=len(mem))
         if median <= 0:
@@ -1032,7 +1073,8 @@ def run_in_copy(ws: Path, cfg: dict, rules, copy: Path, results: Path, nonce: st
     env = {**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results), "CRUCIBLE_RESULTS_NONCE": nonce,
            "PWD": str(copy)}
     code, output, timed_out, seconds = run_argv(mutation_command(ws, cfg, rules, copy), copy,
-                                                min(timeout, remaining), env_extra=env, ws=ws)
+                                                min(timeout, remaining), env_extra=env, ws=ws,
+                                                env_pass=env_pass_of(cfg))
     run.update(exit_code=code, timed_out=timed_out, seconds=round(seconds, 3), output_tail=tail(output)[-500:])
     if not timed_out:
         run["report"], run["problems"] = check_tier1_results(results, nonce, names)
@@ -1793,9 +1835,10 @@ def cmd_status(ws: Path, args) -> dict:
         except KitError as exc:
             pin_status, anchor_error = "DIFFER", str(exc)
     closure = {"unpinned": [], "exempt": [], "closure_files": []}
-    environment_changes = None
+    environment_changes, pass_names = None, []
     try:
         cfg = anchor[3] if anchor else vp.load_config(ws / vp.CONFIG_REL)
+        pass_names = vp.set_pass_names(os.environ, env_pass_of(cfg))
         closure = vp.command_closure(ws, cfg, vp.GateRules(cfg))
         if anchor:
             environment_changes = vp.diff_maps(anchor[1].get("environment") or {},
@@ -1805,6 +1848,7 @@ def cmd_status(ws: Path, args) -> dict:
     result.update(
         closure_exempt=closure["exempt"], closure_unpinned=closure["unpinned"],
         closure_files=closure["closure_files"], environment_differences=environment_changes,
+        environment={"pass": pass_names},
         ignored_files=status_ignored(ws, anchor), mutation=status_mutation(ws),
         verdict=pin_status, head=head, branch=branch, clean=status_clean(ws), git=git_report,
         git_state=vp.repository_state(ws),
@@ -1996,7 +2040,8 @@ def run_ci_setup(ws: Path, cfg: dict) -> str | None:
         say(f"CI setup {number}/{len(commands)}: {' '.join(argv)}")
         code, output, timed_out, _ = run_argv(vp.expand_command(argv), ws,
                                               cfg["ci"]["timeout_seconds"],
-                                              env_extra=cfg["ci"]["env"], ws=ws)
+                                              env_extra=cfg["ci"]["env"], ws=ws,
+                                              env_pass=env_pass_of(cfg))
         if timed_out:
             return (f"[ci] setup command {number} ({argv[0]}) timed out after "
                     f"{cfg['ci']['timeout_seconds']} seconds")
@@ -2234,6 +2279,16 @@ def strict_dumps(result: dict) -> str:
                       sort_keys=True, allow_nan=False)
 
 
+def emit_text_extras(result: dict) -> None:
+    """The text-mode lines after the reasons: git state problems, and the `[environment] pass` names
+    that are set (names only, never values)."""
+    for problem in (result.get("git_state") or {}).get("problems", []):
+        sys.stdout.write(f"  - git state: {problem}\n")
+    names = (result.get("environment") or {}).get("pass")
+    if names:
+        sys.stdout.write(f"  pass: {', '.join(names)}\n")
+
+
 def emit(result: dict, json_mode: bool) -> None:
     if json_mode:
         sys.stdout.write(strict_dumps(result) + "\n")
@@ -2243,8 +2298,7 @@ def emit(result: dict, json_mode: bool) -> None:
                          + "\n")
         for reason in result.get("reasons", []):
             sys.stdout.write(f"  - {reason}\n")
-        for problem in (result.get("git_state") or {}).get("problems", []):
-            sys.stdout.write(f"  - git state: {problem}\n")
+        emit_text_extras(result)
     sys.stdout.flush()
 
 

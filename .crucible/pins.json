@@ -2,10 +2,10 @@
   "genesis": "60fbae26dbbbd777b990ff6161b4ef04e418c14c",
   "pins": {
     ".crucible/baseline.json": "7f8318779a30351f34e845a6dd04a2ce479cb64b01ed6001465bc1fd1708eb66",
-    ".crucible/config.toml": "6e4c56a0a461f2e87b4b6fdb57541979ffa7a32bd2f9c81d810dcc93a713ed06",
+    ".crucible/config.toml": "5f1a69fd1a67c8f45a1f28bc0dc939e42f46493897a12a707d5340934ca56d9e",
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
-    "bin/crucible": "4ee50b00b80df5e07bec24579f58243d52bec11f628a84b2be8a7ea3c6203f71",
+    "bin/crucible": "b9a23c81cbb2226516047dd16ec0bb3f2b078b5aefa4c6114025cb76b0dc8e02",
     "cmd/gate-ast/main.go": "50354f194c5731a4367e8022f1817f3d852b5927ef89bbe8c58ae6b150a3a19f",
     "contracts/SPEC.md": "aae7da17dc347eb3e854d538f428f8632a43973612ddb0d1954d51c2de882030",
     "contracts/mutants/INV_HOST_PORT_SPLIT-keep-colon.patch": "b6e7bf1bd84474f249bd6bc0c2161eacbd8e4bbb9f9f3aa2c35f18bc46a536c1",
@@ -21,7 +21,7 @@
     "harness/telemetry_math.py": "e9beaef9322f1688e22e75cf9fa56ae4d6a3f4d42384958791fe50eb0b72443e",
     "scripts/mcp_server.py": "36ff99bf677d802960a7114cd0ff41fc83a40075ea693deaf6a868342912bdb8",
     "scripts/mint_attestation.py": "11ccd1bf2a9f9f4eae1a38a3cfc797904dfe64a1f723517fa7084d8701fb9154",
-    "scripts/verify_pins.py": "be75648582e3e9789e0139527f0943956cb84c04475fadea1e8074c4dd2b3499"
+    "scripts/verify_pins.py": "229b7f79411fac49067838dada0f6c2241fcffa4d217f38f927ab1666cfb56c9"
   },
   "version": 1
 }

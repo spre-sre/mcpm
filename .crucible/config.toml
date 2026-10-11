@@ -30,7 +30,8 @@ ignored_allow = [".claude/settings.local.json", ".mcp.json", ".crucible/tasks/**
 # is not an argument: a source file named in argv breaks command closure.
 command = ["go", "run", "./cmd/gate-ast", "-json", "-limit", "10", "./internal", "./cmd"]
 none_reason = ""
-env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off"}
+# GOENV=off: Go does not read its `go env -w` file (CC, CGO_*, GOFLAGS, GOMODCACHE ...) (kit 3.1.0, G7).
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", GOENV = "off"}
 
 # .gitignore ignores go.work, and an ignored workspace file changes which code
 # `go` loads. GOWORK=off in every command disables it; the digests below also
@@ -38,6 +39,9 @@ env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY
 # from downloading a different toolchain.
 [environment]
 digest_globs = ["go.work", "go.work.sum"]
+# Kit 3.1.0 (G3): gate commands get only the base allowlist (PATH, HOME, TMPDIR, LANG, ...).
+# mcpm needs nothing more: the Go caches default to directories under HOME.
+pass = []
 
 [tier1]
 # Only the harness package, only the contract tests: a test file elsewhere
@@ -45,17 +49,19 @@ digest_globs = ["go.work", "go.work.sum"]
 # harness/run_tier1.sh runs the cmd/ and internal/ unit tests without the
 # CRUCIBLE_RESULTS* variables, then the contract tests with them.
 command = ["./harness/run_tier1.sh"]
+# Kit 3.1.0 (G8): fails Tier 1 when a module in the cache differs from go.sum.
+before = [["go", "mod", "verify"]]
 contract_tests = ["harness/crucible_contracts_test.go"]
 timeout_seconds = 900
 # A source change that reaches a Node, Python or Go build must not use the
 # network. Modules come from the cache (`[ci] setup` fills it on a runner).
-env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", NPM_CONFIG_OFFLINE = "true", PIP_NO_INDEX = "1"}
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", GOENV = "off", NPM_CONFIG_OFFLINE = "true", PIP_NO_INDEX = "1"}
 
 [tier2]
 # A .go file argument needs no ./ prefix; the driver is pinned through driver_paths.
 command = ["go", "run", "harness/telemetry_driver/main.go"]
 driver_paths = ["harness/telemetry_driver/"]
-env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off"}
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", GOENV = "off"}
 samples = 5000
 rounds = 10
 p99_drift_max = 0.02
@@ -70,7 +76,7 @@ timeout_seconds = 1800
 # Runs in `bin/crucible ci` only, before Tier 1. Pinned with this file.
 [ci]
 setup = [["go", "mod", "download"]]
-env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local"}
+env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOENV = "off"}
 
 [mutation]
 mutants = [

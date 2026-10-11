@@ -99,6 +99,19 @@ DEFAULT_PROTECTED_REFS = ["refs/heads/main", "refs/heads/master"]
 CI_TIMEOUT_DEFAULT = 900
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 RESERVED_ENV_PREFIX = "CRUCIBLE_"
+# G3 (architecture 20.1): the names a gate command takes from the caller's environment. Anything
+# else comes from `[environment] pass` or the section's `env` table. Lower-case forms are kept.
+ENV_BASE_ALLOW = frozenset((
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM", "USER", "LOGNAME", "SHELL", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"))
+ENV_BASE_ALLOW |= frozenset(name.lower() for name in ENV_BASE_ALLOW)
+ENV_BASE_PREFIX = "LC_"
+ENV_PASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
+# Names the kit sets itself: a `pass` entry may not name them or cover them.
+ENV_KIT_PREFIXES = ("GIT_", RESERVED_ENV_PREFIX)
+ENV_KIT_NAMES = ("PWD",)
+# The only GIT_* names a section `env` table may set (20.1): the commit identity of a scratch repository.
+ENV_GIT_IDENTITY = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
 PYTHON_TOKEN = "@crucible-python"
 ISOLATED_FLAG = "-I"
 
@@ -394,6 +407,20 @@ def _number(table: dict, key: str, default, where: str, integer: bool = False,
     return value
 
 
+def _env_name_problem(name: str, where: str) -> None:
+    """Refuse an `env` table name that is malformed, reserved (CRUCIBLE_*), or a git variable other
+    than the four identity names (a GIT_* value set here would undo the git hardening, 20.1)."""
+    if not ENV_NAME_RE.match(name):
+        raise ConfigError(f"{where}.env: {name!r} is not a valid variable name "
+                          "(upper-case letters, digits and '_', not starting with a digit)")
+    if name.startswith(RESERVED_ENV_PREFIX):
+        raise ConfigError(f"{where}.env: {name} is reserved; the CLI sets every "
+                          f"{RESERVED_ENV_PREFIX}* variable itself")
+    if name.startswith("GIT_") and name not in ENV_GIT_IDENTITY:
+        raise ConfigError(f"{where}.env: {name} is refused; the gate sets the git variables itself. "
+                          f"Only {', '.join(ENV_GIT_IDENTITY)} may be set here")
+
+
 def _env_table(table: dict, where: str) -> dict[str, str]:
     """The per-section `env` table (architecture 12.1): names matching
     [A-Z_][A-Z0-9_]*, string values, and no CRUCIBLE_* name (the CLI owns those)."""
@@ -401,15 +428,37 @@ def _env_table(table: dict, where: str) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ConfigError(f"{where}.env must be a table of NAME = \"value\"")
     for name, item in value.items():
-        if not ENV_NAME_RE.match(name):
-            raise ConfigError(f"{where}.env: {name!r} is not a valid variable name "
-                              "(upper-case letters, digits and '_', not starting with a digit)")
-        if name.startswith(RESERVED_ENV_PREFIX):
-            raise ConfigError(f"{where}.env: {name} is reserved; the CLI sets every "
-                              f"{RESERVED_ENV_PREFIX}* variable itself")
+        _env_name_problem(name, where)
         if not isinstance(item, str) or "\0" in item:
             raise ConfigError(f"{where}.env.{name} must be a string")
     return dict(value)
+
+
+def _kit_names_covered(entry: str) -> list[str]:
+    """The kit-set names (GIT_*, CRUCIBLE_*, PWD) that a `pass` entry names or, as a prefix, covers."""
+    stem = entry.rstrip("*").upper()
+    prefix = entry.endswith("*")
+    covered = [kit for kit in ENV_KIT_PREFIXES if stem.startswith(kit) or (prefix and kit.startswith(stem))]
+    return covered + [name for name in ENV_KIT_NAMES if stem == name or (prefix and name.startswith(stem))]
+
+
+def _pass_entry(entry: str) -> None:
+    """One `[environment] pass` entry: a name, or a prefix with one trailing `*` (G3). It may not
+    name or cover a name the kit sets (GIT_*, CRUCIBLE_*, PWD): a prefix like `G*` or `P*` is refused too."""
+    where = "environment.pass"
+    if not entry or not ENV_PASS_RE.match(entry):
+        raise ConfigError(f"{where}: {entry!r} is not a variable name or a name prefix ending in "
+                          "one '*' (letters, digits and '_', not starting with a digit)")
+    if _kit_names_covered(entry):
+        raise ConfigError(f"{where}: {entry!r} names or covers a variable the kit sets itself "
+                          "(GIT_*, CRUCIBLE_*, PWD)")
+
+
+def _pass_list(table: dict) -> list[str]:
+    entries = _string_list(table, "pass", "environment", required=False)
+    for entry in entries:
+        _pass_entry(entry)
+    return entries
 
 
 def _path_list(table: dict, key: str, where: str) -> list[str]:
@@ -443,13 +492,18 @@ def _glob_list(table: dict, key: str, where: str) -> list[str]:
     return patterns
 
 
-def _setup_commands(table: dict) -> list[list[str]]:
-    value = table.get("setup", [])
+def _argv_lists(table: dict, key: str, where: str) -> list[list[str]]:
+    """A list of non-empty argv lists of non-empty strings (`[ci] setup`, `[tier1] before`)."""
+    value = table.get(key, [])
     if not isinstance(value, list) or not all(
             isinstance(cmd, list) and cmd and all(isinstance(a, str) and a for a in cmd)
             for cmd in value):
-        raise ConfigError("ci.setup must be a list of non-empty argv lists of strings")
+        raise ConfigError(f"{where}.{key} must be a list of non-empty argv lists of strings")
     return [list(cmd) for cmd in value]
+
+
+def _setup_commands(table: dict) -> list[list[str]]:
+    return _argv_lists(table, "setup", "ci")
 
 
 MUTATION_KEYS = ("mutants", "waived", "command", "timeout_seconds", "budget_seconds", "controls",
@@ -552,6 +606,7 @@ def parse_config(text: str) -> dict:
                  "ignored_allow": _glob_list(gate, "ignored_allow", "gate")},
         "tier1": {"command": _string_list(tier1, "command", "tier1", required=False),
                   "contract_tests": _path_list(tier1, "contract_tests", "tier1"),
+                  "before": _argv_lists(tier1, "before", "tier1"),
                   "timeout_seconds": _number(tier1, "timeout_seconds", 900, "tier1", minimum=1),
                   "env": _env_table(tier1, "tier1")},
         "ci": {"setup": _setup_commands(ci),
@@ -560,7 +615,8 @@ def parse_config(text: str) -> dict:
         "attestation": {"ttl_seconds": _number(attestation, "ttl_seconds", 3600,
                                                "attestation", integer=True)},
         "environment": {"digest_globs": _string_list(environment, "digest_globs", "environment",
-                                                     required=False)},
+                                                     required=False),
+                        "pass": _pass_list(environment)},
     }
     cfg["mutation"] = parse_mutation(mutation)
     for entry in cfg["environment"]["digest_globs"]:
@@ -698,6 +754,14 @@ def _is_environment(ws: Path, rules: GateRules, rel: str) -> bool:
     return rules.ignored_allowed(rel) and _git_ignored(ws, rel)
 
 
+def gate_commands(cfg: dict) -> list[list[str]]:
+    """The argv lists the gate runs from the config, `[ci] setup` aside: the AST command, the
+    `[tier1] before` commands, the Tier 1 command, the Tier 2 command and the mutation command.
+    The command closure, the review kinds and the ignored-file advice name files through them."""
+    return [cfg["ast"]["command"], *cfg["tier1"].get("before", []), cfg["tier1"]["command"],
+            cfg["tier2"]["command"], cfg["mutation"]["command"]]
+
+
 def command_closure(ws: Path, cfg: dict, rules: GateRules) -> dict:
     """Files the gate commands would run or read that are not pinned: every
     argv element of the ast, tier1 and tier2 commands that names a repository
@@ -713,8 +777,7 @@ def command_closure(ws: Path, cfg: dict, rules: GateRules) -> dict:
     closure_files: set[str] = set()
     closure_dirs: set[str] = set()
     named: list[str] = []
-    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"],
-                    cfg["mutation"]["command"]):
+    for command in gate_commands(cfg):
         for element in expand_command(command):
             named += named_repo_paths(ws, element)
     named += [p for p in cfg["tier2"].get("driver_paths", []) if (ws / p).exists()]
@@ -868,20 +931,39 @@ def commit_identity_env() -> dict[str, str]:
             if name.upper().startswith(COMMIT_IDENTITY_PREFIXES)}
 
 
-def gate_environment(environ, ws: Path | None = None) -> dict[str, str]:
-    """The environment a gate command (AST, Tier 1, Tier 2, CI setup) gets
-    (A1.4, with ruling P3): `environ` without the git location variables and
-    without any inherited GIT_CONFIG_COUNT / _KEY_n / _VALUE_n / _PARAMETERS,
-    plus the four safe settings as GIT_CONFIG_COUNT/KEY_n/VALUE_n and
-    GIT_NO_LAZY_FETCH=1. There is deliberately no core.hooksPath pin: gate
-    commands are agent code, the pin has no security value for them, and it
-    broke test suites that commit in scratch repositories. A toolchain that
-    calls git (VCS stamping, build scripts) sees the same view as the trust
-    layer. Dropping an inherited GIT_CONFIG_PARAMETERS is part of this: it is
-    the same injection channel. Other variables are untouched (the general
-    allowlist is G3). `ws` is accepted for the caller's convenience and unused."""
+def env_name_passes(name: str, extra=()) -> bool:
+    """True when the caller's variable `name` may reach a gate command (G3): the base allowlist,
+    LC_*, or a `pass` entry (exact, or a prefix ending in '*'). A GIT_* or CRUCIBLE_* name never
+    passes, whatever the entries say."""
+    if name.upper().startswith(ENV_KIT_PREFIXES):
+        return False
+    if name in ENV_BASE_ALLOW or name.startswith(ENV_BASE_PREFIX):
+        return True
+    return any(name == entry or (entry.endswith("*") and name.startswith(entry[:-1]))
+               for entry in extra)
+
+
+def set_pass_names(environ, extra=()) -> list[str]:
+    """The names of `[environment] pass` that are set in `environ`, sorted. Never values."""
+    return sorted(name for name in environ
+                  if name not in ENV_BASE_ALLOW and not name.startswith(ENV_BASE_PREFIX)
+                  and env_name_passes(name, extra))
+
+
+def gate_environment(environ, ws: Path | None = None, extra=()) -> dict[str, str]:
+    """The environment a gate command (AST, Tier 1, Tier 2, CI setup, mutation, `before`) gets
+    (A1.4 with ruling P3, and G3 in architecture 20.1): only the variables of the base allowlist
+    and of `extra` (the config's `[environment] pass`) from `environ`, then the git hardening:
+    no git location variable, no inherited GIT_CONFIG_COUNT / _KEY_n / _VALUE_n / _PARAMETERS
+    (the same injection channel), the four safe settings as GIT_CONFIG_COUNT/KEY_n/VALUE_n and
+    GIT_NO_LAZY_FETCH=1. There is deliberately no core.hooksPath pin: gate commands are agent
+    code, the pin has no security value for them, and it broke test suites that commit in
+    scratch repositories. A toolchain that calls git sees the same view as the trust layer. The
+    caller adds the section's `env` table and the CRUCIBLE_* variables afterwards. `ws` is
+    accepted for the caller's convenience and unused."""
     env = {name: value for name, value in environ.items()
-           if name.upper() not in GIT_LOCATION_VARS and not GIT_CONFIG_INJECTION_RE.match(name)}
+           if env_name_passes(name, extra) and name.upper() not in GIT_LOCATION_VARS
+           and not GIT_CONFIG_INJECTION_RE.match(name)}
     env["GIT_CONFIG_COUNT"] = str(len(GIT_SAFE_CONFIG))
     for index, (key, value) in enumerate(GIT_SAFE_CONFIG):
         env[f"GIT_CONFIG_KEY_{index}"] = key
@@ -1932,8 +2014,7 @@ def closure_names(ws: Path, cfg: dict) -> set[str]:
     Tier 2 commands, the driver paths, the contract tests and the baseline. The message
     never tells anyone to delete one of them."""
     names = {cfg["ast"]["baseline"], *cfg["tier1"]["contract_tests"], *cfg["tier2"].get("driver_paths", [])}
-    for command in (cfg["ast"]["command"], cfg["tier1"]["command"], cfg["tier2"]["command"],
-                    cfg["mutation"]["command"]):
+    for command in gate_commands(cfg):
         for element in expand_command(command):
             names.update(named_repo_paths(ws, element))
     return names
@@ -2744,7 +2825,7 @@ def mutation_summary(check: dict) -> dict:
             "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
 
 
-KIT_VERSION = "3.0.1"  # tests/test_kit_version.py keeps this equal to the VERSION file
+KIT_VERSION = "3.1.0"  # tests/test_kit_version.py keeps this equal to the VERSION file
 MUTATION_DIRNAME = "mutation"
 PASS_FILE = "pass.json"
 ATTEMPTS_FILE = "attempts.json"
@@ -3079,7 +3160,7 @@ def _kind_sets(cfg: dict) -> list[tuple[str, set[str], tuple[str, ...]]]:
     drivers = tuple(d.rstrip("/") + "/" for d in cfg["tier2"].get("driver_paths", []))
     engine = named(cfg["ast"]["command"])     # the AST engine the config names: kit machinery
     return [("spec", {SPEC_REL}, ()),
-            ("tests", set(cfg["tier1"]["contract_tests"]) | named(cfg["tier1"]["command"],
+            ("tests", set(cfg["tier1"]["contract_tests"]) | named(cfg["tier1"]["command"], *cfg["tier1"].get("before", []),
                                                                     cfg["mutation"]["command"]), ()),
             ("driver", {d.rstrip("/") for d in drivers}, drivers),
             ("mutant", set(cfg["mutation"]["mutants"]), ()),
@@ -3345,6 +3426,8 @@ def install_hooks(ws: Path, repin: bool = False, verbose: bool = False) -> dict:
             show("  checker   the stored checker snapshot is damaged and will be replaced")
         for note in git_notes or [f"  git binary: {git_path}"]:
             show(note)
+        if cfg["environment"]["pass"]:
+            show("  pass      " + ", ".join(cfg["environment"]["pass"]))
         report_ignored_files(ws, rules, cfg)
         mutation_gate(ws, cfg, rules, tree, pin_digest, config_bytes, True, current is None)
         show(check_line(delta))
