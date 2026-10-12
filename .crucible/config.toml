@@ -46,9 +46,11 @@ pass = []
 [tier1]
 # Only the harness package, only the contract tests: a test file elsewhere
 # would run with CRUCIBLE_RESULTS in its environment.
-# harness/run_tier1.sh runs the cmd/ and internal/ unit tests without the
-# CRUCIBLE_RESULTS* variables, then the contract tests with them.
-command = ["./harness/run_tier1.sh"]
+command = ["go", "test", "-count=1", "-run", "^TestCrucible_INV_", "./harness/..."]
+# Kit 3.2.0 (G4): the cmd/ and internal/ unit tests run first, without the
+# CRUCIBLE_* variables (the results directory and the nonce do not exist yet).
+# A failure stops verify at stage `tier1-unit`. Replaces harness/run_tier1.sh.
+unit_command = ["go", "test", "-count=1", "-v", "./cmd/...", "./internal/..."]
 # Kit 3.1.0 (G8): fails Tier 1 when a module in the cache differs from go.sum.
 before = [["go", "mod", "verify"]]
 contract_tests = ["harness/crucible_contracts_test.go"]
@@ -61,6 +63,8 @@ env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY
 # A .go file argument needs no ./ prefix; the driver is pinned through driver_paths.
 command = ["go", "run", "harness/telemetry_driver/main.go"]
 driver_paths = ["harness/telemetry_driver/"]
+# Kit 3.2.0 (G11): no `build`. The kit trial on this repository measured no gain:
+# `go run` already caches the compile and link output (Go README, "Build step").
 env = {GOWORK = "off", GOFLAGS = "-mod=readonly", GOTOOLCHAIN = "local", GOPROXY = "off", GOENV = "off"}
 samples = 5000
 rounds = 10

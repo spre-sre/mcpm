@@ -113,13 +113,23 @@ def _kill_group(proc) -> bytes:
         return partial + OUTPUT_CUT_NOTE
 
 
+def reap_group(proc) -> None:
+    """Kill any process left in the command's process group after the command itself ended (R-G4-12).
+    It never reads the pipes again: `_kill_group` calls `communicate()`, which is closed by now. A
+    group that is already empty (or not ours to signal, on a zombie leader) is fine."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def env_pass_of(cfg: dict) -> list[str]:
     """The config's `[environment] pass` entries (G3)."""
     return cfg["environment"]["pass"]
 
 
 def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None = None,
-             split: bool = False, ws: Path | None = None, env_pass=()):
+             split: bool = False, ws: Path | None = None, env_pass=(), reap: bool = False):
     """Run an argv list (never a shell) with a timeout, in its own process
     group so a timeout kills the whole tree. The command's stdin is /dev/null: a gate
     command cannot read stdin (architecture 18.3). Returns (returncode, output,
@@ -127,7 +137,8 @@ def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None 
     split, stderr is relayed to our stderr and `output` is stdout alone. `ws`
     is the repository: the command's own git calls then get the hardened
     configuration (architecture 16.1) and lose the location variables. The environment
-    is the allowlist plus `env_pass` (config `[environment] pass`), architecture 20.1."""
+    is the allowlist plus `env_pass` (config `[environment] pass`), architecture 20.1.
+    With `reap`, the process group is killed after a normal exit too (R-G4-12, R-G11-18)."""
     env = vp.gate_environment(os.environ, ws, env_pass)  # plus the section's env table and CRUCIBLE_* (12.1)
     env.update(env_extra or {})
     started = time.monotonic()
@@ -140,6 +151,8 @@ def run_argv(argv: list[str], cwd: Path, timeout: float, env_extra: dict | None 
     try:
         out, err = proc.communicate(timeout=max(timeout, 0.1))
         timed_out = False
+        if reap:
+            reap_group(proc)
         if split and err:
             sys.stderr.write(err.decode(errors="replace"))
     except subprocess.TimeoutExpired:
@@ -391,34 +404,98 @@ def check_tier1_results(path: Path, nonce: str, names: list[str]) -> tuple[dict 
     return report, problems
 
 
-def run_before(ws: Path, cfg: dict, deadline: float) -> dict | None:
+def before_entry(argv: list[str], code, seconds: float, timed_out: bool, output: str) -> dict:
+    """One `tier1.before` report entry; a failing one also carries the output tail (R-NA-2)."""
+    entry = {"command": argv[0], "exit_code": code, "duration_seconds": round(seconds, 3),
+             "timed_out": timed_out}
+    if timed_out or code != 0:
+        entry["output_tail"] = tail(output)
+    return entry
+
+
+def run_before(ws: Path, cfg: dict, deadline: float) -> tuple[dict | None, list[dict]]:
     """Run the `[tier1] before` dependency checks in order (G8), each in the scrubbed environment plus
     the `[tier1] env` table and without any CRUCIBLE_* variable. They share the Tier 1 time budget (the
-    deadline). None when all exit 0; otherwise the Tier 1 result fields of the first failure."""
+    deadline). Returns (failure, entries): failure is None when all exit 0, otherwise the Tier 1 result
+    fields of the first failure; entries holds one report entry per command that was tried."""
+    entries: list[dict] = []
     for argv in cfg["tier1"].get("before", []):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"exit_code": None, "output_tail": "", "timed_out": True}
+            entries.append(before_entry(argv, None, 0.0, True, ""))
+            return {"exit_code": None, "output_tail": "", "timed_out": True}, entries
         code, output, timed_out, seconds = run_argv(
             vp.expand_command(argv), ws, remaining, env_extra=cfg["tier1"]["env"], ws=ws,
             env_pass=env_pass_of(cfg))
+        entries.append(before_entry(argv, code, seconds, timed_out, output))
         if timed_out or code != 0:
             return {"exit_code": code, "duration_seconds": round(seconds, 3),
                     "output_tail": tail(output), "timed_out": timed_out,
-                    "error": None if timed_out else f"dependency check failed: {argv[0]} exited {code}"}
-    return None
+                    "error": None if timed_out else f"dependency check failed: {argv[0]} exited {code}"
+                    }, entries
+    return None, entries
 
 
-def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: Path) -> dict:
-    """The dependency checks, then the Tier 1 command with its results path in `scratch`; `out` is
-    updated with what happened."""
-    deadline = time.monotonic() + cfg["tier1"]["timeout_seconds"]
-    failure = run_before(ws, cfg, deadline)
+def unit_ok(unit: dict) -> bool:
+    return unit["exit_code"] == 0 and not unit["timed_out"]
+
+
+def run_unit(ws: Path, cfg: dict, deadline: float) -> dict | None:
+    """Run `[tier1] unit_command` once (G4): the scrubbed environment plus the `[tier1] env` table, no
+    CRUCIBLE_* variable, the shared Tier 1 time budget, and the process group killed afterwards. None
+    when not configured; otherwise {exit_code, duration_seconds, output_tail, timed_out}."""
+    argv = cfg["tier1"].get("unit_command", [])
+    if not argv:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": True}
+    code, output, timed_out, seconds = run_argv(
+        vp.expand_command(argv), ws, remaining, env_extra=cfg["tier1"]["env"], ws=ws,
+        env_pass=env_pass_of(cfg), reap=True)
+    return {"exit_code": code, "duration_seconds": round(seconds, 3), "output_tail": tail(output),
+            "timed_out": timed_out}
+
+
+def unit_failure(unit: dict, cfg: dict) -> dict:
+    """The Tier 1 result fields of a failed unit step: the same overwrite as a failed `before`
+    (R-G4-19), so that an old reader sees the failing command."""
+    argv0 = cfg["tier1"]["unit_command"][0]
+    return {**unit, "error": None if unit["timed_out"] else f"unit tests failed: {argv0} exited {unit['exit_code']}"}
+
+
+def tier1_prelude(ws: Path, cfg: dict, out: dict, deadline: float) -> dict | None:
+    """The dependency checks, then the unit step. None when both passed; otherwise the finished Tier 1
+    result. `out` gains `before` and `unit`; `unit` stays None when the step did not run."""
+    failure, out["before"] = run_before(ws, cfg, deadline)
     if failure is not None:
         return {**out, **failure}
+    out["unit"] = run_unit(ws, cfg, deadline)
+    if out["unit"] is None or unit_ok(out["unit"]):
+        return None
+    return {**out, **unit_failure(out["unit"], cfg)}
+
+
+def tier1_commands(ws: Path, cfg: dict, out: dict, names: list[str]) -> dict:
+    """The dependency checks and the unit step, then the Tier 1 command in a fresh results directory.
+    The directory and the nonce do not exist while the first two run (R-G4-5)."""
+    deadline = time.monotonic() + cfg["tier1"]["timeout_seconds"]
+    finished = tier1_prelude(ws, cfg, out, deadline)
+    if finished is not None:
+        return finished
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return {**out, "timed_out": True}
+    scratch = Path(tempfile.mkdtemp(prefix="crucible-tier1-")).resolve()
+    try:
+        return tier1_in_scratch(ws, cfg, out, names, scratch, remaining)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: Path,
+                     remaining: float) -> dict:
+    """The Tier 1 command with its results path in `scratch`; `out` is updated with what happened."""
     results, nonce = scratch / "results.json", secrets.token_hex(16)
     code, output, timed_out, seconds = run_argv(
         vp.expand_command(cfg["tier1"]["command"]), ws, remaining,
@@ -427,6 +504,7 @@ def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: 
     out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
                timed_out=timed_out)
     if timed_out or code != 0:
+        out["invariants"] = None if timed_out else check_tier1_results(results, nonce, names)[0]  # report only (R-NB-1)
         return out
     report, problems = check_tier1_results(results, nonce, names)
     out["invariants"] = report
@@ -435,27 +513,45 @@ def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: 
     return out
 
 
+def temp_inside(ws: Path) -> bool:
+    """True when the temporary directory (TMPDIR) is the repository or inside it. The check needs no
+    directory: it runs before any command does (R-G4-5)."""
+    temp, root = Path(tempfile.gettempdir()).resolve(), ws.resolve()
+    return temp == root or root in temp.parents
+
+
 def run_tier1(ws: Path, cfg: dict) -> dict:
-    """Run the `[tier1] before` dependency checks (G8), then `[tier1] command` with the result
-    protocol (section 11.1): a results path in a fresh temp directory outside the repository and a
+    """Run the `[tier1] before` dependency checks (G8), the `[tier1] unit_command` (G4), then
+    `[tier1] command` with the result protocol (section 11.1): a results path in a fresh temp directory outside the repository and a
     random nonce. Tier 1 passes only if every check and the command exit 0 and the results validate."""
     command = cfg["tier1"]["command"]
     out = {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": False,
-           "invariants": None}
+           "invariants": None, "before": [], "unit": None}
     if not command or not all(isinstance(c, str) and c for c in command):
         return {**out, "error": "tier1.command is empty or missing (fail closed)"}
     spec, spec_errors = load_spec(ws)
     if spec_errors:
         return {**out, "error": "SPEC.md is invalid; Tier 1 cannot check its invariants"}
     names = [inv["name"] for inv in spec["invariants"]]
-    scratch = Path(tempfile.mkdtemp(prefix="crucible-tier1-")).resolve()
-    try:
-        if scratch == ws.resolve() or ws.resolve() in scratch.parents:
-            return {**out, "error": "the temporary directory is inside the repository; point "
-                                    "TMPDIR outside it"}
-        return tier1_in_scratch(ws, cfg, out, names, scratch)
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    if temp_inside(ws):
+        return {**out, "error": "the temporary directory is inside the repository; point "
+                                "TMPDIR outside it"}
+    return tier1_commands(ws, cfg, out, names)
+
+
+def tier1_report(tier1: dict) -> dict:
+    """The Tier 1 fields of the result and of the token: the four 3.0 keys, then `error` (None when
+    there is none), the `before` entries (R-NA-1, R-NA-2) and the `unit` object (None when the step
+    did not run, R-G4-8)."""
+    report = {k: tier1[k] for k in ("exit_code", "duration_seconds", "output_tail", "invariants")}
+    return {**report, "error": tier1.get("error"), "before": tier1.get("before", []),
+            "unit": tier1.get("unit")}
+
+
+def tier1_stage(t1: dict) -> str:
+    """The stage of a Tier 1 failure that is not a timeout: `tier1-unit` when the unit step failed."""
+    unit = t1.get("unit")
+    return "tier1-unit" if unit is not None and not unit_ok(unit) else "tier1"
 
 
 def tier1_failed(t1: dict) -> bool:
@@ -495,13 +591,12 @@ def gate_stages(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
         fail(result, "step0", EXIT_GATE, "Step 0 failed")
         return False
     tier1 = run_tier1(ws, cfg)
-    result["tier1"] = {k: tier1[k] for k in ("exit_code", "duration_seconds", "output_tail",
-                                              "invariants")}
+    result["tier1"] = tier1_report(tier1)
     if tier1["timed_out"]:
         fail(result, "timeout", EXIT_GATE, "Tier 1 timed out")
         return False
     if tier1_failed(tier1):
-        fail(result, "tier1", EXIT_GATE, tier1.get("error") or
+        fail(result, tier1_stage(tier1), EXIT_GATE, tier1.get("error") or
              f"Tier 1 exited with {tier1['exit_code']}")
         return False
     try:
@@ -546,10 +641,12 @@ def record_tier2(result: dict, t2: dict) -> None:
         result["ignored_files"] = t2["ignored_files"]
 
 
-def ignored_tier2_result(report: dict, when: str) -> dict:
-    """A run_tier2-shaped failure (exit 1, stage step0) for a git-ignored file found `when`."""
+def ignored_tier2_result(report: dict, when: str, build: dict | None = None) -> dict:
+    """A run_tier2-shaped failure (exit 1, stage step0) for a git-ignored file found `when`. `build` is
+    the run's build record; before Tier 2 no build ran, so both sides are null (R-G11-12)."""
     return {"verdict": "ERROR_IGNORED_FILES", "stage": "step0",
             "reasons": [report["message"], f"git-ignored files found {when}"],
+            "build": build or {"candidate": None, "baseline": None},
             "ignored_files": {key: report[key] for key in ("count", "files", "truncated")}}
 
 
@@ -563,7 +660,7 @@ def checked_tier2(ws: Path, cfg: dict, rules, **options) -> dict:
     if out["verdict"] not in GATE_PASS_VERDICTS:
         return out
     report = vp.ignored_report(ws, rules, cfg)
-    return out if report is None else ignored_tier2_result(report, "after Tier 2")
+    return out if report is None else ignored_tier2_result(report, "after Tier 2", out.get("build"))
 
 
 def issue_token(ws: Path, secret: bytes, cfg: dict, tree: dict, result: dict, level: str,
@@ -676,6 +773,12 @@ def baseline_config_bytes(ws: Path, head: str | None) -> bytes | None:
     return vp.committed_blob(ws, head, vp.CONFIG_REL)
 
 
+def baseline_state(ws: Path, head: str | None) -> tuple[bytes | None, bool]:
+    """(HEAD's raw config, whether it has a [tier2] section): the baseline exists only when both hold."""
+    raw_config = baseline_config_bytes(ws, head)
+    return raw_config, raw_config is not None and baseline_has_tier2(raw_config)
+
+
 def baseline_has_tier2(raw_config: bytes) -> bool:
     """True when HEAD's config has a [tier2] section. Unreadable TOML is an
     error, never "no baseline": a damaged config cannot restart the comparison."""
@@ -744,6 +847,70 @@ def prepare_baseline(ws: Path, head: str, base_dir: Path, raw_config: bytes) -> 
     return base_cfg, base_rules, drivers, problems
 
 
+BUILD_SIDES = {"candidate": "the candidate", "baseline": "the baseline (HEAD)"}
+
+
+def build_side(ws: Path, tree: Path, cfg: dict, rules, env_pass) -> dict:
+    """Run the `[tier2] build` of `cfg` in `tree` (R-G11-5): untimed by the rounds, its own budget
+    (`build_timeout_seconds`), the scrubbed environment plus that config's `[tier2] env` table, no
+    CRUCIBLE_* variable, no argument appended, and the process group killed afterwards (R-G11-18)."""
+    tier2 = cfg["tier2"]
+    code, output, timed_out, seconds = run_argv(
+        command_for(ws, tier2["build"], tree, rules), tree, tier2["build_timeout_seconds"],
+        env_extra=tier2["env"], ws=ws, env_pass=env_pass, reap=True)
+    return {"exit_code": code, "duration_seconds": round(seconds, 3), "output_tail": tail(output),
+            "timed_out": timed_out}
+
+
+def build_failure(out: dict, side: str, build: dict, budget: float) -> bool:
+    """True, with `out` filled, when `build` failed or ran out of its budget (R-G11-9 to R-G11-11)."""
+    name = BUILD_SIDES[side]
+    if build["timed_out"]:
+        out.update(verdict="ERROR_TIMEOUT", stage="timeout",
+                   reasons=[f"{name} build timed out after {budget:g} seconds"])
+    elif build["exit_code"] != 0:
+        more = ("; check the toolchain and the dependency cache; HEAD changes only through a promotion"
+                if side == "baseline" else f": {build['output_tail'][-500:]}")
+        out.update(verdict="ERROR_TIER2", stage="build",
+                   reasons=[f"{name} build exited {build['exit_code']}{more}"])
+    return out.get("stage") in ("build", "timeout")
+
+
+def candidate_build(ws: Path, cfg: dict, rules, out: dict) -> bool:
+    """The candidate build, then proof that it did not change the gated tree (R-G11-17: a build daemon
+    could change it while the timed rounds run). True when no build is set or it passed."""
+    if not cfg["tier2"]["build"]:
+        return True
+    before = vp.working_tree(ws, rules)
+    out["build"]["candidate"] = build_side(ws, ws, cfg, rules, env_pass_of(cfg))
+    if build_failure(out, "candidate", out["build"]["candidate"], cfg["tier2"]["build_timeout_seconds"]):
+        return False
+    try:
+        delta = vp.diff_maps(before, vp.working_tree(ws, rules))
+    except vp.PathViolation as exc:                # a symlink or FIFO where a gated file was
+        out.update(verdict="ERROR_TIER2", stage="build",
+                   reasons=[f"the candidate build left the gated tree unreadable: {exc}; no round ran"])
+        return False
+    if any(delta.values()):
+        out.update(verdict="ERROR_TIER2", stage="build",
+                   reasons=[f"the candidate build changed the gated tree: {delta}; no round ran"])
+    return out.get("stage") != "build"
+
+
+def baseline_build(ws: Path, cfg: dict, base, base_dir: Path, out: dict) -> bool:
+    """The baseline build with HEAD's own config (R-G11-6, 12.3); a failure is never a first adoption."""
+    if base is None or not base[0]["tier2"]["build"]:
+        return True
+    out["build"]["baseline"] = build_side(ws, base_dir, base[0], base[1], env_pass_of(cfg))
+    return not build_failure(out, "baseline", out["build"]["baseline"], base[0]["tier2"]["build_timeout_seconds"])
+
+
+def run_builds(ws: Path, cfg: dict, rules, base, base_dir: Path, out: dict) -> bool:
+    """Candidate first, so that an agent that can fix it hears of a failure early, then the baseline.
+    True when every configured build passed; otherwise `out` holds the failure (R-G11-1)."""
+    return candidate_build(ws, cfg, rules, out) and baseline_build(ws, cfg, base, base_dir, out)
+
+
 def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
               genesis: str | None = None, prior_promotions: bool = False) -> dict:
     """Run Tier 2. Returns {"verdict", "stage", "reasons", ...}; verdict is one
@@ -755,7 +922,7 @@ def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
     command = tier2["command"]
     out = {"verdict": "ERROR_TIER2", "stage": "tier2", "reasons": [], "baseline_commit": None,
            "seed": None, "rounds": tier2["rounds"], "samples_per_round": None,
-           "ci_method": None, "gate": None}
+           "ci_method": None, "gate": None, "build": {"candidate": None, "baseline": None}}
     drivers = vp.tier2_driver_set(ws, cfg, rules)
     problems = driver_problems(ws, cfg, rules, drivers, "the candidate")
     if problems:
@@ -775,11 +942,9 @@ def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
     out["seed"] = base_seed
     head = vp.head_commit(ws)
     out["baseline_commit"] = head
-    deadline = time.monotonic() + tier2["timeout_seconds"]
     scratch = Path(tempfile.mkdtemp(prefix="crucible-tier2-"))
     try:
-        raw_config = baseline_config_bytes(ws, head)
-        has_baseline = raw_config is not None and baseline_has_tier2(raw_config)
+        raw_config, has_baseline = baseline_state(ws, head)
         base_dir = scratch / "baseline"
         base = None
         if has_baseline:
@@ -794,6 +959,9 @@ def run_tier2(ws: Path, cfg: dict, rules, seed: int | None = None,
             if problems:
                 out["reasons"] += problems
                 return out
+        if not run_builds(ws, cfg, rules, base, base_dir, out):
+            return out
+        deadline = time.monotonic() + tier2["timeout_seconds"]  # the rounds' clock starts after the builds (R-G11-8)
         base_lat, cand_lat, base_mem, cand_mem = [], [], [], []  # one series per round
         for index in range(tier2["rounds"] if has_baseline else 1):
             round_seed = base_seed + index
@@ -867,11 +1035,15 @@ def run_tier2_smoke(ws: Path, cfg: dict, rules) -> dict:
     tier2 = cfg["tier2"]
     command = tier2["command"]
     count = smoke_samples(tier2)
-    out = {"smoke": True, "ok": False, "samples": count, "reasons": [], "stage": "tier2"}
+    out = {"smoke": True, "ok": False, "samples": count, "reasons": [], "stage": "tier2",
+           "build": {"candidate": None, "baseline": None}}
     problems = driver_problems(ws, cfg, rules, vp.tier2_driver_set(ws, cfg, rules), "the candidate")
     if problems:
         out["reasons"] += problems
         return out
+    built = {"build": out["build"]}
+    if not candidate_build(ws, cfg, rules, built):            # R-G11-13: the build comes first
+        return {**out, "stage": built["stage"], "reasons": built["reasons"]}
     scratch = Path(tempfile.mkdtemp(prefix="crucible-smoke-"))
     try:
         math_module = load_telemetry_math(ws)
@@ -1933,16 +2105,42 @@ def repin_coming(ws: Path, tree: dict) -> bool:
         return True
 
 
-def pinned_root_elsewhere(ws: Path) -> str | None:
-    """The pinned repository root when `ws` is another work tree (a linked worktree) of a repository
-    that has a trust anchor; None when `ws` is the pinned root, or there is no readable anchor."""
+def anchor_root(ws: Path) -> str | None:
+    """The repository root that the trust anchor names; None when there is no readable anchor."""
     try:
         state = vp.state_dir(ws, create=False)
         trust = vp.load_trust(state) if state.is_dir() else None
     except KitError:
         return None
     root = trust.get("repo_root") if trust else None
-    return root if isinstance(root, str) and root != str(ws.resolve()) else None
+    return root if isinstance(root, str) else None
+
+
+def pinned_root_elsewhere(ws: Path) -> str | None:
+    """The pinned repository root when `ws` is another work tree (a linked worktree) of a repository
+    that has a trust anchor; None when `ws` is the pinned root, or there is no readable anchor."""
+    root = anchor_root(ws)
+    return root if root is not None and root != str(ws.resolve()) else None
+
+
+def linked_worktree(ws: Path) -> bool:
+    """True when `.git` is a file and its git directory has a `commondir` (R-NC-3). A submodule also
+    has a `.git` file, but its git directory is its own, with no `commondir`."""
+    dotgit = ws / ".git"
+    if not dotgit.is_file():
+        return False
+    try:
+        return (ws / vp._read_gitfile(dotgit) / "commondir").is_file()
+    except KitError:
+        return False
+
+
+def unanchored_worktree(ws: Path) -> str | None:
+    """The reason to skip the mutation stage in a linked worktree that has no readable anchor (R-NC-1):
+    the stage would write the state directory that the main work tree shares."""
+    if linked_worktree(ws) and anchor_root(ws) is None:
+        return "no trust anchor here: run mutation in the main work tree"
+    return None
 
 
 def mutation_in_preflight(ws: Path, cfg: dict, rules, tree: dict, result: dict) -> bool:
@@ -1950,6 +2148,10 @@ def mutation_in_preflight(ws: Path, cfg: dict, rules, tree: dict, result: dict) 
     Workers that check a candidate in a linked worktree change source files only, so their pins match.
     A worker that changes a trusted file also skips: the record and the attempt counter are shared with
     the pinned work tree, and a record written here would name this path, not the root the pin needs."""
+    reason = unanchored_worktree(ws)
+    if reason is not None:
+        result["mutation"] = {"skipped": reason}
+        return True
     if not repin_coming(ws, tree):
         result["mutation"] = {"skipped": "pins match"}
         return True
@@ -1958,6 +2160,16 @@ def mutation_in_preflight(ws: Path, cfg: dict, rules, tree: dict, result: dict) 
         result["mutation"] = {"skipped": f"not the pinned work tree; run mutation in {root}"}
         return True
     return mutation_stage(ws, cfg, rules, tree, result)
+
+
+def note_without_unit(cfg: dict, result: dict) -> None:
+    """R-G4-11: say once that no unit tests are in the gate. The verdict does not change."""
+    if cfg["tier1"].get("unit_command"):
+        return
+    note = ("note: [tier1] unit_command is empty, so no unit tests run in the gate; set it to run the "
+            "project's own unit tests before the contract command")
+    result.setdefault("notes", []).append(note)
+    say(note)
 
 
 def cmd_preflight(ws: Path, args) -> dict:
@@ -1978,6 +2190,7 @@ def cmd_preflight(ws: Path, args) -> dict:
         return fail(result, "step0", EXIT_GATE, str(exc))
     if not checked_stages(ws, cfg, rules, tree, result):
         return result
+    note_without_unit(cfg, result)
     if not mutation_in_preflight(ws, cfg, rules, tree, result):
         return result
     smoke = run_tier2_smoke(ws, cfg, rules)

@@ -92,7 +92,7 @@ COMMIT_IDENTITY_PREFIXES = ("GIT_AUTHOR_", "GIT_COMMITTER_")
 TIER2_DEFAULTS = {
     "samples": 5000, "rounds": 10, "p99_drift_max": 0.02, "p50_drift_max": 0.02,
     "bootstrap_samples": 1000, "ci_level": 0.95, "leak_slope_max": 1024.0,
-    "leak_alpha": 0.05, "min_samples": 1000, "timeout_seconds": 1800,
+    "leak_alpha": 0.05, "min_samples": 1000, "timeout_seconds": 1800, "build_timeout_seconds": 900,
 }
 DEFAULT_BASELINE = ".crucible/baseline.json"
 DEFAULT_PROTECTED_REFS = ["refs/heads/main", "refs/heads/master"]
@@ -510,6 +510,7 @@ MUTATION_KEYS = ("mutants", "waived", "command", "timeout_seconds", "budget_seco
                  "no_controls_reason")
 MUTATION_BUDGET_DEFAULT = 3600
 INVARIANT_NAME_RE = re.compile(r"INV_[A-Z0-9_]+")
+CONTROL_CHAR_RE = re.compile("[\x00-\x1f\x7f-\x9f]")   # C0, DEL and C1: a terminal acts on them
 PRINTABLE_ASCII_RE = re.compile(r"[ -~]+")   # a reason reaches the PIN prompt: no ESC, no bidirectional character
 
 
@@ -540,6 +541,18 @@ def _mutation_command(table: dict) -> list[str]:
     command = _string_list(table, "command", "mutation", required=False)
     if not all(command):
         raise ConfigError("mutation.command must not hold an empty string")
+    return command
+
+
+def _argv_command(table: dict, key: str, where: str) -> list[str]:
+    """An optional argv list (`[tier1] unit_command`, `[tier2] build`): a list of non-empty strings with
+    no control character, or absent. `_string_list` accepts "" elements, so this adds the check, as `_mutation_command` does."""
+    command = _string_list(table, key, where, required=False)
+    if not all(command):
+        raise ConfigError(f"{where}.{key} must not hold an empty string")
+    if any(CONTROL_CHAR_RE.search(element) for element in command):
+        raise ConfigError(f"{where}.{key} must not hold a control character (C0, DEL or C1): "
+                          "the repin summary shows this command to the human who pins it")
     return command
 
 
@@ -607,6 +620,7 @@ def parse_config(text: str) -> dict:
         "tier1": {"command": _string_list(tier1, "command", "tier1", required=False),
                   "contract_tests": _path_list(tier1, "contract_tests", "tier1"),
                   "before": _argv_lists(tier1, "before", "tier1"),
+                  "unit_command": _argv_command(tier1, "unit_command", "tier1"),
                   "timeout_seconds": _number(tier1, "timeout_seconds", 900, "tier1", minimum=1),
                   "env": _env_table(tier1, "tier1")},
         "ci": {"setup": _setup_commands(ci),
@@ -644,11 +658,13 @@ def parse_config(text: str) -> dict:
     tier2_cfg = {**TIER2_DEFAULTS, **tier2}
     tier2_cfg["command"] = _string_list(tier2, "command", "tier2", required=False)
     tier2_cfg["driver_paths"] = _path_list(tier2, "driver_paths", "tier2")
+    tier2_cfg["build"] = _argv_command(tier2, "build", "tier2")
     tier2_cfg["env"] = _env_table(tier2, "tier2")
     for key in ("samples", "rounds", "bootstrap_samples", "min_samples"):
         tier2_cfg[key] = _number(tier2_cfg, key, TIER2_DEFAULTS[key], "tier2",
                                  integer=True, minimum=1)
     tier2_cfg["timeout_seconds"] = _number(tier2_cfg, "timeout_seconds", 1800, "tier2", minimum=1)
+    tier2_cfg["build_timeout_seconds"] = _number(tier2_cfg, "build_timeout_seconds", 900, "tier2", minimum=1)
     if "smoke_samples" in tier2_cfg:
         tier2_cfg["smoke_samples"] = _number(tier2_cfg, "smoke_samples", 1, "tier2",
                                              integer=True, minimum=1)
@@ -756,10 +772,11 @@ def _is_environment(ws: Path, rules: GateRules, rel: str) -> bool:
 
 def gate_commands(cfg: dict) -> list[list[str]]:
     """The argv lists the gate runs from the config, `[ci] setup` aside: the AST command, the
-    `[tier1] before` commands, the Tier 1 command, the Tier 2 command and the mutation command.
-    The command closure, the review kinds and the ignored-file advice name files through them."""
-    return [cfg["ast"]["command"], *cfg["tier1"].get("before", []), cfg["tier1"]["command"],
-            cfg["tier2"]["command"], cfg["mutation"]["command"]]
+    `[tier1] before` commands, the unit command, the Tier 1 command, the Tier 2 build and command and
+    the mutation command. The command closure, the review kinds and the ignored-file advice name files through them."""
+    return [cfg["ast"]["command"], *cfg["tier1"].get("before", []), cfg["tier1"].get("unit_command", []),
+            cfg["tier1"]["command"], cfg["tier2"].get("build", []), cfg["tier2"]["command"],
+            cfg["mutation"]["command"]]
 
 
 def command_closure(ws: Path, cfg: dict, rules: GateRules) -> dict:
@@ -2825,7 +2842,7 @@ def mutation_summary(check: dict) -> dict:
             "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
 
 
-KIT_VERSION = "3.1.0"  # tests/test_kit_version.py keeps this equal to the VERSION file
+KIT_VERSION = "3.2.0"  # tests/test_kit_version.py keeps this equal to the VERSION file
 MUTATION_DIRNAME = "mutation"
 PASS_FILE = "pass.json"
 ATTEMPTS_FILE = "attempts.json"
@@ -3161,12 +3178,26 @@ def _kind_sets(cfg: dict) -> list[tuple[str, set[str], tuple[str, ...]]]:
     engine = named(cfg["ast"]["command"])     # the AST engine the config names: kit machinery
     return [("spec", {SPEC_REL}, ()),
             ("tests", set(cfg["tier1"]["contract_tests"]) | named(cfg["tier1"]["command"], *cfg["tier1"].get("before", []),
+                                                                    cfg["tier1"].get("unit_command", []),
                                                                     cfg["mutation"]["command"]), ()),
-            ("driver", {d.rstrip("/") for d in drivers}, drivers),
+            ("driver", {d.rstrip("/") for d in drivers} | named(cfg["tier2"].get("build", [])), drivers),
             ("mutant", set(cfg["mutation"]["mutants"]), ()),
             ("config", {CONFIG_REL, PINS_MIRROR_REL}, ()),
             ("baseline", {cfg["ast"]["baseline"]}, ()),
             ("kit", set(MACHINERY) | engine, tuple(e.rstrip("/") + "/" for e in engine if "." not in posixpath.basename(e)))]
+
+
+def unit_build_lines(cfg: dict) -> list[str]:
+    """The repin summary lines for `[tier1] unit_command` and `[tier2] build`, only when set. The
+    build command files are kind `driver` in the review rows (not the fallback kind `build`)."""
+    labelled = (("unit", cfg["tier1"].get("unit_command")), ("build", cfg["tier2"].get("build")))
+    return [f"  {label:<9} {' '.join(_shown(shlex.quote(element)) for element in argv)}"
+            for label, argv in labelled if argv]
+
+
+def show_unit_build(cfg: dict) -> None:
+    for line in unit_build_lines(cfg):
+        show(line)
 
 
 def pin_kind(path: str, cfg: dict) -> str:
@@ -3428,6 +3459,7 @@ def install_hooks(ws: Path, repin: bool = False, verbose: bool = False) -> dict:
             show(note)
         if cfg["environment"]["pass"]:
             show("  pass      " + ", ".join(cfg["environment"]["pass"]))
+        show_unit_build(cfg)
         report_ignored_files(ws, rules, cfg)
         mutation_gate(ws, cfg, rules, tree, pin_digest, config_bytes, True, current is None)
         show(check_line(delta))
@@ -3457,6 +3489,7 @@ def install_hooks(ws: Path, repin: bool = False, verbose: bool = False) -> dict:
         show_pin_review(delta, env_delta, cfg, verbose, current, pins, environment)
         for note in git_notes:
             show(note)
+        show_unit_build(cfg)
         report_ignored_files(ws, rules, cfg)
         mutation_gate(ws, cfg, rules, tree, pin_digest, config_bytes, False, False)
         show(check_line(delta))
