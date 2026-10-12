@@ -158,6 +158,36 @@ latencies and the same number of memory samples. Rules:
 Memory in Go: `runtime.ReadMemStats(&m)`, sample `m.HeapAlloc` (live heap
 bytes) after each call.
 
+### Build step (`[tier2] build`)
+
+`[tier2] build` (optional argv list) runs once in the baseline tree and once in the work tree, before round 1 and not
+again. Each build has its own budget, `build_timeout_seconds` (default 900), so build time does not reduce
+`[tier2] timeout_seconds` and enters no sample. It runs in the tree, in the scrubbed environment plus the
+`[tier2] env` table of that tree's own config, without `CRUCIBLE_*` variables and with no argument appended; the
+baseline uses HEAD's own `build` and budget. The work tree builds first. A failing build stops Tier 2 at stage `build`
+(`ERROR_TIER2`), a timeout at stage `timeout` (`ERROR_TIMEOUT`), and a baseline build that fails is never a first
+adoption. A build that changes the gated tree fails at stage `build`; a process it leaves behind is killed.
+`preflight` runs the work-tree build before its smoke run. The files that `build` names are in the command closure
+(kind `driver` in the repin review).
+
+Never name a build output in a command. An ignored output admitted by `ignored_allow` becomes an environment digest
+that every rebuild changes, which ends in exit 3 at the next run; without the admission it is an unpinned closure
+file. A build output inside the work tree is not pinned: use a command that rebuilds, or clear the directory.
+
+Residual risks of a build: a build that starts a daemon with `setsid` (a Gradle daemon, `sccache`) leaves the process
+group, so the kill afterwards does not reach it. It could edit a gated file after the tree check, while the timed
+rounds run; `promote` sees the change only at admission, where it still fails closed. The candidate build also runs
+after HEAD is written to the baseline tree under `$TMPDIR/crucible-tier2-*/baseline`, so candidate build code can edit
+that tree before the first baseline sample (the candidate driver has the same power between rounds).
+
+Go (kit 3.2.0 trial, Go 1.24.0, mcpm): `go run` caches the linked executable. Without a build the first driver run
+in a fresh tree took 2.4 s and later runs 0.25 s; after `go build -o /dev/null` the first run took 0.9 s, but the build
+itself took 1.6 s, so the sum did not change. On a warm cache a whole `telemetry` run took 35.2 to 35.6 s without a
+build and 35.2 to 36.3 s with one or two. The fragment therefore leaves `build` unset. If you set it, use a warm-up such as
+`go build -o /dev/null ./harness/telemetry_driver`: plain `go build` writes `./telemetry_driver` into the
+repository root.
+
+
 ## AST gate
 
 `cmd/gate-ast/main.go` is a native McCabe gate (Go standard library only:
@@ -353,6 +383,31 @@ What stays open: the Go toolchain and standard library on the machine, and a `re
 outside the module (the `go.mod` pin shows the directive, not the target's content).
 
 Gaps line: `go mod verify` checks the module cache against go.sum before Tier 1; gate commands build from that cache (-mod=readonly), and a project that sets -mod=vendor is covered for vendor/ by the pin only, because go mod verify does not cover vendor/; the Go toolchain, the standard library and the target of a replace directive outside the module are not verified.
+
+### Unit tests
+
+`[tier1] unit_command` (optional) runs the project's own unit tests once per Tier 1 run, after every `before`
+command and before the contract command. It gets the scrubbed environment and the `[tier1] env` table, and no
+`CRUCIBLE_*` variable; the results directory and the nonce are created only after it has ended, and any process left
+in its process group is killed. It shares the Tier 1 `timeout_seconds` budget. A failure stops `verify`,
+`preflight` and `ci` at stage `tier1-unit` with the reason `unit tests failed: <argv0> exited <N>`; no token is
+issued, and `tier1.unit` in the JSON result holds its `exit_code`, `duration_seconds`, `output_tail` and `timed_out`.
+A repository file named in the command is in the command closure, so it must be pinned; a source directory is the
+code under test and stays allowed. The mutation stage does not run it: the contract tests alone must kill each
+mutant. A new `unit_command` is a config change, so a human repins; the repin summary shows it as a `unit` line.
+Without the key, `preflight` prints one note.
+
+The value in `config.fragment.toml` carries a `TODO(agent)`: write one `./<dir>/...` per `source_paths` directory
+that exists. `go test` (Go 1.24.0) behaves as follows:
+
+- A pattern for a missing directory fails: `lstat ./pkg/: no such file or directory`, `FAIL ./pkg/... [setup failed]`, exit 1.
+- An existing directory without packages only warns (`matched no packages`) and exits 0 when another pattern matches.
+- When all patterns are empty, `go test` prints `no packages to test` and exits 1.
+
+The contract package `./harness` is not named (its `TestMain` needs the results variables), and `./...` is not used
+(G7). A pattern that selects no test passes silently.
+
+Gaps line: unit tests run as the same OS user, without the CRUCIBLE_* variables and before the results file and nonce exist, and their process group is killed afterwards; a test can still read a parent process's environment, leave a daemon that escapes the process group, or write outside the repository, and a command that selects zero tests passes silently; a Go pattern for a missing directory fails and an empty directory only warns.
 
 ### Environment (`[environment] pass`)
 
