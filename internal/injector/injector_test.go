@@ -84,7 +84,11 @@ func TestRegisterAlphaBetaGemini(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(origDir) })
+	t.Cleanup(func() {
+		if err := os.Chdir(origDir); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatal(err)
 	}
