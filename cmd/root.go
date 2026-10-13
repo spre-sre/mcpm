@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -43,7 +44,19 @@ func initConfig() {
 	}
 
 	viper.AutomaticEnv()
-	if err := viper.ReadInConfig(); err == nil {
-		// Config loaded
+	if err := readConfig(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
+}
+
+// readConfig loads the config file. A missing default file is normal, so
+// only other errors (malformed file, bad --config path) are returned.
+func readConfig() error {
+	err := viper.ReadInConfig()
+	var notFound viper.ConfigFileNotFoundError
+	if errors.As(err, &notFound) {
+		return nil
+	}
+	return err
 }
