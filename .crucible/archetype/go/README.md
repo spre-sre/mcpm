@@ -265,8 +265,8 @@ GOFLAGS=-trimpath=false go run ./cmd/gate-ast/main.go -json -migrate-baseline ./
    file, or local git config that redirects git or runs code (for example
    `core.hooksPath` or a `filter.*` driver); they exit 2 and name the key.
    Remove it or work in a full clone (reference/architecture.md 16.2, 16.6).
-   A repository with linked worktrees and a leftover `config.worktree` file
-   also exits 2; delete the file or set `extensions.worktreeConfig`.
+   The engine reads the worktree config only when `extensions.worktreeConfig`
+   is true (reference/architecture.md 22.1).
 5. Read every report row. Refactor each violation or accept it. A row marked
    `RAISED` or `identity unverified` needs a decision; the `genesis_line` and
    `head_line` columns show what moved.
