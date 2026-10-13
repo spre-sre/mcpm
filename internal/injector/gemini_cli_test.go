@@ -20,7 +20,11 @@ func registerDemo(t *testing.T, cwd string) error {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(orig) })
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
 
 	return Register(
 		&builder.BuildResult{
@@ -144,7 +148,11 @@ func TestNewFileWithEnvMode0600(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(orig) })
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
 
 	err = Register(
 		&builder.BuildResult{
@@ -190,7 +198,11 @@ func TestExistingFileWithEnvMode0600(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(orig) })
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
 
 	err = Register(
 		&builder.BuildResult{
@@ -254,7 +266,11 @@ func TestExistingFileWithoutEnvKeepsMode(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(orig) })
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
 
 	err = Register(
 		&builder.BuildResult{

@@ -11,10 +11,10 @@ type fakeModel struct {
 	err error
 }
 
-func (m fakeModel) Init() tea.Cmd                           { return nil }
-func (m fakeModel) Update(tea.Msg) (tea.Model, tea.Cmd)     { return m, nil }
-func (m fakeModel) View() string                            { return "" }
-func (m fakeModel) Err() error                              { return m.err }
+func (m fakeModel) Init() tea.Cmd                       { return nil }
+func (m fakeModel) Update(tea.Msg) (tea.Model, tea.Cmd) { return m, nil }
+func (m fakeModel) View() string                        { return "" }
+func (m fakeModel) Err() error                          { return m.err }
 
 type fakeModelNoErr struct{}
 

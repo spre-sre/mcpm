@@ -14,10 +14,18 @@ import (
 func TestClone_TrailingSlash(t *testing.T) {
 	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := Clone("https://github.com/org/repo/")
 	if err != nil {
@@ -32,10 +40,18 @@ func TestClone_TrailingSlash(t *testing.T) {
 func TestClone_TrailingSlashDotGit(t *testing.T) {
 	tmp, _ := filepath.EvalSymlinks(t.TempDir())
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := Clone("https://github.com/org/repo.git/")
 	if err != nil {
@@ -50,10 +66,18 @@ func TestClone_TrailingSlashDotGit(t *testing.T) {
 func TestClone_EmptyURL(t *testing.T) {
 	tmp := t.TempDir()
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Clone("")
 	if err == nil {
@@ -72,10 +96,18 @@ func TestClone_EmptyURL(t *testing.T) {
 func TestClone_SlashOnly(t *testing.T) {
 	tmp := t.TempDir()
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Clone("/")
 	if err == nil {
@@ -89,10 +121,18 @@ func TestClone_SlashOnly(t *testing.T) {
 func TestClone_DotGitOnly(t *testing.T) {
 	tmp := t.TempDir()
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Clone(".git")
 	if err == nil {
@@ -106,10 +146,18 @@ func TestClone_DotGitOnly(t *testing.T) {
 func TestClone_DotDotTraversal(t *testing.T) {
 	tmp := t.TempDir()
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(tmp)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
 
-	os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755)
+	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err := Clone("https://host/org/..")
 	if err == nil {
@@ -156,8 +204,14 @@ func TestClone_LocalRepo_Fast(t *testing.T) {
 
 	cwdDir, _ := filepath.EvalSymlinks(t.TempDir())
 	orig, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(orig) })
-	os.Chdir(cwdDir)
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(cwdDir); err != nil {
+		t.Fatal(err)
+	}
 
 	start := time.Now()
 	got, err := Clone("file://" + srcDir)
