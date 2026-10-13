@@ -6,7 +6,7 @@
     ".github/workflows/crucible.yml": "e93190e5ee067f94a7b53dee3e318816434c5be574c091ce12eb0ce3a83ffa7d",
     ".gitignore": "72b5baaa25c143ee180b57a0070782e232b355ffe0a412bdde0c4b55e0118de6",
     "bin/crucible": "002e0fdd49e87c94b2017d941002a651bdadabe17e11217a1776101c72b94607",
-    "cmd/gate-ast/main.go": "50354f194c5731a4367e8022f1817f3d852b5927ef89bbe8c58ae6b150a3a19f",
+    "cmd/gate-ast/main.go": "d8ebabaf5ba5293624ed038448a82192bf36975a9d3ea83ac97883f47ddab98c",
     "contracts/SPEC.md": "49576feee7d30942eff63483d5fda671b8300a99839a694bee86add2e0341daf",
     "contracts/mutants/INV_HOST_PORT_SPLIT-keep-colon.patch": "b6e7bf1bd84474f249bd6bc0c2161eacbd8e4bbb9f9f3aa2c35f18bc46a536c1",
     "contracts/mutants/INV_HOST_WITHOUT_PORT-multi-colon-check-removed.patch": "6d42918e1eb7272910e8a6052c1334ecb19ae74f1125be07e69b9d6c7a1d21c6",
@@ -20,7 +20,7 @@
     "harness/telemetry_math.py": "e9beaef9322f1688e22e75cf9fa56ae4d6a3f4d42384958791fe50eb0b72443e",
     "scripts/mcp_server.py": "36ff99bf677d802960a7114cd0ff41fc83a40075ea693deaf6a868342912bdb8",
     "scripts/mint_attestation.py": "11ccd1bf2a9f9f4eae1a38a3cfc797904dfe64a1f723517fa7084d8701fb9154",
-    "scripts/verify_pins.py": "dcc87f606c4dd97da3d95f337a137f23bb369335205863eec8e3067efd08a27c"
+    "scripts/verify_pins.py": "77710f3d8a446ac96b12e86557c8d47da798054fb03a8954a0f99ad651dbc1c0"
   },
   "version": 1
 }

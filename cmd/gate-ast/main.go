@@ -1387,15 +1387,27 @@ func checkShallow() error {
 	return nil
 }
 
-// localConfigKeys lists the keys of the local config and, when it exists, the
-// worktree config (includes are not followed).
+// readsWorktreeConfig reports whether git reads the worktree config: only when
+// the file exists and the local config turns extensions.worktreeConfig on. A
+// leftover file is not read (architecture 16.2 item 4).
+func readsWorktreeConfig() (bool, error) {
+	located, err := gitAnswer("rev-parse", "--git-path", "config.worktree")
+	if err != nil || !fileExists(located) {
+		return false, err
+	}
+	extension, err := gitAnswer("config", "--local", "--no-includes", "--type=bool", "--default", "false", "--get", "extensions.worktreeConfig")
+	return extension == "true", err
+}
+
+// localConfigKeys lists the keys of the local config and, when git reads it,
+// the worktree config (includes are not followed).
 func localConfigKeys() ([]string, error) {
 	scopes := []string{"--local"}
-	located, err := gitAnswer("rev-parse", "--git-path", "config.worktree")
+	worktree, err := readsWorktreeConfig()
 	if err != nil {
 		return nil, err
 	}
-	if fileExists(located) {
+	if worktree {
 		scopes = append(scopes, "--worktree")
 	}
 	var keys []string

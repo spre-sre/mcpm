@@ -1210,13 +1210,25 @@ def _config_keys(ws: Path, scope: str) -> list[str]:
     return [record.split("\n", 1)[0] for record in split_z(proc.stdout)]
 
 
+def _worktree_scope_is_read(ws: Path) -> bool:
+    """Git reads config.worktree only when the repository's own config turns
+    extensions.worktreeConfig on (an unset or false value, or the variable set by
+    GIT_CONFIG_*, leaves the file unread). Architecture 16.2 item 4."""
+    proc = _probe(ws, "config", "--local", "--no-includes", "--type=bool", "--default", "false",
+                  "--get", "extensions.worktreeConfig")
+    if proc.returncode != 0:
+        raise KitError("git config --local extensions.worktreeConfig failed: "
+                       f"{proc.stderr.decode(errors='replace').strip()}")
+    return proc.stdout.decode().strip() == "true"
+
+
 def local_config_keys(ws: Path) -> list[str]:
-    """Every key set in the repository's local config and, when the file exists,
-    its worktree config. Includes are not followed (include.path is itself a
-    dangerous key)."""
+    """Every key set in the repository's local config and, when git reads it, its
+    worktree config (only if the file exists and the extension is on). Includes
+    are not followed (include.path is itself a dangerous key)."""
     keys = set(_config_keys(ws, "--local"))
     relative = _probe_text(ws, "rev-parse", "--git-path", "config.worktree")
-    if relative is not None and os.path.lexists(ws / relative):
+    if relative is not None and os.path.lexists(ws / relative) and _worktree_scope_is_read(ws):
         keys.update(_config_keys(ws, "--worktree"))
     return sorted(keys)
 
@@ -2842,7 +2854,7 @@ def mutation_summary(check: dict) -> dict:
             "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
 
 
-KIT_VERSION = "3.2.0"  # tests/test_kit_version.py keeps this equal to the VERSION file
+KIT_VERSION = "3.2.1"  # tests/test_kit_version.py keeps this equal to the VERSION file
 MUTATION_DIRNAME = "mutation"
 PASS_FILE = "pass.json"
 ATTEMPTS_FILE = "attempts.json"
