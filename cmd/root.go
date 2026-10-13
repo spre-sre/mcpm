@@ -35,7 +35,7 @@ func initConfig() {
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		viper.AddConfigPath(home)
