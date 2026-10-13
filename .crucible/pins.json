@@ -20,7 +20,7 @@
     "harness/telemetry_math.py": "e9beaef9322f1688e22e75cf9fa56ae4d6a3f4d42384958791fe50eb0b72443e",
     "scripts/mcp_server.py": "36ff99bf677d802960a7114cd0ff41fc83a40075ea693deaf6a868342912bdb8",
     "scripts/mint_attestation.py": "11ccd1bf2a9f9f4eae1a38a3cfc797904dfe64a1f723517fa7084d8701fb9154",
-    "scripts/verify_pins.py": "77710f3d8a446ac96b12e86557c8d47da798054fb03a8954a0f99ad651dbc1c0"
+    "scripts/verify_pins.py": "013bc85d5ce8ce3476ae63fb1cdee36831974b75be3f757207f37a605e20fb92"
   },
   "version": 1
 }

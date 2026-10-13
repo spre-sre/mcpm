@@ -492,6 +492,32 @@ def _glob_list(table: dict, key: str, where: str) -> list[str]:
     return patterns
 
 
+CONTROL_LINE_HINT = "write an inline script on one line (use ';') or move it into a pinned script file"
+CONTROL_OTHER_HINT = "remove the character or move the command into a pinned script file"
+
+
+def _refuse_control(elements: list[str], where: str, key: str, command: int | None = None) -> None:
+    """Every argv key refuses C0, DEL and C1 characters in an element: a terminal acts on them when
+    the command reaches the human (the repin summary, a failure message). The message names the first
+    bad character as an escape with its code point and its position (`command` is the 1-based index
+    in a key that holds a list of argv lists). It holds no raw control character."""
+    for number, element in enumerate(elements, 1):
+        found = CONTROL_CHAR_RE.search(element)
+        if found:
+            place = (f"command {command} " if command else "") + f"element {number}"
+            hint = CONTROL_LINE_HINT if found[0] in "\n\r" else CONTROL_OTHER_HINT
+            raise ConfigError(f"{where}.{key}: {place} must not hold a control character (C0, DEL or C1): "
+                              f"found {ascii(found[0])} (U+{ord(found[0]):04X}); {hint}")
+
+
+def _argv_strings(table: dict, key: str, where: str) -> list[str]:
+    """An optional argv list of strings with no control character (`[tier1] command`, `[tier2] command`,
+    `[ast] command`). An empty element is accepted here and fails the stage that runs it."""
+    command = _string_list(table, key, where, required=False)
+    _refuse_control(command, where, key)
+    return command
+
+
 def _argv_lists(table: dict, key: str, where: str) -> list[list[str]]:
     """A list of non-empty argv lists of non-empty strings (`[ci] setup`, `[tier1] before`)."""
     value = table.get(key, [])
@@ -499,6 +525,8 @@ def _argv_lists(table: dict, key: str, where: str) -> list[list[str]]:
             isinstance(cmd, list) and cmd and all(isinstance(a, str) and a for a in cmd)
             for cmd in value):
         raise ConfigError(f"{where}.{key} must be a list of non-empty argv lists of strings")
+    for number, cmd in enumerate(value, 1):
+        _refuse_control(cmd, where, key, number)
     return [list(cmd) for cmd in value]
 
 
@@ -541,6 +569,7 @@ def _mutation_command(table: dict) -> list[str]:
     command = _string_list(table, "command", "mutation", required=False)
     if not all(command):
         raise ConfigError("mutation.command must not hold an empty string")
+    _refuse_control(command, "mutation", "command")
     return command
 
 
@@ -550,9 +579,7 @@ def _argv_command(table: dict, key: str, where: str) -> list[str]:
     command = _string_list(table, key, where, required=False)
     if not all(command):
         raise ConfigError(f"{where}.{key} must not hold an empty string")
-    if any(CONTROL_CHAR_RE.search(element) for element in command):
-        raise ConfigError(f"{where}.{key} must not hold a control character (C0, DEL or C1): "
-                          "the repin summary shows this command to the human who pins it")
+    _refuse_control(command, where, key)
     return command
 
 
@@ -617,7 +644,7 @@ def parse_config(text: str) -> dict:
                  "protected_refs": _string_list(gate, "protected_refs", "gate", required=False,
                                                 default=DEFAULT_PROTECTED_REFS),
                  "ignored_allow": _glob_list(gate, "ignored_allow", "gate")},
-        "tier1": {"command": _string_list(tier1, "command", "tier1", required=False),
+        "tier1": {"command": _argv_strings(tier1, "command", "tier1"),
                   "contract_tests": _path_list(tier1, "contract_tests", "tier1"),
                   "before": _argv_lists(tier1, "before", "tier1"),
                   "unit_command": _argv_command(tier1, "unit_command", "tier1"),
@@ -650,13 +677,13 @@ def parse_config(text: str) -> dict:
     if not isinstance(none_reason, str) or not isinstance(baseline, str) or not baseline:
         raise ConfigError("ast.none_reason and ast.baseline must be strings")
     # Every other [ast] key belongs to the AST command, not to this CLI.
-    cfg["ast"] = {"command": _string_list(ast, "command", "ast", required=False),
+    cfg["ast"] = {"command": _argv_strings(ast, "command", "ast"),
                   "none_reason": none_reason, "env": _env_table(ast, "ast"),
                   "baseline": normalize_entry(baseline, "ast.baseline"),
                   "paths": _lenient_paths(ast, "paths")}
 
     tier2_cfg = {**TIER2_DEFAULTS, **tier2}
-    tier2_cfg["command"] = _string_list(tier2, "command", "tier2", required=False)
+    tier2_cfg["command"] = _argv_strings(tier2, "command", "tier2")
     tier2_cfg["driver_paths"] = _path_list(tier2, "driver_paths", "tier2")
     tier2_cfg["build"] = _argv_command(tier2, "build", "tier2")
     tier2_cfg["env"] = _env_table(tier2, "tier2")
@@ -2854,7 +2881,7 @@ def mutation_summary(check: dict) -> dict:
             "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
 
 
-KIT_VERSION = "3.2.1"  # tests/test_kit_version.py keeps this equal to the VERSION file
+KIT_VERSION = "3.2.2"  # tests/test_kit_version.py keeps this equal to the VERSION file
 MUTATION_DIRNAME = "mutation"
 PASS_FILE = "pass.json"
 ATTEMPTS_FILE = "attempts.json"
@@ -3199,11 +3226,19 @@ def _kind_sets(cfg: dict) -> list[tuple[str, set[str], tuple[str, ...]]]:
             ("kit", set(MACHINERY) | engine, tuple(e.rstrip("/") + "/" for e in engine if "." not in posixpath.basename(e)))]
 
 
+def _shown_element(element: str) -> str:
+    """One argv element for the summary. `_shown` leaves plain ASCII alone, so the six characters
+    backslash-u-2-0-2-e would look like a real U+202E, which it escapes the same way. An element with a
+    backslash or a non-ASCII character is escaped whole: the literal backslash shows as two."""
+    quoted = shlex.quote(element)
+    return ascii(quoted)[1:-1] if "\\" in quoted or not is_plain_ascii(quoted) else quoted
+
+
 def unit_build_lines(cfg: dict) -> list[str]:
     """The repin summary lines for `[tier1] unit_command` and `[tier2] build`, only when set. The
     build command files are kind `driver` in the review rows (not the fallback kind `build`)."""
     labelled = (("unit", cfg["tier1"].get("unit_command")), ("build", cfg["tier2"].get("build")))
-    return [f"  {label:<9} {' '.join(_shown(shlex.quote(element)) for element in argv)}"
+    return [f"  {label:<9} {' '.join(_shown_element(element) for element in argv)}"
             for label, argv in labelled if argv]
 
 
