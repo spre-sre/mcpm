@@ -52,6 +52,10 @@ from verify_pins import ConfigError, KitError, PathViolation, TrustError, say  #
 EXIT_OK, EXIT_GATE, EXIT_USAGE, EXIT_TRUST, EXIT_INTERNAL = 0, 1, 2, 3, 4
 SPEC_REL = vp.SPEC_REL
 OUTPUT_TAIL_CHARS = 4000
+FAILURE_LINES_CHARS = 4000
+FAILURE_LINE_CUT = 500
+FAILURE_CONTEXT = 2
+FAILURE_HINT_CUT = 300
 AST_TIMEOUT_SECONDS = 600
 MAX_INVARIANTS = 32
 GATE_PASS_VERDICTS = ("PROCEED_CANARY_RAMP", "PROCEED_NO_BASELINE")
@@ -84,6 +88,206 @@ def fail(result: dict, stage: str | None, code: int, reason: str, verdict: str =
 
 def tail(text: str) -> str:
     return text[-OUTPUT_TAIL_CHARS:]
+
+
+# The failure markers (kit 3.2.3). A line is cut at FAILURE_LINE_CUT characters before any pattern
+# sees it, and every pattern is anchored or starts with a literal, so the match time is linear in
+# the output size even for untrusted input. They are language-neutral:
+#   Go      "--- FAIL: Name" (also indented, for a subtest), with the "=== RUN|CONT|NAME Name" windows of
+#           the SAME test before it, FAIL, panic:, file.go:LINE:COL:, and "# pkg" or "# pkg [pkg.test]"
+#           (a build error header) ONLY when the next line is a file:LINE compiler line, or "# pkg.test" (link)
+#   C/C++   file:LINE[:COL]: [fatal ]error, "tool: error:" for a compiler or linker driver name (a prefix of at most 40
+#           characters before cc, lang or ++, or the linker (ld, ld64, ld.SUFFIX, PREFIX-ld), with an optional -VERSION;
+#           cc1*, collect2, javac, as, mold), "ld: " or "/path/ld: " but not "ld: warning", "ld: x.o: warning", "ld: x.o: in function" only when the next line has no ": warning: " (a failed link prints that line before its cause line, a green link before a warning), "Undefined symbols", "undefined reference to",
+#           "make: ***"
+#   Rust    error[: |E....]:, "thread 'x' panicked at" (with the message and left/right after it)
+#   Python  Traceback, "E   " (pytest), FAILED/ERROR lines
+#   Node    "not ok N" (TAP), "●" (jest, with 6 lines after it for Expected/Received)
+#   Maven   [ERROR], BUILD FAILURE
+#   generic SomethingError: ..., error: ..., fatal: ...
+# A "--> file:LINE" line is no marker: cargo prints one for every warning. The "error[E....]:" line
+# brings its own "-->" line as context. A "name: error: text" line is a marker only for the tool names
+# above: an application log line such as "server: error: retry ok" is not one. Residual: a Go build
+# error with another header shape and no file:LINE line under it keeps the header out.
+FAILURE_PANIC_RE = re.compile(r"thread '[^']*'(?: \(\d+\))? panicked at ")
+FAILURE_JEST_RE = re.compile(r"\s*\u25cf ")
+FAILURE_TOOL_RE = (r"(?:[\w.+-]{0,40}(?:cc|lang|\+\+)|(?:[\w.+-]{0,40}-)?ld(?:64)?(?:\.\w+)?"
+                   r"|cc1\w*|collect2|javac|as|mold)(?:-[\d.]+)?: "
+                   r"(?:fatal )?error: ")
+FAILURE_START_RE = re.compile(
+    r"\s*--- FAIL|FAIL\b|panic:|\S+:\d+(?::\d+)?: (?:fatal )?error|" + FAILURE_TOOL_RE
+    + r"|error(?:\[E\d+\])?:|Traceback \(most recent call last\)|E {2,}|(?:FAILED|ERROR) |not ok \d+"
+    r"|\[ERROR\]|\s*\S+Error: |\s*(?:error|fatal):|(?:\S*/)?(?:[\w.+-]{0,40}-)?ld(?:64)?(?:\.\w+)?: "
+    r"(?!(?:\S+: )?warning|\S+: in function )|Undefined symbols|make: \*\*\* |"
+    + FAILURE_PANIC_RE.pattern + "|" + FAILURE_JEST_RE.pattern)
+FAILURE_LD_FUNCTION_RE = re.compile(r"(?:\S*/)?(?:[\w.+-]{0,40}-)?ld(?:64)?(?:\.\w+)?: \S+: in function ")
+FAILURE_INSIDE_RE = re.compile(r"\.go:\d+:\d+: |BUILD FAILURE|undefined reference to ")
+FAILURE_GO_FAIL_RE = re.compile(r"\s*--- FAIL: (\S+)")
+FAILURE_GO_STOP_RE = re.compile(r"=== |\s*--- (?:FAIL|PASS|SKIP): |\S")
+FAILURE_GO_EXAMPLE_STOP_RE = re.compile(r"=== |\s*--- (?:FAIL|PASS|SKIP): |FAIL$|FAIL\t|ok  \t")
+FAILURE_GO_PANIC_RE = re.compile(r"panic:")
+FAILURE_GO_PANIC_STOP_RE = re.compile(r"=== |FAIL\b")
+FAILURE_GO_PKGFAIL_RE = re.compile(r"FAIL\t")
+FAILURE_GO_PASSED_RE = re.compile(r"\s*--- (?:PASS|SKIP): (\S+)")
+FAILURE_GO_RESULT_RE = re.compile(r"\s*--- (?:FAIL|PASS|SKIP): ")
+FAILURE_GO_TESTBIN_RE = re.compile(r"# \S+\.test\s*$")
+FAILURE_GO_EVENT_RE = re.compile(r"=== (RUN|CONT|NAME|PAUSE)\s+(\S+)")
+FAILURE_GO_HEADER_RE = re.compile(r"# \S+(?: \[\S+\])?\s*$")
+FAILURE_GO_COMPILER_RE = re.compile(r"(?:vet: )?\S+:\d+(?::\d+)?: ")
+FAILURE_HINT_SKIP_RE = re.compile(r"\s*$|=== (?:RUN|CONT|NAME|PAUSE)\b|" + FAILURE_GO_HEADER_RE.pattern
+                                  + "|" + FAILURE_LD_FUNCTION_RE.pattern)
+FAILURE_REGEXES = (FAILURE_START_RE, FAILURE_LD_FUNCTION_RE, FAILURE_INSIDE_RE, FAILURE_PANIC_RE, FAILURE_JEST_RE,
+                   FAILURE_GO_FAIL_RE, FAILURE_GO_STOP_RE, FAILURE_GO_EXAMPLE_STOP_RE, FAILURE_GO_PANIC_RE,
+                   FAILURE_GO_PANIC_STOP_RE, FAILURE_GO_PKGFAIL_RE, FAILURE_GO_PASSED_RE, FAILURE_GO_RESULT_RE, FAILURE_GO_TESTBIN_RE, FAILURE_GO_EVENT_RE, FAILURE_GO_HEADER_RE, FAILURE_GO_COMPILER_RE,
+                   FAILURE_HINT_SKIP_RE)
+FAILURE_CONTEXT_RULES = ((FAILURE_JEST_RE, 6), (FAILURE_PANIC_RE, 3), (FAILURE_GO_PKGFAIL_RE, 0))
+FAILURE_LOOKBACK = 20
+FAILURE_GO_NAMES = 4096
+
+
+def failure_lines(text: str) -> str:
+    """The failure lines of a command's FULL output (kit 3.2.3): each line that matches a marker
+    (FAILURE_START_RE at the start, FAILURE_INSIDE_RE anywhere) plus the next FAILURE_CONTEXT lines
+    (6 after a jest "●", 3 after a Rust panic), in output order, no line twice, each cut at
+    FAILURE_LINE_CUT characters. A Go "--- FAIL: Name" (also an indented subtest line) also brings
+    the "=== RUN|CONT|NAME Name" windows of the SAME test: each opens at an event line and ends at the
+    next "=== " or result line of any test; a test keeps at most FAILURE_LOOKBACK lines in all (the LAST
+    lines of a long window), and a test that passed keeps none. `go test -v` prints t.Errorf there, and it
+    prints the subtests' results only at the end. The result holds at most FAILURE_LINES_CHARS characters and
+    keeps the EARLIEST lines; when the cap cuts, the last line reads "... (N more failure lines)".
+    "" when nothing matches. It is an aid for the reader, not a gate input."""
+    if not isinstance(text, str) or not text:
+        return ""
+    picked = pick_failure_lines([line[:FAILURE_LINE_CUT] for line in text.split("\n")])
+    while picked and not picked[-1]:     # the empty piece after a final newline is no line
+        picked.pop()
+    if len("\n".join(picked)) <= FAILURE_LINES_CHARS:
+        return "\n".join(picked)
+    reserve = len(f"... ({len(picked)} more failure lines)") + 1
+    kept, used = 0, 0
+    while kept < len(picked) and used + len(picked[kept]) + 1 + reserve <= FAILURE_LINES_CHARS:
+        used += len(picked[kept]) + 1
+        kept += 1
+    return "\n".join(picked[:kept] + [f"... ({len(picked) - kept} more failure lines)"])
+
+
+def context_after(line: str) -> int:
+    """How many lines after a marker line belong to it."""
+    for pattern, count in FAILURE_CONTEXT_RULES:
+        if pattern.match(line):
+            return count
+    return FAILURE_CONTEXT
+
+
+def context_rule(line: str) -> tuple[int, "re.Pattern | None"]:
+    """The number of context lines of a marker line and the pattern that ends them early (or None)."""
+    fail = FAILURE_GO_FAIL_RE.match(line)
+    if fail:
+        example = fail.group(1).startswith("Example")
+        return FAILURE_LOOKBACK, FAILURE_GO_EXAMPLE_STOP_RE if example else FAILURE_GO_STOP_RE
+    if FAILURE_GO_PANIC_RE.match(line):
+        return FAILURE_LOOKBACK, FAILURE_GO_PANIC_STOP_RE
+    return context_after(line), None
+
+
+def context_end(lines: list[str], index: int) -> int:
+    """The last line of a marker line's context. A Go "--- FAIL" has up to FAILURE_LOOKBACK lines
+    (without -v, go prints t.Errorf under it) and stops before a "=== " line, a "--- FAIL|PASS|SKIP: "
+    result line or a non-indented line (an "Example" test prints got/want non-indented, so it stops
+    at a "=== ", result, FAIL or "ok<2 spaces><TAB>" line instead). A Go "panic:" has up to FAILURE_LOOKBACK
+    lines (the goroutine frames) and stops before a "=== " or FAIL line."""
+    count, stop = context_rule(lines[index])
+    last = min(index + count, len(lines) - 1)
+    if stop is None:
+        return last
+    for number in range(index + 1, last + 1):
+        if stop.match(lines[number]):
+            return number - 1
+    return last
+
+
+def note_go_event(segments: dict, open_name: str | None, line: str, index: int) -> str | None:
+    """Track the Go "=== " lines and "--- PASS|FAIL|SKIP" result lines. `segments` maps a test name
+    to a list of [first line, end line or None] windows: a window opens at a RUN, CONT or NAME line
+    and ends at the next "=== " or result line of any test. A name keeps at most FAILURE_LOOKBACK
+    lines in all (the oldest window goes first; a longer window is clipped to its last lines), and a
+    "--- PASS|SKIP: Name" line removes the windows of Name. Returns the
+    name of the window that is open now. The map is cleared at FAILURE_GO_NAMES names, so the memory
+    stays bounded (an old test then loses its log lines, never its "--- FAIL" line)."""
+    if open_name in segments:
+        windows = segments[open_name]
+        windows[-1][1] = index
+        windows[-1][0] = max(windows[-1][0], index - FAILURE_LOOKBACK)
+        while sum(end - first for first, end in windows) > FAILURE_LOOKBACK:
+            windows.pop(0)
+    passed = FAILURE_GO_PASSED_RE.match(line)
+    if passed:
+        segments.pop(passed.group(1), None)
+    found = FAILURE_GO_EVENT_RE.match(line)
+    if not found or found.group(1) == "PAUSE":
+        return None
+    if found.group(2) not in segments and len(segments) >= FAILURE_GO_NAMES:
+        segments.clear()
+    segments.setdefault(found.group(2), []).append([index, None])
+    return found.group(2)
+
+
+def go_segment_of(line: str, index: int, segments: dict) -> list[tuple[int, int]]:
+    """The (first, end) windows of the test that a Go "--- FAIL: Name" line names, `end` excluded.
+    An open window ends at this line. [] when the line is no such line or the test has none."""
+    found = FAILURE_GO_FAIL_RE.match(line)
+    windows = segments.get(found.group(1)) if found else None
+    return [(first, index if end is None else end) for first, end in windows or []]
+
+
+def is_failure_line(lines: list[str], index: int) -> bool:
+    """A marker line: FAILURE_START_RE, FAILURE_INSIDE_RE, a Go "# pkg" header before a compiler line, or a
+    linker "ld: x.o: in function `f':" line whose next line is no warning."""
+    line = lines[index]
+    if FAILURE_START_RE.match(line) or FAILURE_INSIDE_RE.search(line):
+        return True
+    if FAILURE_GO_TESTBIN_RE.match(line):
+        return True
+    if FAILURE_LD_FUNCTION_RE.match(line):     # a failed link: the next line is the cause, not a warning
+        return index + 1 < len(lines) and ": warning: " not in lines[index + 1]
+    return bool(FAILURE_GO_HEADER_RE.match(line) and index + 1 < len(lines)
+                and FAILURE_GO_COMPILER_RE.match(lines[index + 1]))
+
+
+def pick_failure_lines(lines: list[str]) -> list[str]:
+    """Every marker line with its context, in output order, no line twice. A flag per line (one byte)
+    lets a Go segment, which lies before lines that are already picked, join in place."""
+    keep = bytearray(len(lines))
+    segments: dict = {}
+    open_name = None
+    for index, line in enumerate(lines):
+        if line.startswith("=== ") or FAILURE_GO_RESULT_RE.match(line):
+            open_name = note_go_event(segments, open_name, line, index)
+        if not is_failure_line(lines, index):
+            continue
+        last = context_end(lines, index)
+        keep[index:last + 1] = b"\x01" * (last + 1 - index)
+        for first, end in go_segment_of(line, index, segments):
+            keep[first:end] = b"\x01" * (end - first)
+    return [line.rstrip() for line, flag in zip(lines, keep) if flag]
+
+
+def captured(output: str) -> dict:
+    """The two report fields of one command run: the last characters and the failure lines."""
+    return {"output_tail": tail(output), "output_failures": failure_lines(output)}
+
+
+def failure_hint(failures: str, output_tail: str) -> str:
+    """A failed command's output for a reason: the first failure line that names a cause (at most
+    FAILURE_HINT_CUT characters) on its own line, then the tail as in 3.2.2. Blank lines, a Go
+    "# pkg [pkg.test]" header and a "=== RUN|CONT|NAME|PAUSE" line are skipped; when every line is
+    one of those, the first line is used. The full failure text lives only in `output_failures`.
+    Without failure lines it is the tail alone."""
+    if not failures:
+        return output_tail
+    lines = failures.split("\n")
+    first = next((line for line in lines if not FAILURE_HINT_SKIP_RE.match(line)), lines[0])
+    return f"{first[:FAILURE_HINT_CUT]}\n{output_tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +609,12 @@ def check_tier1_results(path: Path, nonce: str, names: list[str]) -> tuple[dict 
 
 
 def before_entry(argv: list[str], code, seconds: float, timed_out: bool, output: str) -> dict:
-    """One `tier1.before` report entry; a failing one also carries the output tail (R-NA-2)."""
+    """One `tier1.before` report entry; a failing one also carries the output tail (R-NA-2) and the
+    failure lines."""
     entry = {"command": argv[0], "exit_code": code, "duration_seconds": round(seconds, 3),
              "timed_out": timed_out}
     if timed_out or code != 0:
-        entry["output_tail"] = tail(output)
+        entry.update(captured(output))
     return entry
 
 
@@ -423,14 +628,14 @@ def run_before(ws: Path, cfg: dict, deadline: float) -> tuple[dict | None, list[
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             entries.append(before_entry(argv, None, 0.0, True, ""))
-            return {"exit_code": None, "output_tail": "", "timed_out": True}, entries
+            return {"exit_code": None, "output_tail": "", "output_failures": "", "timed_out": True}, entries
         code, output, timed_out, seconds = run_argv(
             vp.expand_command(argv), ws, remaining, env_extra=cfg["tier1"]["env"], ws=ws,
             env_pass=env_pass_of(cfg))
         entries.append(before_entry(argv, code, seconds, timed_out, output))
         if timed_out or code != 0:
             return {"exit_code": code, "duration_seconds": round(seconds, 3),
-                    "output_tail": tail(output), "timed_out": timed_out,
+                    **captured(output), "timed_out": timed_out,
                     "error": None if timed_out else f"dependency check failed: {argv[0]} exited {code}"
                     }, entries
     return None, entries
@@ -443,17 +648,18 @@ def unit_ok(unit: dict) -> bool:
 def run_unit(ws: Path, cfg: dict, deadline: float) -> dict | None:
     """Run `[tier1] unit_command` once (G4): the scrubbed environment plus the `[tier1] env` table, no
     CRUCIBLE_* variable, the shared Tier 1 time budget, and the process group killed afterwards. None
-    when not configured; otherwise {exit_code, duration_seconds, output_tail, timed_out}."""
+    when not configured; otherwise {exit_code, duration_seconds, output_tail, output_failures, timed_out}."""
     argv = cfg["tier1"].get("unit_command", [])
     if not argv:
         return None
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": True}
+        return {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "output_failures": "",
+                "timed_out": True}
     code, output, timed_out, seconds = run_argv(
         vp.expand_command(argv), ws, remaining, env_extra=cfg["tier1"]["env"], ws=ws,
         env_pass=env_pass_of(cfg), reap=True)
-    return {"exit_code": code, "duration_seconds": round(seconds, 3), "output_tail": tail(output),
+    return {"exit_code": code, "duration_seconds": round(seconds, 3), **captured(output),
             "timed_out": timed_out}
 
 
@@ -501,7 +707,7 @@ def tier1_in_scratch(ws: Path, cfg: dict, out: dict, names: list[str], scratch: 
         vp.expand_command(cfg["tier1"]["command"]), ws, remaining,
         env_extra={**cfg["tier1"]["env"], "CRUCIBLE_RESULTS": str(results),
                    "CRUCIBLE_RESULTS_NONCE": nonce}, ws=ws, env_pass=env_pass_of(cfg))
-    out.update(exit_code=code, duration_seconds=round(seconds, 3), output_tail=tail(output),
+    out.update(exit_code=code, duration_seconds=round(seconds, 3), **captured(output),
                timed_out=timed_out)
     if timed_out or code != 0:
         out["invariants"] = None if timed_out else check_tier1_results(results, nonce, names)[0]  # report only (R-NB-1)
@@ -525,7 +731,8 @@ def run_tier1(ws: Path, cfg: dict) -> dict:
     `[tier1] command` with the result protocol (section 11.1): a results path in a fresh temp directory outside the repository and a
     random nonce. Tier 1 passes only if every check and the command exit 0 and the results validate."""
     command = cfg["tier1"]["command"]
-    out = {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "timed_out": False,
+    out = {"exit_code": None, "duration_seconds": 0.0, "output_tail": "", "output_failures": "",
+           "timed_out": False,
            "invariants": None, "before": [], "unit": None}
     if not command or not all(isinstance(c, str) and c for c in command):
         return {**out, "error": "tier1.command is empty or missing (fail closed)"}
@@ -543,7 +750,8 @@ def tier1_report(tier1: dict) -> dict:
     """The Tier 1 fields of the result and of the token: the four 3.0 keys, then `error` (None when
     there is none), the `before` entries (R-NA-1, R-NA-2) and the `unit` object (None when the step
     did not run, R-G4-8)."""
-    report = {k: tier1[k] for k in ("exit_code", "duration_seconds", "output_tail", "invariants")}
+    report = {k: tier1[k] for k in ("exit_code", "duration_seconds", "output_tail", "output_failures",
+                                    "invariants")}
     return {**report, "error": tier1.get("error"), "before": tier1.get("before", []),
             "unit": tier1.get("unit")}
 
@@ -746,7 +954,8 @@ def run_driver(ws: Path, tree: Path, command: list[str], rules, samples: int, se
     if timed_out:
         raise TimeoutError("the telemetry driver timed out")
     if code != 0:
-        raise KitError(f"telemetry driver exited with {code}: {tail(output)[-500:]}")
+        raise KitError(f"telemetry driver exited with {code}: "
+                       f"{failure_hint(failure_lines(output), tail(output)[-500:])}")
     return validate_driver_output(out, samples)
 
 
@@ -858,7 +1067,7 @@ def build_side(ws: Path, tree: Path, cfg: dict, rules, env_pass) -> dict:
     code, output, timed_out, seconds = run_argv(
         command_for(ws, tier2["build"], tree, rules), tree, tier2["build_timeout_seconds"],
         env_extra=tier2["env"], ws=ws, env_pass=env_pass, reap=True)
-    return {"exit_code": code, "duration_seconds": round(seconds, 3), "output_tail": tail(output),
+    return {"exit_code": code, "duration_seconds": round(seconds, 3), **captured(output),
             "timed_out": timed_out}
 
 
@@ -870,7 +1079,7 @@ def build_failure(out: dict, side: str, build: dict, budget: float) -> bool:
                    reasons=[f"{name} build timed out after {budget:g} seconds"])
     elif build["exit_code"] != 0:
         more = ("; check the toolchain and the dependency cache; HEAD changes only through a promotion"
-                if side == "baseline" else f": {build['output_tail'][-500:]}")
+                if side == "baseline" else f": {failure_hint(build['output_failures'], build['output_tail'][-500:])}")
         out.update(verdict="ERROR_TIER2", stage="build",
                    reasons=[f"{name} build exited {build['exit_code']}{more}"])
     return out.get("stage") in ("build", "timeout")
@@ -1221,7 +1430,7 @@ def run_once(ws: Path, cfg: dict, rules, tree: dict, paths: list[str], scratch: 
     results = scratch / f"results-{secrets.token_hex(8)}.json"
     nonce = secrets.token_hex(16)
     run = {"exit_code": None, "timed_out": False, "seconds": 0.0, "report": None, "problems": [],
-           "error": None, "output_tail": "", "skipped": []}
+           "error": None, "output_tail": "", "output_failures": "", "skipped": []}
     try:
         try:
             run["skipped"] = copy_tree(ws, rules, tree, paths, copy, edit)
@@ -1247,7 +1456,8 @@ def run_in_copy(ws: Path, cfg: dict, rules, copy: Path, results: Path, nonce: st
     code, output, timed_out, seconds = run_argv(mutation_command(ws, cfg, rules, copy), copy,
                                                 min(timeout, remaining), env_extra=env, ws=ws,
                                                 env_pass=env_pass_of(cfg))
-    run.update(exit_code=code, timed_out=timed_out, seconds=round(seconds, 3), output_tail=tail(output)[-500:])
+    run.update(exit_code=code, timed_out=timed_out, seconds=round(seconds, 3), output_tail=tail(output)[-500:],
+               output_failures=failure_lines(output))
     if not timed_out:
         run["report"], run["problems"] = check_tier1_results(results, nonce, names)
 
@@ -1379,6 +1589,7 @@ def public_run(run: dict) -> dict:
                     if isinstance(entry, dict)}
     if run["outcome"] not in ("pass", "killed"):
         out["output_tail"] = run["output_tail"]
+        out["output_failures"] = run["output_failures"]
     return out
 
 
@@ -2260,7 +2471,7 @@ def run_ci_setup(ws: Path, cfg: dict) -> str | None:
                     f"{cfg['ci']['timeout_seconds']} seconds")
         if code != 0:
             return f"[ci] setup command {number} ({argv[0]}) exited with {code}: " \
-                   f"{tail(output)[-500:]}"
+                   f"{failure_hint(failure_lines(output), tail(output)[-500:])}"
     return None
 
 

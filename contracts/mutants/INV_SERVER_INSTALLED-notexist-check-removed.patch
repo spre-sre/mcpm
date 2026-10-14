@@ -2,9 +2,9 @@ Crucible-Mutant: INV_SERVER_INSTALLED
 Description: never report a missing server directory as not found
 
 diff --git a/internal/fetcher/git.go b/internal/fetcher/git.go
-index 2e71e18..0df30be 100644
+index 2a67858..1d0836a 100644
 --- a/internal/fetcher/git.go
 +++ b/internal/fetcher/git.go
-@@ -82 +82 @@ func GetServerPath(name string) (string, error) {
+@@ -108 +108 @@ func GetServerPath(name string) (string, error) {
 -	if _, err := os.Stat(serverPath); os.IsNotExist(err) {
 +	if _, err := os.Stat(serverPath); false && os.IsNotExist(err) {
