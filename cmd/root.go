@@ -25,16 +25,24 @@ func Execute() {
 }
 
 // run executes the root command with args and returns the process exit code.
-// A failure is printed once to stderr. Commands write their own output with
-// fmt to os.Stdout, so the stdout writer is not used here.
-func run(args []string, _, stderr io.Writer) int {
+// Cobra's help goes to stdout. After a failure nothing goes to stdout: the
+// usage (unless the command set SilenceUsage) and one error line go to stderr.
+func run(args []string, stdout, stderr io.Writer) int {
 	rootCmd.SetArgs(args)
+	rootCmd.SetOut(stdout)
 	rootCmd.SetErr(stderr)
+	rootCmd.SilenceUsage = true
 	defer func() {
 		rootCmd.SetArgs(nil)
+		rootCmd.SetOut(nil)
 		rootCmd.SetErr(nil)
+		rootCmd.SilenceUsage = false
 	}()
-	if err := rootCmd.Execute(); err != nil {
+	cmd, err := rootCmd.ExecuteC()
+	if err != nil {
+		if cmd != nil && !cmd.SilenceUsage {
+			fmt.Fprint(stderr, cmd.UsageString())
+		}
 		fmt.Fprintf(stderr, "Error: %v\n", err)
 		return 1
 	}
