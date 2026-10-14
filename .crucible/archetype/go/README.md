@@ -391,7 +391,7 @@ command and before the contract command. It gets the scrubbed environment and th
 `CRUCIBLE_*` variable; the results directory and the nonce are created only after it has ended, and any process left
 in its process group is killed. It shares the Tier 1 `timeout_seconds` budget. A failure stops `verify`,
 `preflight` and `ci` at stage `tier1-unit` with the reason `unit tests failed: <argv0> exited <N>`; no token is
-issued, and `tier1.unit` in the JSON result holds its `exit_code`, `duration_seconds`, `output_tail` and `timed_out`.
+issued, and `tier1.unit` in the JSON result holds its `exit_code`, `duration_seconds`, `output_tail`, `output_failures` and `timed_out`.
 A repository file named in the command is in the command closure, so it must be pinned; a source directory is the
 code under test and stays allowed. The mutation stage does not run it: the contract tests alone must kill each
 mutant. A new `unit_command` is a config change, so a human repins; the repin summary shows it as a `unit` line.
