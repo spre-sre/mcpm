@@ -1,12 +1,38 @@
 package cmd
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/viper"
 )
+
+func TestRunArgumentErrorPrintedOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldCfg := cfgFile
+	cfgFile = ""
+	viper.Reset()
+	t.Cleanup(func() {
+		cfgFile = oldCfg
+		viper.Reset()
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"remove"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	const msg = "accepts 1 arg(s), received 0"
+	if n := strings.Count(stderr.String(), msg); n != 1 {
+		t.Errorf("stderr has %d occurrences of %q, want 1:\n%s", n, msg, stderr.String())
+	}
+	if strings.Contains(stdout.String(), msg) {
+		t.Errorf("stdout contains %q:\n%s", msg, stdout.String())
+	}
+}
 
 func TestReadConfig(t *testing.T) {
 	tests := []struct {

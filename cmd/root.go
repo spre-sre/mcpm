@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -15,13 +16,29 @@ var rootCmd = &cobra.Command{
 	Use:   "mcpm",
 	Short: "Model Context Protocol Manager",
 	Long:  `A CLI to manage Model Context Protocol (MCP) servers for Claude Code and Gemini CLI.`,
+
+	SilenceErrors: true,
 }
 
 func Execute() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run executes the root command with args and returns the process exit code.
+// A failure is printed once to stderr. Commands write their own output with
+// fmt to os.Stdout, so the stdout writer is not used here.
+func run(args []string, _, stderr io.Writer) int {
+	rootCmd.SetArgs(args)
+	rootCmd.SetErr(stderr)
+	defer func() {
+		rootCmd.SetArgs(nil)
+		rootCmd.SetErr(nil)
+	}()
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "Error: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
 func init() {
