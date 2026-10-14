@@ -37,6 +37,55 @@ func TestRunArgumentErrorPrintedOnce(t *testing.T) {
 	}
 }
 
+func TestRunRootErrorPrintsRootUsage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldCfg := cfgFile
+	cfgFile = ""
+	viper.Reset()
+	t.Cleanup(func() {
+		cfgFile = oldCfg
+		viper.Reset()
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--bogus"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+	out := stderr.String()
+	for _, s := range []string{"Usage:", "Usage:\n  mcpm [command]\n", "Error: unknown flag: --bogus"} {
+		if n := strings.Count(out, s); n != 1 {
+			t.Errorf("stderr has %d occurrences of %q, want 1:\n%s", n, s, out)
+		}
+	}
+	if strings.Index(out, "Usage:") > strings.Index(out, "Error: ") {
+		t.Errorf("usage should come before the error line:\n%s", out)
+	}
+}
+
+func TestRunRestoresSilenceUsage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldCfg := cfgFile
+	oldSilence := rootCmd.SilenceUsage
+	cfgFile = ""
+	viper.Reset()
+	t.Cleanup(func() {
+		cfgFile = oldCfg
+		rootCmd.SilenceUsage = oldSilence
+		viper.Reset()
+	})
+
+	rootCmd.SilenceUsage = true
+	var stdout, stderr bytes.Buffer
+	run([]string{"--bogus"}, &stdout, &stderr)
+	if !rootCmd.SilenceUsage {
+		t.Error("rootCmd.SilenceUsage = false after run, want true")
+	}
+}
+
 func TestRunHelpGoesToStdout(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	oldCfg := cfgFile

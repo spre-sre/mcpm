@@ -31,16 +31,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	rootCmd.SetArgs(args)
 	rootCmd.SetOut(stdout)
 	rootCmd.SetErr(stderr)
+	rootSilenced := rootCmd.SilenceUsage
 	rootCmd.SilenceUsage = true
 	defer func() {
 		rootCmd.SetArgs(nil)
 		rootCmd.SetOut(nil)
 		rootCmd.SetErr(nil)
-		rootCmd.SilenceUsage = false
+		rootCmd.SilenceUsage = rootSilenced
 	}()
 	cmd, err := rootCmd.ExecuteC()
 	if err != nil {
-		if cmd != nil && !cmd.SilenceUsage {
+		// run silenced rootCmd itself, so use its saved value for it.
+		silenced := cmd != nil && cmd.SilenceUsage
+		if cmd == rootCmd {
+			silenced = rootSilenced
+		}
+		if cmd != nil && !silenced {
 			fmt.Fprint(stderr, cmd.UsageString())
 		}
 		fmt.Fprintf(stderr, "Error: %v\n", err)
