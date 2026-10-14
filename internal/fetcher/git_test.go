@@ -303,8 +303,7 @@ func TestClone_ExistingNotGitRepo(t *testing.T) {
 func TestClone_ExistingNoOrigin(t *testing.T) {
 	tmp := chdirTemp(t)
 	dir := filepath.Join(tmp, ".mcp", "servers", "repo")
-	repo, err := git.PlainInit(dir, false)
-	if err != nil {
+	if _, err := git.PlainInit(dir, false); err != nil {
 		t.Fatalf("PlainInit: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep\n"), 0644); err != nil {
@@ -329,7 +328,7 @@ func TestClone_ExistingNoOrigin(t *testing.T) {
 	}
 	before := listing()
 
-	_, err = Clone("https://github.com/org/repo")
+	_, err := Clone("file://" + filepath.ToSlash(filepath.Join(tmp, "origin", "repo")))
 	if err == nil {
 		t.Fatal("expected error for repository without origin")
 	}
@@ -345,7 +344,7 @@ func TestClone_ExistingNoOrigin(t *testing.T) {
 	if err != nil || string(data) != "keep\n" {
 		t.Fatalf("keep.txt changed: %q, %v", data, err)
 	}
-	repo, err = git.PlainOpen(dir)
+	repo, err := git.PlainOpen(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
