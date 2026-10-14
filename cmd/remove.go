@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"mcpm/internal/fetcher"
+
 	"github.com/spf13/cobra"
 )
 
@@ -14,6 +16,7 @@ var (
 	removeClaudeCode bool
 	removeGeminiCLI  bool
 	removeGlobal     bool
+	removePurge      bool
 )
 
 var removeCmd = &cobra.Command{
@@ -32,7 +35,10 @@ Examples:
   mcpm remove myserver --gemini
 
   # Remove from global configuration
-  mcpm remove myserver --global`,
+  mcpm remove myserver --global
+
+  # Also delete the cloned server from .mcp/servers
+  mcpm remove myserver --purge`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
@@ -54,33 +60,49 @@ Examples:
 		errs := make(map[string]error)
 
 		if removeClaudeCode {
-			if err := removeFromClaudeCode(cwd, name, scope); err != nil {
-				fmt.Fprintf(os.Stderr, "Error removing from Claude Code: %v\n", err)
-				errs["Claude Code"] = err
-			} else {
-				if removeGlobal {
-					fmt.Printf("Removed %s from Claude Code (global)\n", name)
-				} else {
-					fmt.Printf("Removed %s from Claude Code\n", name)
-				}
-			}
+			reportRemove("Claude Code", name, removeFromClaudeCode(cwd, name, scope), errs)
 		}
 
 		if removeGeminiCLI {
-			if err := removeFromGeminiCLI(cwd, name, removeGlobal); err != nil {
-				fmt.Fprintf(os.Stderr, "Error removing from Gemini CLI: %v\n", err)
-				errs["Gemini CLI"] = err
-			} else {
-				if removeGlobal {
-					fmt.Printf("Removed %s from Gemini CLI (global)\n", name)
-				} else {
-					fmt.Printf("Removed %s from Gemini CLI\n", name)
-				}
-			}
+			reportRemove("Gemini CLI", name, removeFromGeminiCLI(cwd, name, removeGlobal), errs)
 		}
 
-		return clientFailures("remove", errs)
+		clientErr := clientFailures("remove", errs)
+
+		if removePurge {
+			return purgeServer(name, clientErr)
+		}
+
+		return clientErr
 	},
+}
+
+// reportRemove prints the outcome of one client removal and records failures.
+func reportRemove(client, name string, err error, errs map[string]error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error removing from %s: %v\n", client, err)
+		errs[client] = err
+		return
+	}
+	if removeGlobal {
+		fmt.Printf("Removed %s from %s (global)\n", name, client)
+	} else {
+		fmt.Printf("Removed %s from %s\n", name, client)
+	}
+}
+
+// purgeServer deletes the server directory and combines any purge failure
+// with the earlier client failure.
+func purgeServer(name string, clientErr error) error {
+	if err := fetcher.RemoveServer(name); err != nil {
+		fmt.Fprintf(os.Stderr, "Error purging server: %v\n", err)
+		if clientErr != nil {
+			return fmt.Errorf("%w; purge failed: %v", clientErr, err)
+		}
+		return fmt.Errorf("failed to purge server: %w", err)
+	}
+	fmt.Printf("Deleted .mcp/servers/%s\n", name)
+	return clientErr
 }
 
 func removeFromClaudeCode(cwd, name, scope string) error {
@@ -155,5 +177,6 @@ func init() {
 	removeCmd.Flags().BoolVar(&removeClaudeCode, "claude", false, "Remove only from Claude Code")
 	removeCmd.Flags().BoolVar(&removeGeminiCLI, "gemini", false, "Remove only from Gemini CLI")
 	removeCmd.Flags().BoolVarP(&removeGlobal, "global", "g", false, "Remove from global configuration")
+	removeCmd.Flags().BoolVar(&removePurge, "purge", false, "Also delete the server directory from .mcp/servers")
 	rootCmd.AddCommand(removeCmd)
 }
