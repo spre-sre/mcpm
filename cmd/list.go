@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -17,26 +19,55 @@ var listCmd = &cobra.Command{
 Examples:
   mcpm list`,
 	Run: func(cmd *cobra.Command, args []string) {
-		servers, err := fetcher.ListServers()
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
+		asJSON, _ := cmd.Flags().GetBool("json")
+		if err := writeList(os.Stdout, asJSON); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
-		}
-
-		if len(servers) == 0 {
-			fmt.Println("No servers installed in .mcp/servers/")
-			return
-		}
-
-		cwd, _ := os.Getwd()
-		fmt.Println("Installed MCP servers:")
-		for _, name := range servers {
-			serverPath := filepath.Join(cwd, ".mcp", "servers", name)
-			fmt.Printf("  • %s (%s)\n", name, serverPath)
 		}
 	},
 }
 
+type listEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// writeList writes the installed servers to w, as a JSON array or as text.
+func writeList(w io.Writer, asJSON bool) error {
+	servers, err := fetcher.ListServers()
+	if err != nil {
+		return err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	entries := make([]listEntry, 0, len(servers))
+	for _, name := range servers {
+		entries = append(entries, listEntry{Name: name, Path: filepath.Join(cwd, ".mcp", "servers", name)})
+	}
+
+	if asJSON {
+		return json.NewEncoder(w).Encode(entries)
+	}
+
+	if len(entries) == 0 {
+		_, err = fmt.Fprintln(w, "No servers installed in .mcp/servers/")
+		return err
+	}
+	if _, err = fmt.Fprintln(w, "Installed MCP servers:"); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if _, err = fmt.Fprintf(w, "  • %s (%s)\n", e.Name, e.Path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func init() {
+	listCmd.Flags().Bool("json", false, "Print installed servers as a JSON array")
 	rootCmd.AddCommand(listCmd)
 }
