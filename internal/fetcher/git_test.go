@@ -300,6 +300,64 @@ func TestClone_ExistingNotGitRepo(t *testing.T) {
 	}
 }
 
+func TestClone_ExistingNoOrigin(t *testing.T) {
+	tmp := chdirTemp(t)
+	dir := filepath.Join(tmp, ".mcp", "servers", "repo")
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("PlainInit: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	listing := func() []string {
+		var names []string
+		err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() && d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			names = append(names, p)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
+	before := listing()
+
+	_, err = Clone("https://github.com/org/repo")
+	if err == nil {
+		t.Fatal("expected error for repository without origin")
+	}
+	if !strings.Contains(err.Error(), "has no origin remote") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	after := listing()
+	if strings.Join(before, "\n") != strings.Join(after, "\n") {
+		t.Fatalf("directory changed: %v -> %v", before, after)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "keep.txt"))
+	if err != nil || string(data) != "keep\n" {
+		t.Fatalf("keep.txt changed: %q, %v", data, err)
+	}
+	repo, err = git.PlainOpen(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remotes, err := repo.Remotes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotes) != 0 {
+		t.Fatalf("expected no remotes, got %d", len(remotes))
+	}
+}
+
 func TestClone_LocalRepo_Fast(t *testing.T) {
 	srcDir, _ := filepath.EvalSymlinks(t.TempDir())
 	repo, err := git.PlainInit(srcDir, false)

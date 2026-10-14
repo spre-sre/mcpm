@@ -78,6 +78,26 @@ func TestWriteListJSONServers(t *testing.T) {
 	}
 }
 
+func TestWriteListServersIsFile(t *testing.T) {
+	dir := chdirTemp(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".mcp", "servers"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, asJSON := range []bool{true, false} {
+		var buf bytes.Buffer
+		if err := writeList(&buf, asJSON); err == nil {
+			t.Fatalf("asJSON=%v: expected error", asJSON)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("asJSON=%v: expected no output, got %q", asJSON, buf.String())
+		}
+	}
+}
+
 func TestWriteListText(t *testing.T) {
 	dir := chdirTemp(t)
 
