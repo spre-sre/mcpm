@@ -29,8 +29,9 @@ func Clone(url string) (string, error) {
 	targetPath := filepath.Join(baseDir, repoName)
 
 	if _, err := os.Stat(targetPath); err == nil {
-		// Directory exists, try to pull? For now, let's just error or return existing
-		// Returning existing path assuming it's already there
+		if err := checkExisting(targetPath, repoName, url); err != nil {
+			return "", err
+		}
 		return targetPath, nil
 	}
 
@@ -45,6 +46,31 @@ func Clone(url string) (string, error) {
 	}
 
 	return targetPath, nil
+}
+
+// checkExisting verifies that the repository at path was cloned from url.
+func checkExisting(path, repoName, url string) error {
+	repo, err := git.PlainOpen(path)
+	if err != nil {
+		return fmt.Errorf("server '%s' exists but is not a git repository: %w", repoName, err)
+	}
+	remote, err := repo.Remote("origin")
+	if err != nil {
+		return fmt.Errorf("server '%s' has no origin remote: %w", repoName, err)
+	}
+	urls := remote.Config().URLs
+	if len(urls) == 0 {
+		return fmt.Errorf("server '%s' has no origin remote URL", repoName)
+	}
+	if normalizeURL(urls[0]) != normalizeURL(url) {
+		return fmt.Errorf("server '%s' is already installed from %s", repoName, urls[0])
+	}
+	return nil
+}
+
+func normalizeURL(url string) string {
+	url = strings.TrimSuffix(url, "/")
+	return strings.TrimSuffix(url, ".git")
 }
 
 // Pull updates from remote for an existing repository

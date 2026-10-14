@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -23,9 +24,7 @@ func TestClone_TrailingSlash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	initWithOrigin(t, filepath.Join(tmp, ".mcp", "servers", "repo"), "https://github.com/org/repo")
 
 	got, err := Clone("https://github.com/org/repo/")
 	if err != nil {
@@ -49,9 +48,7 @@ func TestClone_TrailingSlashDotGit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(tmp, ".mcp", "servers", "repo"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	initWithOrigin(t, filepath.Join(tmp, ".mcp", "servers", "repo"), "https://github.com/org/repo")
 
 	got, err := Clone("https://github.com/org/repo.git/")
 	if err != nil {
@@ -170,6 +167,136 @@ func TestClone_DotDotTraversal(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(tmp, ".mcp", "servers"))
 	if len(entries) != 0 {
 		t.Fatalf("expected no entries under .mcp/servers, got %d", len(entries))
+	}
+}
+
+func initWithOrigin(t *testing.T, dir, url string) {
+	t.Helper()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("PlainInit: %v", err)
+	}
+	if _, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{url}}); err != nil {
+		t.Fatalf("CreateRemote: %v", err)
+	}
+}
+
+func makeSourceRepo(t *testing.T, dir string) {
+	t.Helper()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatalf("PlainInit: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("hello.txt"); err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "Test", Email: "test@test.com", When: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)}
+	if _, err := wt.Commit("init", &git.CommitOptions{Author: sig}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chdirTemp(t *testing.T) string {
+	t.Helper()
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	orig, _ := os.Getwd()
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestClone_SameURLTwice(t *testing.T) {
+	src, _ := filepath.EvalSymlinks(t.TempDir())
+	makeSourceRepo(t, src)
+	chdirTemp(t)
+
+	first, err := Clone("file://" + src)
+	if err != nil {
+		t.Fatalf("first Clone: %v", err)
+	}
+	second, err := Clone("file://" + src)
+	if err != nil {
+		t.Fatalf("second Clone: %v", err)
+	}
+	if first != second {
+		t.Fatalf("paths differ: %q vs %q", first, second)
+	}
+}
+
+func TestClone_DifferentRepoSameName(t *testing.T) {
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	srcA := filepath.Join(root, "alice", "tools")
+	srcB := filepath.Join(root, "bob", "tools")
+	for _, d := range []string{srcA, srcB} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		makeSourceRepo(t, d)
+	}
+	chdirTemp(t)
+
+	first, err := Clone("file://" + srcA)
+	if err != nil {
+		t.Fatalf("first Clone: %v", err)
+	}
+	head := func() string {
+		r, err := git.PlainOpen(first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := r.Head()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h.Hash().String()
+	}
+	before := head()
+
+	_, err = Clone("file://" + srcB)
+	if err == nil {
+		t.Fatal("expected error for different repository with same name")
+	}
+	want := "server 'tools' is already installed from file://" + srcA
+	if err.Error() != want {
+		t.Fatalf("got %q, want %q", err.Error(), want)
+	}
+	if after := head(); after != before {
+		t.Fatalf("existing clone changed: %s -> %s", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(first, "hello.txt")); err != nil {
+		t.Fatalf("existing clone modified: %v", err)
+	}
+}
+
+func TestClone_ExistingNotGitRepo(t *testing.T) {
+	tmp := chdirTemp(t)
+	dir := filepath.Join(tmp, ".mcp", "servers", "repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Clone("https://github.com/org/repo")
+	if err == nil {
+		t.Fatal("expected error for non-git directory")
+	}
+	if !strings.Contains(err.Error(), "not a git repository") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Fatalf("existing directory changed: %v", statErr)
 	}
 }
 
