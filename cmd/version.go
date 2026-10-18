@@ -29,13 +29,46 @@ func resolveVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 	return "dev"
 }
 
-// versionCmd prints the same line as cobra's root --version flag.
+// buildSetting returns the value of key in the build info settings, or "" when
+// the build info is missing or the key is absent.
+func buildSetting(info *debug.BuildInfo, key string) string {
+	if info == nil {
+		return ""
+	}
+	for _, s := range info.Settings {
+		if s.Key == key {
+			return s.Value
+		}
+	}
+	return ""
+}
+
+// vcsLines returns the "commit:" and "built:" lines for the VCS revision and
+// time stamped in the build info, verbatim; a missing or empty value adds no line.
+func vcsLines(read func() (*debug.BuildInfo, bool)) string {
+	info, ok := read()
+	if !ok {
+		return ""
+	}
+	out := ""
+	if rev := buildSetting(info, "vcs.revision"); rev != "" {
+		out += "commit: " + rev + "\n"
+	}
+	if t := buildSetting(info, "vcs.time"); t != "" {
+		out += "built: " + t + "\n"
+	}
+	return out
+}
+
+// versionCmd prints the same line as cobra's root --version flag, then the
+// VCS commit and build date when the build info has them.
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version",
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s version %s\n", cmd.Root().Name(), cmd.Root().Version)
+		fmt.Fprint(cmd.OutOrStdout(), vcsLines(debug.ReadBuildInfo))
 	},
 }
 
