@@ -29,7 +29,8 @@ Examples:
 
   # Update and re-register globally
   mcpm update server-filesystem --global`,
-	Args: cobra.MaximumNArgs(1),
+	Args:              cobra.MaximumNArgs(1),
+	ValidArgsFunction: completeServerNames,
 	Run: func(cmd *cobra.Command, args []string) {
 		if updateAll {
 			servers, err := fetcher.ListServers()

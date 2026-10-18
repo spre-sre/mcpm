@@ -39,7 +39,8 @@ Examples:
 
   # Also delete the cloned server from .mcp/servers
   mcpm remove myserver --purge`,
-	Args: cobra.ExactArgs(1),
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeServerNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
 
