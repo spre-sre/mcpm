@@ -75,9 +75,14 @@ func updateAllServers(update func(name string, global bool) error) bool {
 		return true
 	}
 
+	verb := "Updating"
+	if updateDryRun {
+		verb = "Would update"
+	}
+
 	ok := true
 	for _, name := range servers {
-		fmt.Printf("Updating %s...\n", name)
+		fmt.Printf("%s %s...\n", verb, name)
 		if err := update(name, updateGlobal); err != nil {
 			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
 			ok = false

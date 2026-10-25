@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,6 +122,48 @@ func TestUpdateAllServersDryRun(t *testing.T) {
 
 	if !updateAllServers(dryRunUpdate) {
 		t.Fatal("updateAllServers reported a failure")
+	}
+}
+
+// captureStdout returns what fn writes to os.Stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		data, _ := io.ReadAll(r)
+		done <- string(data)
+	}()
+	defer func() { os.Stdout = old }()
+	fn()
+	w.Close()
+	return <-done
+}
+
+func TestUpdateAllServersDryRunOutput(t *testing.T) {
+	dir := chdirTemp(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp", "servers", "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldAll, oldGlobal, oldDry := updateAll, updateGlobal, updateDryRun
+	t.Cleanup(func() { updateAll, updateGlobal, updateDryRun = oldAll, oldGlobal, oldDry })
+	updateAll, updateGlobal, updateDryRun = true, false, true
+
+	out := captureStdout(t, func() { updateCmd.Run(updateCmd, nil) })
+	for _, want := range []string{"Would update a...", "Would pull latest changes into", "re-register it (local)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"Updating a", "Updated successfully", "Pulling"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("dry-run output contains %q:\n%s", unwanted, out)
+		}
 	}
 }
 

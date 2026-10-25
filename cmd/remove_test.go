@@ -72,6 +72,59 @@ func TestDryRunRemoveReportsFailures(t *testing.T) {
 	}
 }
 
+func TestRemoveCmdDryRunOutput(t *testing.T) {
+	dir := chdirTemp(t)
+	gemDir := filepath.Join(dir, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settings := []byte(`{"mcpServers": {"srv": {"command": "x"}}}`)
+	settingsPath := filepath.Join(gemDir, "settings.json")
+	if err := os.WriteFile(settingsPath, settings, 0644); err != nil {
+		t.Fatal(err)
+	}
+	server := filepath.Join(dir, ".mcp", "servers", "srv")
+	if err := os.MkdirAll(server, 0755); err != nil {
+		t.Fatal(err)
+	}
+	setRemoveFlags(t, true, true, false, true)
+	oldDry := removeDryRun
+	oldSilence := removeCmd.SilenceUsage
+	t.Cleanup(func() {
+		removeDryRun = oldDry
+		removeCmd.SilenceUsage = oldSilence
+	})
+	removeDryRun = true
+
+	var runErr error
+	out := captureStdout(t, func() { runErr = removeCmd.RunE(removeCmd, []string{"srv"}) })
+	if runErr != nil {
+		t.Fatalf("remove --dry-run: %v", runErr)
+	}
+	for _, want := range []string{
+		"Would run: claude mcp remove --scope local srv",
+		"Would remove srv from Gemini CLI (" + settingsPath + ")",
+		"Would delete .mcp/servers/srv",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Removed") || strings.Contains(out, "Deleted") {
+		t.Errorf("dry-run output reports a change:\n%s", out)
+	}
+	got, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(settings) {
+		t.Errorf("settings changed: %s", got)
+	}
+	if _, err := os.Stat(server); err != nil {
+		t.Errorf("server directory removed: %v", err)
+	}
+}
+
 func TestRemoveCmdDryRunFlag(t *testing.T) {
 	f := removeCmd.Flags().Lookup("dry-run")
 	if f == nil {
