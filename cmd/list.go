@@ -17,10 +17,18 @@ var listCmd = &cobra.Command{
 	Long: `List all MCP servers installed in the current directory's .mcp/servers/ folder.
 
 Examples:
-  mcpm list`,
+  mcpm list
+  mcpm list --names`,
 	Run: func(cmd *cobra.Command, args []string) {
 		asJSON, _ := cmd.Flags().GetBool("json")
-		if err := writeList(os.Stdout, asJSON); err != nil {
+		names, _ := cmd.Flags().GetBool("names")
+		var err error
+		if names {
+			err = writeNames(os.Stdout)
+		} else {
+			err = writeList(os.Stdout, asJSON)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -67,7 +75,23 @@ func writeList(w io.Writer, asJSON bool) error {
 	return nil
 }
 
+// writeNames writes the installed server names to w, one per line.
+func writeNames(w io.Writer) error {
+	servers, err := fetcher.ListServers()
+	if err != nil {
+		return err
+	}
+	for _, name := range servers {
+		if _, err = fmt.Fprintln(w, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func init() {
 	listCmd.Flags().Bool("json", false, "Print installed servers as a JSON array")
+	listCmd.Flags().Bool("names", false, "Print only the installed server names, one per line")
+	listCmd.MarkFlagsMutuallyExclusive("json", "names")
 	rootCmd.AddCommand(listCmd)
 }

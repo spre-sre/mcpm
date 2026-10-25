@@ -122,3 +122,59 @@ func TestWriteListText(t *testing.T) {
 		t.Fatalf("got %q, want %q", buf.String(), want)
 	}
 }
+
+func TestWriteNames(t *testing.T) {
+	dir := chdirTemp(t)
+
+	var buf bytes.Buffer
+	if err := writeNames(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected no output, got %q", buf.String())
+	}
+
+	servers := filepath.Join(dir, ".mcp", "servers")
+	for _, n := range []string{"alpha", "beta"} {
+		if err := os.MkdirAll(filepath.Join(servers, n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(servers, "file.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := writeNames(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), "alpha\nbeta\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestWriteNamesServersIsFile(t *testing.T) {
+	dir := chdirTemp(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".mcp", "servers"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := writeNames(&buf); err == nil {
+		t.Fatal("expected error")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected no output, got %q", buf.String())
+	}
+}
+
+func TestListNamesFlag(t *testing.T) {
+	f := listCmd.Flags().Lookup("names")
+	if f == nil {
+		t.Fatal("list has no --names flag")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("--names default = %q, want false", f.DefValue)
+	}
+}
