@@ -97,8 +97,12 @@ func TestBuildRepoCmdManifest(t *testing.T) {
 
 func TestBuildRepoCmdUnknownProject(t *testing.T) {
 	msg := buildRepoCmd(t.TempDir())()
-	if _, ok := msg.(msgError); !ok {
-		t.Fatalf("expected msgError, got %T", msg)
+	got, ok := msg.(msgBuilt)
+	if !ok {
+		t.Fatalf("expected msgBuilt, got %T (%v)", msg, msg)
+	}
+	if got.result == nil || got.result.Command != "" || len(got.result.Args) != 0 {
+		t.Fatalf("expected an empty build result, got %+v", got.result)
 	}
 }
 

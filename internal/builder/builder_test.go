@@ -36,15 +36,18 @@ func TestDetectAndBuildManifestUnreadable(t *testing.T) {
 	}
 }
 
-func TestDetectAndBuildUndetectedNamesEveryMarker(t *testing.T) {
-	_, err := DetectAndBuild(t.TempDir())
-	if err == nil {
-		t.Fatal("got nil, want an error")
+// A directory without a project file has nothing to build: the result is
+// empty and non-nil, and there is no error.
+func TestDetectAndBuildUndetectedReturnsEmptyResult(t *testing.T) {
+	r, err := DetectAndBuild(t.TempDir())
+	if err != nil {
+		t.Fatalf("got error %v, want nil", err)
 	}
-	for _, marker := range []string{"mcp.json", "package.json", "pyproject.toml", "requirements.txt", "go.mod"} {
-		if !strings.Contains(err.Error(), marker) {
-			t.Errorf("error %q does not name %s", err, marker)
-		}
+	if r == nil {
+		t.Fatal("got nil result, want an empty result")
+	}
+	if r.Command != "" || len(r.Args) != 0 || len(r.EnvNeeds) != 0 || len(r.BuildErrors) != 0 {
+		t.Fatalf("got %+v, want an empty result", r)
 	}
 }
 

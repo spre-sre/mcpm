@@ -38,7 +38,8 @@ func DetectAndBuild(repoPath string) (*BuildResult, error) {
 		return buildGo(absPath)
 	}
 
-	return nil, fmt.Errorf("could not detect project type (no mcp.json, package.json, pyproject.toml, requirements.txt, or go.mod)")
+	// No project file: nothing to build, so the install succeeds with an empty result.
+	return &BuildResult{}, nil
 }
 
 func buildFromManifest(repoPath, manifestPath string) (*BuildResult, error) {
