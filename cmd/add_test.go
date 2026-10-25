@@ -318,3 +318,90 @@ func TestClientFailuresTwoErrors(t *testing.T) {
 		t.Errorf("expected error to name Gemini CLI, got: %v", err)
 	}
 }
+
+func writeClaudeJSON(t *testing.T, content string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClaudeRegistrationLocalAndGlobal(t *testing.T) {
+	writeClaudeJSON(t, `{
+  "mcpServers": {"srv": {"type": "stdio", "command": "global-cmd", "args": ["g"]}},
+  "projects": {"/proj": {"mcpServers": {"srv": {"type": "stdio", "command": "node", "args": ["/proj/.mcp/servers/srv/index.js"]}}}}
+}`)
+
+	local, err := claudeRegistration("/proj", "srv", false)
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	if local.Command != "node" || len(local.Args) != 1 || local.Args[0] != "/proj/.mcp/servers/srv/index.js" {
+		t.Errorf("local = %+v", local)
+	}
+
+	global, err := claudeRegistration("/proj", "srv", true)
+	if err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	if global.Command != "global-cmd" || len(global.Args) != 1 || global.Args[0] != "g" {
+		t.Errorf("global = %+v", global)
+	}
+}
+
+func TestClaudeRegistrationNotFound(t *testing.T) {
+	writeClaudeJSON(t, `{"projects": {"/other": {"mcpServers": {"srv": {"command": "x"}}}}}`)
+
+	if _, err := claudeRegistration("/proj", "srv", false); err == nil || !strings.Contains(err.Error(), "srv") {
+		t.Errorf("expected not-found error naming srv, got: %v", err)
+	}
+	if _, err := claudeRegistration("/proj", "srv", true); err == nil {
+		t.Error("expected not-found error for global scope, got nil")
+	}
+}
+
+func TestClaudeRegistrationMissingFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := claudeRegistration("/proj", "srv", false); err == nil {
+		t.Error("expected error for missing ~/.claude.json, got nil")
+	}
+}
+
+func TestRegistrationProblem(t *testing.T) {
+	want := registration{Command: "node", Args: []string{"/a/index.js"}}
+	tests := []struct {
+		name    string
+		got     registration
+		err     error
+		problem bool
+		substr  string
+	}{
+		{"match", registration{Command: "node", Args: []string{"/a/index.js"}}, nil, false, ""},
+		{"other command", registration{Command: "python", Args: []string{"/a/index.js"}}, nil, true, `runs "python /a/index.js", want "node /a/index.js"`},
+		{"other args", registration{Command: "node", Args: []string{"/b/index.js"}}, nil, true, "/b/index.js"},
+		{"read error", registration{}, fmt.Errorf("server srv not found"), true, "not found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := registrationProblem("Claude Code", "srv", want, tt.got, tt.err)
+			if (got != "") != tt.problem {
+				t.Fatalf("problem = %q, want problem %v", got, tt.problem)
+			}
+			if !tt.problem {
+				return
+			}
+			if !strings.HasPrefix(got, "srv: Claude Code") || !strings.Contains(got, tt.substr) || strings.Contains(got, "\n") {
+				t.Errorf("problem = %q, want one line with %q", got, tt.substr)
+			}
+		})
+	}
+}
+
+func TestRegistrationProblemNilAndEmptyArgs(t *testing.T) {
+	got := registrationProblem("Gemini CLI", "srv", registration{Command: "bin"}, registration{Command: "bin", Args: []string{}}, nil)
+	if got != "" {
+		t.Errorf("nil and empty args reported as a problem: %q", got)
+	}
+}

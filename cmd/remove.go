@@ -214,6 +214,28 @@ func loadGeminiServer(configPath, name string) (map[string]interface{}, map[stri
 	return cfg, mcpServers, nil
 }
 
+// geminiRegistration reads the Gemini CLI registration of name from the
+// project settings, or the global settings when global.
+func geminiRegistration(cwd, name string, global bool) (registration, error) {
+	configPath, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return registration{}, err
+	}
+	_, mcpServers, err := loadGeminiServer(configPath, name)
+	if err != nil {
+		return registration{}, err
+	}
+	data, err := json.Marshal(mcpServers[name])
+	if err != nil {
+		return registration{}, err
+	}
+	var reg registration
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return registration{}, fmt.Errorf("%s: server %s: %w", configPath, name, err)
+	}
+	return reg, nil
+}
+
 func removeFromGeminiCLI(cwd, name string, global bool) error {
 	configPath, err := geminiSettingsPath(cwd, global)
 	if err != nil {

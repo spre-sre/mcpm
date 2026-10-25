@@ -154,3 +154,48 @@ func TestRemoveFromGeminiCLIMissingServer(t *testing.T) {
 		t.Errorf("expected error to mention server name 'ghost', got: %v", err)
 	}
 }
+
+func TestGeminiRegistration(t *testing.T) {
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settings := `{"theme": "dark", "mcpServers": {"srv": {"type": "stdio", "command": "node", "args": ["/s/index.js"], "env": {"K": "v"}}}}`
+	if err := os.WriteFile(filepath.Join(gemDir, "settings.json"), []byte(settings), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, err := geminiRegistration(cwd, "srv", false)
+	if err != nil {
+		t.Fatalf("geminiRegistration: %v", err)
+	}
+	if reg.Command != "node" || len(reg.Args) != 1 || reg.Args[0] != "/s/index.js" {
+		t.Errorf("registration = %+v", reg)
+	}
+
+	if _, err := geminiRegistration(cwd, "ghost", false); err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Errorf("expected error naming ghost, got: %v", err)
+	}
+}
+
+func TestGeminiRegistrationMissingFile(t *testing.T) {
+	if _, err := geminiRegistration(t.TempDir(), "srv", false); err == nil {
+		t.Error("expected error for missing settings file, got nil")
+	}
+}
+
+func TestGeminiRegistrationBadArgs(t *testing.T) {
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settings := `{"mcpServers": {"srv": {"command": "node", "args": "not-a-list"}}}`
+	if err := os.WriteFile(filepath.Join(gemDir, "settings.json"), []byte(settings), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := geminiRegistration(cwd, "srv", false); err == nil {
+		t.Error("expected error for args that are not a list, got nil")
+	}
+}

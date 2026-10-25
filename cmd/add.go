@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -151,6 +152,69 @@ func addToClaudeCode(cwd, name, commandOrURL string, args []string, env map[stri
 	}
 
 	return nil
+}
+
+// registration is the command and args a client has stored for a server.
+type registration struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
+// claudeServers is the part of ~/.claude.json that lists MCP servers.
+type claudeServers struct {
+	McpServers map[string]registration `json:"mcpServers"`
+}
+
+// claudeConfig holds the user-scope servers and the local-scope servers of
+// each project in ~/.claude.json.
+type claudeConfig struct {
+	claudeServers
+	Projects map[string]claudeServers `json:"projects"`
+}
+
+// claudeRegistration reads the Claude Code registration of name from
+// ~/.claude.json: the entry of project cwd (local scope), or the top-level
+// entry when global (user scope).
+func claudeRegistration(cwd, name string, global bool) (registration, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return registration{}, fmt.Errorf("could not get home directory: %w", err)
+	}
+	configPath := filepath.Join(home, ".claude.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return registration{}, fmt.Errorf("could not read %s: %w", configPath, err)
+	}
+	var cfg claudeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return registration{}, fmt.Errorf("could not parse %s: %w", configPath, err)
+	}
+	servers := cfg.McpServers
+	if !global {
+		servers = cfg.Projects[cwd].McpServers
+	}
+	reg, ok := servers[name]
+	if !ok {
+		return registration{}, fmt.Errorf("server %s not found", name)
+	}
+	return reg, nil
+}
+
+// registrationProblem returns one line that describes why the client's
+// registration of name does not run want, or "" when it does. err is the
+// error from reading the registration.
+func registrationProblem(client, name string, want, got registration, err error) string {
+	if err != nil {
+		return fmt.Sprintf("%s: %s: %v", name, client, err)
+	}
+	if got.Command == want.Command && slices.Equal(got.Args, want.Args) {
+		return ""
+	}
+	return fmt.Sprintf("%s: %s runs %q, want %q", name, client, formatRegistration(got), formatRegistration(want))
+}
+
+func formatRegistration(r registration) string {
+	return strings.Join(append([]string{r.Command}, r.Args...), " ")
 }
 
 func addToGeminiCLI(cwd, name, commandOrURL string, args []string, env map[string]string, transport string, global bool) error {
