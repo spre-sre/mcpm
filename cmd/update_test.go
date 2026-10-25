@@ -81,6 +81,59 @@ func TestUpdateCmdArgs(t *testing.T) {
 	}
 }
 
+func TestDryRunUpdateMissing(t *testing.T) {
+	chdirTemp(t)
+	err := dryRunUpdate("ghost", false)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got: %v", err)
+	}
+}
+
+func TestDryRunUpdateChangesNothing(t *testing.T) {
+	dir := chdirTemp(t)
+	server := filepath.Join(dir, ".mcp", "servers", "plain")
+	if err := os.MkdirAll(server, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// "plain" is not a git repository, so a real update would fail to pull.
+	if err := dryRunUpdate("plain", true); err != nil {
+		t.Fatalf("dryRunUpdate: %v", err)
+	}
+	entries, err := os.ReadDir(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("server directory changed: %d entries", len(entries))
+	}
+}
+
+func TestUpdateAllServersDryRun(t *testing.T) {
+	dir := chdirTemp(t)
+	for _, name := range []string{"a", "b"} {
+		if err := os.MkdirAll(filepath.Join(dir, ".mcp", "servers", name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldDry := updateDryRun
+	t.Cleanup(func() { updateDryRun = oldDry })
+	updateDryRun = true
+
+	if !updateAllServers(dryRunUpdate) {
+		t.Fatal("updateAllServers reported a failure")
+	}
+}
+
+func TestUpdateCmdDryRunFlag(t *testing.T) {
+	f := updateCmd.Flags().Lookup("dry-run")
+	if f == nil {
+		t.Fatal("flag --dry-run not defined")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("--dry-run default = %q, want %q", f.DefValue, "false")
+	}
+}
+
 func TestUpdateCmdAllNoServers(t *testing.T) {
 	chdirTemp(t)
 	oldAll, oldGlobal := updateAll, updateGlobal

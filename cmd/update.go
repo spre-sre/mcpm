@@ -13,6 +13,7 @@ import (
 var (
 	updateAll    bool
 	updateGlobal bool
+	updateDryRun bool
 )
 
 var updateCmd = &cobra.Command{
@@ -28,33 +29,20 @@ Examples:
   mcpm update --all
 
   # Update and re-register globally
-  mcpm update server-filesystem --global`,
+  mcpm update server-filesystem --global
+
+  # Show what would be updated without changing anything
+  mcpm update --all --dry-run`,
 	Args:              cobra.MaximumNArgs(1),
 	ValidArgsFunction: completeServerNames,
 	Run: func(cmd *cobra.Command, args []string) {
+		update := updateServer
+		if updateDryRun {
+			update = dryRunUpdate
+		}
+
 		if updateAll {
-			servers, err := fetcher.ListServers()
-			if err != nil {
-				fmt.Printf("Error listing servers: %v\n", err)
-				os.Exit(1)
-			}
-
-			if len(servers) == 0 {
-				fmt.Println("No servers installed in .mcp/servers/")
-				return
-			}
-
-			var failed bool
-			for _, name := range servers {
-				fmt.Printf("Updating %s...\n", name)
-				if err := updateServer(name, updateGlobal); err != nil {
-					fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-					failed = true
-				} else {
-					fmt.Printf("  Updated successfully\n")
-				}
-			}
-			if failed {
+			if !updateAllServers(update) {
 				os.Exit(1)
 			}
 			return
@@ -66,11 +54,54 @@ Examples:
 		}
 
 		name := args[0]
-		if err := updateServer(name, updateGlobal); err != nil {
+		if err := update(name, updateGlobal); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 	},
+}
+
+// updateAllServers runs update for every installed server and reports
+// whether all of them succeeded.
+func updateAllServers(update func(name string, global bool) error) bool {
+	servers, err := fetcher.ListServers()
+	if err != nil {
+		fmt.Printf("Error listing servers: %v\n", err)
+		return false
+	}
+
+	if len(servers) == 0 {
+		fmt.Println("No servers installed in .mcp/servers/")
+		return true
+	}
+
+	ok := true
+	for _, name := range servers {
+		fmt.Printf("Updating %s...\n", name)
+		if err := update(name, updateGlobal); err != nil {
+			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
+			ok = false
+		} else if !updateDryRun {
+			fmt.Printf("  Updated successfully\n")
+		}
+	}
+	return ok
+}
+
+// dryRunUpdate prints what updateServer would do and changes nothing.
+func dryRunUpdate(name string, global bool) error {
+	serverPath, err := fetcher.GetServerPath(name)
+	if err != nil {
+		return err
+	}
+
+	scope := "local"
+	if global {
+		scope = "global"
+	}
+	fmt.Printf("  Would pull latest changes into %s\n", serverPath)
+	fmt.Printf("  Would rebuild %s and re-register it (%s)\n", name, scope)
+	return nil
 }
 
 func updateServer(name string, global bool) error {
@@ -103,5 +134,6 @@ func updateServer(name string, global bool) error {
 func init() {
 	updateCmd.Flags().BoolVarP(&updateAll, "all", "a", false, "Update all installed servers")
 	updateCmd.Flags().BoolVarP(&updateGlobal, "global", "g", false, "Re-register globally after update")
+	updateCmd.Flags().BoolVar(&updateDryRun, "dry-run", false, "Print what would be updated and change nothing")
 	rootCmd.AddCommand(updateCmd)
 }

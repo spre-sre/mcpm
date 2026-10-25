@@ -17,6 +17,7 @@ var (
 	removeGeminiCLI  bool
 	removeGlobal     bool
 	removePurge      bool
+	removeDryRun     bool
 )
 
 var removeCmd = &cobra.Command{
@@ -38,7 +39,10 @@ Examples:
   mcpm remove myserver --global
 
   # Also delete the cloned server from .mcp/servers
-  mcpm remove myserver --purge`,
+  mcpm remove myserver --purge
+
+  # Show what would be removed without changing anything
+  mcpm remove myserver --purge --dry-run`,
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: completeServerNames,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -58,6 +62,9 @@ Examples:
 		}
 
 		cmd.SilenceUsage = true
+		if removeDryRun {
+			return dryRunRemove(cwd, name, scope)
+		}
 		errs := make(map[string]error)
 
 		if removeClaudeCode {
@@ -92,18 +99,59 @@ func reportRemove(client, name string, err error, errs map[string]error) {
 	}
 }
 
+// dryRunRemove prints what remove would change and changes nothing. It
+// returns the errors the real run would hit where they can be known
+// without changing anything.
+func dryRunRemove(cwd, name, scope string) error {
+	errs := make(map[string]error)
+
+	if removeClaudeCode {
+		fmt.Printf("Would run: claude mcp remove --scope %s %s\n", scope, name)
+	}
+
+	if removeGeminiCLI {
+		configPath, err := geminiSettingsPath(cwd, removeGlobal)
+		if err == nil {
+			_, _, err = loadGeminiServer(configPath, name)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing from Gemini CLI: %v\n", err)
+			errs["Gemini CLI"] = err
+		} else {
+			fmt.Printf("Would remove %s from Gemini CLI (%s)\n", name, configPath)
+		}
+	}
+
+	clientErr := clientFailures("remove", errs)
+	if !removePurge {
+		return clientErr
+	}
+
+	if _, err := fetcher.ServerDirToRemove(name); err != nil {
+		return purgeFailure(err, clientErr)
+	}
+	fmt.Printf("Would delete .mcp/servers/%s\n", name)
+	return clientErr
+}
+
 // purgeServer deletes the server directory and combines any purge failure
 // with the earlier client failure.
 func purgeServer(name string, clientErr error) error {
 	if err := fetcher.RemoveServer(name); err != nil {
-		fmt.Fprintf(os.Stderr, "Error purging server: %v\n", err)
-		if clientErr != nil {
-			return fmt.Errorf("%w; purge failed: %v", clientErr, err)
-		}
-		return fmt.Errorf("failed to purge server: %w", err)
+		return purgeFailure(err, clientErr)
 	}
 	fmt.Printf("Deleted .mcp/servers/%s\n", name)
 	return clientErr
+}
+
+// purgeFailure reports a purge error and combines it with the earlier
+// client failure.
+func purgeFailure(err, clientErr error) error {
+	fmt.Fprintf(os.Stderr, "Error purging server: %v\n", err)
+	if clientErr != nil {
+		return fmt.Errorf("%w; purge failed: %v", clientErr, err)
+	}
+	return fmt.Errorf("failed to purge server: %w", err)
 }
 
 func removeFromClaudeCode(cwd, name, scope string) error {
@@ -122,44 +170,58 @@ func removeFromClaudeCode(cwd, name, scope string) error {
 	return nil
 }
 
-func removeFromGeminiCLI(cwd, name string, global bool) error {
-	var configPath string
-
+// geminiSettingsPath returns the Gemini CLI settings file that remove edits.
+func geminiSettingsPath(cwd string, global bool) (string, error) {
 	if global {
 		// Global config in ~/.gemini/settings.json
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return fmt.Errorf("could not get home directory: %w", err)
+			return "", fmt.Errorf("could not get home directory: %w", err)
 		}
-		configPath = filepath.Join(home, ".gemini", "settings.json")
-	} else {
-		// Project-level config in ./.gemini/settings.json
-		configPath = filepath.Join(cwd, ".gemini", "settings.json")
+		return filepath.Join(home, ".gemini", "settings.json"), nil
 	}
+	// Project-level config in ./.gemini/settings.json
+	return filepath.Join(cwd, ".gemini", "settings.json"), nil
+}
 
+// loadGeminiServer reads configPath and checks that it lists the server name.
+// It returns the whole config and its mcpServers map.
+func loadGeminiServer(configPath, name string) (map[string]interface{}, map[string]interface{}, error) {
 	// Read existing config
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("config file not found: %s", configPath)
+			return nil, nil, fmt.Errorf("config file not found: %s", configPath)
 		}
-		return err
+		return nil, nil, err
 	}
 
 	var cfg map[string]interface{}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// Get mcpServers
 	mcpServers, ok := cfg["mcpServers"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("server %s not found", name)
+		return nil, nil, fmt.Errorf("server %s not found", name)
 	}
 
 	// Check if server exists
 	if _, exists := mcpServers[name]; !exists {
-		return fmt.Errorf("server %s not found", name)
+		return nil, nil, fmt.Errorf("server %s not found", name)
+	}
+	return cfg, mcpServers, nil
+}
+
+func removeFromGeminiCLI(cwd, name string, global bool) error {
+	configPath, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return err
+	}
+	cfg, mcpServers, err := loadGeminiServer(configPath, name)
+	if err != nil {
+		return err
 	}
 
 	// Remove server
@@ -179,5 +241,6 @@ func init() {
 	removeCmd.Flags().BoolVar(&removeGeminiCLI, "gemini", false, "Remove only from Gemini CLI")
 	removeCmd.Flags().BoolVarP(&removeGlobal, "global", "g", false, "Remove from global configuration")
 	removeCmd.Flags().BoolVar(&removePurge, "purge", false, "Also delete the server directory from .mcp/servers")
+	removeCmd.Flags().BoolVar(&removeDryRun, "dry-run", false, "Print what would be removed and change nothing")
 	rootCmd.AddCommand(removeCmd)
 }

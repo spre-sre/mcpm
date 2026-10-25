@@ -102,6 +102,39 @@ func TestRemoveServerRefusesSymlink(t *testing.T) {
 	}
 }
 
+func TestServerDirToRemoveChangesNothing(t *testing.T) {
+	dir := setupServers(t)
+	server := filepath.Join(dir, ".mcp", "servers", "x")
+	if err := os.MkdirAll(server, 0755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ServerDirToRemove("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mustEval(t, got) != mustEval(t, server) {
+		t.Errorf("got %q, want %q", got, server)
+	}
+	if _, err := os.Stat(server); err != nil {
+		t.Fatalf("server directory touched: %v", err)
+	}
+	if _, err := ServerDirToRemove("nope"); err == nil {
+		t.Error("want error for missing server")
+	}
+	if _, err := ServerDirToRemove("../x"); err == nil {
+		t.Error("want error for invalid name")
+	}
+}
+
+func mustEval(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 func TestRemoveServerNotFound(t *testing.T) {
 	setupServers(t)
 	err := RemoveServer("nope")
