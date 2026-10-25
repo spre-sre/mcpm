@@ -5,7 +5,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 func chdirTemp(t *testing.T) string {
@@ -75,6 +81,115 @@ func TestWriteListJSONServers(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("entry %d: got %v, want %v", i, got[i], want[i])
 		}
+	}
+}
+
+func writeFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func commitAll(t *testing.T, dir string) string {
+	t.Helper()
+	repo, err := git.PlainInit(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.AddGlob("."); err != nil {
+		t.Fatal(err)
+	}
+	sig := &object.Signature{Name: "t", Email: "t@example.com", When: time.Now()}
+	hash, err := wt.Commit("init", &git.CommitOptions{Author: sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash.String()
+}
+
+func TestWriteListJSONDetails(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	custom := filepath.Join(servers, "custom")
+	goSrv := filepath.Join(servers, "gosrv")
+	node := filepath.Join(servers, "node")
+	py := filepath.Join(servers, "py")
+	writeFiles(t, custom, map[string]string{"mcp.json": `{"runCmd":"bin/server","args":["--port","1"]}`})
+	writeFiles(t, goSrv, map[string]string{"go.mod": "module x\n"})
+	writeFiles(t, node, map[string]string{"package.json": `{"main":"lib/main.js"}`})
+	writeFiles(t, py, map[string]string{"requirements.txt": "", "src/server.py": ""})
+	commit := commitAll(t, custom)
+	if err := os.MkdirAll(filepath.Join(servers, "plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeList(&buf, true); err != nil {
+		t.Fatal(err)
+	}
+	var got []listEntry
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	python := filepath.Join(py, ".venv", "bin", "python")
+	if runtime.GOOS == "windows" {
+		python = filepath.Join(py, ".venv", "Scripts", "python.exe")
+	}
+	want := []listEntry{
+		{Name: "custom", Path: custom, BuildType: "custom", RunCommand: "bin/server --port 1", Commit: commit},
+		{Name: "gosrv", Path: goSrv, BuildType: "go", RunCommand: filepath.Join(goSrv, goBinName())},
+		{Name: "node", Path: node, BuildType: "node", RunCommand: "node " + filepath.Join(node, "lib", "main.js")},
+		{Name: "plain", Path: filepath.Join(servers, "plain")},
+		{Name: "py", Path: py, BuildType: "python", RunCommand: python + " " + filepath.Join(py, "src", "server.py")},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if !strings.Contains(buf.String(), `"buildType"`) || !strings.Contains(buf.String(), `"runCommand"`) || !strings.Contains(buf.String(), `"commit"`) {
+		t.Fatalf("missing keys in %s", buf.String())
+	}
+}
+
+func TestNodeEntryPrefersDist(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"package.json": `{"main":"lib/main.js"}`, "dist/index.js": ""})
+	if got, want := nodeEntry(dir), filepath.Join(dir, "dist", "index.js"); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	other := t.TempDir()
+	writeFiles(t, other, map[string]string{"package.json": `{}`})
+	if got, want := nodeEntry(other), filepath.Join(other, "index.js"); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestManifestRunCommandInvalid(t *testing.T) {
+	dir := t.TempDir()
+	if got := manifestRunCommand(dir); got != "" {
+		t.Fatalf("missing manifest: got %q", got)
+	}
+	writeFiles(t, dir, map[string]string{"mcp.json": `{"runCmd":"  "}`})
+	if got := manifestRunCommand(dir); got != "" {
+		t.Fatalf("empty runCmd: got %q", got)
+	}
+	if got := pythonRunCommand(dir); got != "" {
+		t.Fatalf("no python entry: got %q", got)
 	}
 }
 
