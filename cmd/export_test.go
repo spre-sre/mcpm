@@ -1,0 +1,149 @@
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"mcpm/internal/injector"
+)
+
+// gitServer makes dir a git repository with one commit and the given origin
+// URL, and returns the commit hash.
+func gitServer(t *testing.T, dir, origin string, files map[string]string) string {
+	t.Helper()
+	writeFiles(t, dir, files)
+	commit := commitAll(t, dir)
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{origin}}); err != nil {
+		t.Fatal(err)
+	}
+	return commit
+}
+
+func TestBuildLock(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	alpha := gitServer(t, filepath.Join(servers, "alpha"), "https://example.com/org/alpha.git", map[string]string{"go.mod": "module a\n"})
+	beta := gitServer(t, filepath.Join(servers, "beta"), "https://example.com/org/beta", map[string]string{"go.mod": "module b\n"})
+	writeRegistrations(t, dir, map[string]registration{"alpha": {Command: "x"}})
+
+	lock, err := buildLock(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []lockEntry{
+		{Name: "alpha", Repository: "https://example.com/org/alpha.git", Commit: alpha,
+			Targets: []injector.TargetTool{injector.TargetClaudeCode, injector.TargetGeminiCLI}},
+		{Name: "beta", Repository: "https://example.com/org/beta", Commit: beta, Targets: []injector.TargetTool{}},
+	}
+	if len(lock.Servers) != len(want) {
+		t.Fatalf("got %+v, want %+v", lock.Servers, want)
+	}
+	for i, w := range want {
+		got := lock.Servers[i]
+		if got.Name != w.Name || got.Repository != w.Repository || got.Commit != w.Commit || !slices.Equal(got.Targets, w.Targets) {
+			t.Errorf("entry %d: got %+v, want %+v", i, got, w)
+		}
+	}
+
+	path := filepath.Join(dir, lockFileName)
+	if err := writeLock(path, lock); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"targets": []`) {
+		t.Fatalf("beta targets should be an empty array: %s", data)
+	}
+	back, err := readLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Servers) != 2 || back.Servers[0].Commit != alpha || back.Servers[1].Name != "beta" {
+		t.Fatalf("round trip: got %+v", back.Servers)
+	}
+}
+
+func TestBuildLockEmpty(t *testing.T) {
+	chdirTemp(t)
+	lock, err := buildLock(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Servers == nil || len(lock.Servers) != 0 {
+		t.Fatalf("want empty list, got %+v", lock.Servers)
+	}
+}
+
+func TestBuildLockRejectsUntrackedServers(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	writeFiles(t, filepath.Join(servers, "plain"), map[string]string{"go.mod": ""})
+	if _, err := buildLock(false); err == nil || !strings.Contains(err.Error(), "server 'plain': not a git repository") {
+		t.Fatalf("plain folder: got %v", err)
+	}
+
+	if err := os.RemoveAll(filepath.Join(servers, "plain")); err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, filepath.Join(servers, "local"), map[string]string{"go.mod": ""})
+	commitAll(t, filepath.Join(servers, "local"))
+	if _, err := buildLock(false); err == nil || !strings.Contains(err.Error(), "server 'local': no origin remote") {
+		t.Fatalf("no origin: got %v", err)
+	}
+}
+
+func TestRegisteredTargetsBadConfig(t *testing.T) {
+	dir := chdirTemp(t)
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): `{"mcpServers":[]}`})
+	if _, err := registeredTargets("x", false); err == nil || !strings.Contains(err.Error(), "mcpServers is not a JSON object") {
+		t.Fatalf("gemini: got %v", err)
+	}
+	writeFiles(t, claudeDir, map[string]string{".claude.json": "{"})
+	if _, err := registeredTargets("x", false); err == nil || !strings.Contains(err.Error(), "could not parse") {
+		t.Fatalf("claude: got %v", err)
+	}
+}
+
+func TestRegisteredTargetsGlobal(t *testing.T) {
+	chdirTemp(t)
+	claudeDir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	t.Setenv("HOME", home)
+	writeFiles(t, claudeDir, map[string]string{".claude.json": `{"mcpServers":{"x":{"command":"c"}}}`})
+	writeFiles(t, home, map[string]string{filepath.Join(".gemini", "settings.json"): `{"mcpServers":{"x":{}}}`})
+
+	got, err := registeredTargets("x", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []injector.TargetTool{injector.TargetClaudeCode, injector.TargetGeminiCLI}; !slices.Equal(got, want) {
+		t.Fatalf("global: got %v, want %v", got, want)
+	}
+	if got, err := registeredTargets("x", false); err != nil || len(got) != 0 {
+		t.Fatalf("local: got %v, %v", got, err)
+	}
+}
+
+func TestExportFlags(t *testing.T) {
+	f := exportCmd.Flags().Lookup("file")
+	if f == nil || f.DefValue != lockFileName {
+		t.Fatalf("--file: got %+v", f)
+	}
+	if exportCmd.Flags().Lookup("global") == nil {
+		t.Fatal("export has no --global flag")
+	}
+}
