@@ -105,3 +105,30 @@ func TestRunVersionMatchesFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestRunVersionShort(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldCfg := cfgFile
+	cfgFile = ""
+	viper.Reset()
+	t.Cleanup(func() {
+		cfgFile = oldCfg
+		viper.Reset()
+		if f := versionCmd.Flags().Lookup("short"); f != nil {
+			_ = f.Value.Set("false")
+			f.Changed = false
+		}
+	})
+
+	args := []string{"version", "--short"}
+	var stdout, stderr bytes.Buffer
+	if code := run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(%v) exit code = %d, want 0", args, code)
+	}
+	if want := rootCmd.Version + "\n"; stdout.String() != want {
+		t.Errorf("run(%v) stdout = %q, want %q", args, stdout.String(), want)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("run(%v) stderr = %q, want empty", args, stderr.String())
+	}
+}

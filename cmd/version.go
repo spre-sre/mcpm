@@ -61,12 +61,17 @@ func vcsLines(read func() (*debug.BuildInfo, bool)) string {
 }
 
 // versionCmd prints the same line as cobra's root --version flag, then the
-// VCS commit and build date when the build info has them.
+// VCS commit and build date when the build info has them. With --short it
+// prints only the version number.
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the version",
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
+		if short, _ := cmd.Flags().GetBool("short"); short {
+			fmt.Fprintln(cmd.OutOrStdout(), cmd.Root().Version)
+			return
+		}
 		fmt.Fprintf(cmd.OutOrStdout(), "%s version %s\n", cmd.Root().Name(), cmd.Root().Version)
 		fmt.Fprint(cmd.OutOrStdout(), vcsLines(debug.ReadBuildInfo))
 	},
@@ -74,5 +79,6 @@ var versionCmd = &cobra.Command{
 
 func init() {
 	rootCmd.Version = resolveVersion(version, debug.ReadBuildInfo)
+	versionCmd.Flags().Bool("short", false, "Print only the version number")
 	rootCmd.AddCommand(versionCmd)
 }
