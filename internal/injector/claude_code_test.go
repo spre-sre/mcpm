@@ -179,6 +179,57 @@ func TestRegisterClaudeCodeWrapsError(t *testing.T) {
 	}
 }
 
+// writeClaudeConfig points CLAUDE_CONFIG_DIR at a temp dir holding content as
+// .claude.json and returns the file path.
+func writeClaudeConfig(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	path := filepath.Join(dir, ".claude.json")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLookupClaudeCodeScopes(t *testing.T) {
+	cwd := "/work/project"
+	writeClaudeConfig(t, `{
+		"mcpServers": {"alpha": {"type": "stdio", "command": "/user/alpha", "args": []}},
+		"projects": {"/work/project": {"mcpServers": {"alpha": {"type": "stdio", "command": "node", "args": ["/local/index.js"]}}}}
+	}`)
+
+	def, ok, err := lookupClaudeCode(cwd, "alpha", true)
+	if err != nil || !ok || def.Command != "/user/alpha" {
+		t.Errorf("user scope = %+v, %v, %v", def, ok, err)
+	}
+	def, ok, err = lookupClaudeCode(cwd, "alpha", false)
+	if err != nil || !ok || def.Command != "node" || !equalArgs(def.Args, []string{"/local/index.js"}) {
+		t.Errorf("local scope = %+v, %v, %v", def, ok, err)
+	}
+	if _, ok, err := lookupClaudeCode("/other", "alpha", false); err != nil || ok {
+		t.Errorf("other project: ok=%v err=%v, want not registered", ok, err)
+	}
+	if _, ok, err := lookupClaudeCode(cwd, "beta", true); err != nil || ok {
+		t.Errorf("beta: ok=%v err=%v, want not registered", ok, err)
+	}
+}
+
+func TestLookupClaudeCodeMissingFile(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	if _, ok, err := lookupClaudeCode(t.TempDir(), "alpha", false); err != nil || ok {
+		t.Errorf("ok=%v err=%v, want not registered without error", ok, err)
+	}
+}
+
+func TestLookupClaudeCodeInvalidJSON(t *testing.T) {
+	path := writeClaudeConfig(t, "not json")
+	_, _, err := lookupClaudeCode(t.TempDir(), "alpha", true)
+	if err == nil || !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %v, want parse error naming %s", err, path)
+	}
+}
+
 func TestMcpServerDefJSON(t *testing.T) {
 	def := McpServerDef{Type: "stdio", Command: "node", Args: []string{"index.js"}}
 	data, err := json.Marshal(def)

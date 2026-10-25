@@ -58,27 +58,46 @@ func loadGeminiConfig(path string) (GeminiConfig, error) {
 	return cfg, nil
 }
 
+// geminiSettingsPath returns ~/.gemini/settings.json for global and
+// <cwd>/.gemini/settings.json for project-level registration.
+func geminiSettingsPath(cwd string, global bool) (string, error) {
+	base := cwd
+	if global {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("could not get home directory: %w", err)
+		}
+		base = home
+	}
+	return filepath.Join(base, ".gemini", "settings.json"), nil
+}
+
+// lookupGeminiCLI returns the Gemini CLI registration of name. A missing
+// settings file means the server is not registered.
+func lookupGeminiCLI(cwd, name string, global bool) (McpServerDef, bool, error) {
+	configPath, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return McpServerDef{}, false, err
+	}
+	cfg, err := loadGeminiConfig(configPath)
+	if err != nil {
+		return McpServerDef{}, false, err
+	}
+	def, ok := cfg.McpServers[name]
+	return def, ok, nil
+}
+
 func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
 	name, nameErr := serverName(result)
 	if nameErr != nil {
 		return nameErr
 	}
 
-	var configDir, configPath string
-
-	if global {
-		// Global config in ~/.gemini/settings.json
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("could not get home directory: %w", err)
-		}
-		configDir = filepath.Join(home, ".gemini")
-		configPath = filepath.Join(configDir, "settings.json")
-	} else {
-		// Project-level config in ./.gemini/settings.json
-		configDir = filepath.Join(cwd, ".gemini")
-		configPath = filepath.Join(configDir, "settings.json")
+	configPath, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return err
 	}
+	configDir := filepath.Dir(configPath)
 
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("could not create .gemini dir: %w", err)

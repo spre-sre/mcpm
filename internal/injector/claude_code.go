@@ -1,8 +1,12 @@
 package injector
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"mcpm/internal/builder"
 )
@@ -53,4 +57,53 @@ func updateClaudeCode(cwd string, result *builder.BuildResult, env map[string]st
 	}
 
 	return nil
+}
+
+// claudeConfig is the part of Claude Code's .claude.json that holds MCP
+// servers: user scope at the top level, local scope per project directory.
+type claudeConfig struct {
+	McpServers map[string]McpServerDef `json:"mcpServers"`
+	Projects   map[string]struct {
+		McpServers map[string]McpServerDef `json:"mcpServers"`
+	} `json:"projects"`
+}
+
+// claudeConfigPath returns $CLAUDE_CONFIG_DIR/.claude.json when set, else
+// ~/.claude.json.
+func claudeConfigPath() (string, error) {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, ".claude.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not get home directory: %w", err)
+	}
+	return filepath.Join(home, ".claude.json"), nil
+}
+
+// lookupClaudeCode returns the Claude Code registration of name in the scope
+// that updateClaudeCode writes to. A missing config file means the server is
+// not registered.
+func lookupClaudeCode(cwd, name string, global bool) (McpServerDef, bool, error) {
+	path, err := claudeConfigPath()
+	if err != nil {
+		return McpServerDef{}, false, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return McpServerDef{}, false, nil
+	}
+	if err != nil {
+		return McpServerDef{}, false, fmt.Errorf("could not read %s: %w", path, err)
+	}
+	var cfg claudeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return McpServerDef{}, false, fmt.Errorf("could not parse %s: %w", path, err)
+	}
+	servers := cfg.McpServers
+	if !global {
+		servers = cfg.Projects[cwd].McpServers
+	}
+	def, ok := servers[name]
+	return def, ok, nil
 }

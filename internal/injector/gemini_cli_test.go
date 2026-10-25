@@ -128,6 +128,48 @@ func TestNoFileCreatesNew(t *testing.T) {
 	}
 }
 
+func TestLookupGeminiCLIAfterRegister(t *testing.T) {
+	cwd := t.TempDir()
+	if err := registerDemo(t, cwd); err != nil {
+		t.Fatal(err)
+	}
+
+	def, ok, err := lookupGeminiCLI(cwd, "demo", false)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v, want demo registered", ok, err)
+	}
+	wantArgs := []string{filepath.Join(cwd, ".mcp", "servers", "demo", "index.js")}
+	if def.Command != "node" || len(def.Args) != 1 || def.Args[0] != wantArgs[0] {
+		t.Errorf("def = %+v, want node %v", def, wantArgs)
+	}
+	if _, ok, err := lookupGeminiCLI(cwd, "other", false); err != nil || ok {
+		t.Errorf("other: ok=%v err=%v, want not registered", ok, err)
+	}
+}
+
+func TestLookupGeminiCLIMissingFile(t *testing.T) {
+	if _, ok, err := lookupGeminiCLI(t.TempDir(), "demo", false); err != nil || ok {
+		t.Errorf("ok=%v err=%v, want not registered without error", ok, err)
+	}
+}
+
+func TestLookupGeminiCLIGlobalUsesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	gemDir := filepath.Join(home, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"mcpServers": {"demo": {"type": "stdio", "command": "x"}}}`
+	if err := os.WriteFile(filepath.Join(gemDir, "settings.json"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	def, ok, err := lookupGeminiCLI(t.TempDir(), "demo", true)
+	if err != nil || !ok || def.Command != "x" {
+		t.Errorf("def=%+v ok=%v err=%v, want command x", def, ok, err)
+	}
+}
+
 func TestUnmarshalJSONInvalidReturnsError(t *testing.T) {
 	var cfg GeminiConfig
 	err := json.Unmarshal([]byte(`not json`), &cfg)
