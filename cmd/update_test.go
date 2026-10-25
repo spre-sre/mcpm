@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/go-git/go-git/v5"
 )
 
 func TestUpdateServerMissing(t *testing.T) {
@@ -174,6 +176,68 @@ func TestUpdateCmdDryRunFlag(t *testing.T) {
 	}
 	if f.DefValue != "false" {
 		t.Errorf("--dry-run default = %q, want %q", f.DefValue, "false")
+	}
+}
+
+func TestUpdateCmdCheckFlag(t *testing.T) {
+	f := updateCmd.Flags().Lookup("check")
+	if f == nil {
+		t.Fatal("flag --check not defined")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("--check default = %q, want %q", f.DefValue, "false")
+	}
+}
+
+func TestCheckServerRemoteErrors(t *testing.T) {
+	dir := chdirTemp(t)
+	if err := checkServerRemote("ghost", false); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing server: got %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp", "servers", "plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkServerRemote("plain", false); err == nil || !strings.Contains(err.Error(), "failed to open repository") {
+		t.Fatalf("non-git server: got %v", err)
+	}
+}
+
+func TestUpdateCheckReportsNewCommits(t *testing.T) {
+	dir := chdirTemp(t)
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	commitAll(t, upstream)
+	srv := filepath.Join(dir, ".mcp", "servers", "alpha")
+	if _, err := git.PlainClone(srv, false, &git.CloneOptions{URL: upstream}); err != nil {
+		t.Fatal(err)
+	}
+	before := headCommit(srv)
+
+	oldAll, oldGlobal, oldDry, oldCheck := updateAll, updateGlobal, updateDryRun, updateCheck
+	t.Cleanup(func() { updateAll, updateGlobal, updateDryRun, updateCheck = oldAll, oldGlobal, oldDry, oldCheck })
+	updateAll, updateGlobal, updateDryRun, updateCheck = true, false, false, true
+
+	out := captureStdout(t, func() { updateCmd.Run(updateCmd, nil) })
+	if !strings.Contains(out, "Checking alpha...") || !strings.Contains(out, "Up to date") {
+		t.Fatalf("unchanged remote: output %q", out)
+	}
+
+	after := commitMore(t, upstream, map[string]string{"README": "v2"})
+	out = captureStdout(t, func() { updateCmd.Run(updateCmd, nil) })
+	want := "New commits available (" + before[:7] + " -> " + after[:7] + ")"
+	if !strings.Contains(out, want) {
+		t.Fatalf("output missing %q:\n%s", want, out)
+	}
+	for _, unwanted := range []string{"Updated successfully", "Pulling"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("check output contains %q:\n%s", unwanted, out)
+		}
+	}
+	if got := headCommit(srv); got != before {
+		t.Fatalf("HEAD moved to %s, want %s", got, before)
+	}
+	if data, err := os.ReadFile(filepath.Join(srv, "README")); err != nil || string(data) != "v1" {
+		t.Fatalf("working tree changed: %q, %v", data, err)
 	}
 }
 
