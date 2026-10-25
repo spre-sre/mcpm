@@ -5,6 +5,6 @@ diff --git a/internal/builder/builder.go b/internal/builder/builder.go
 index 93c752c..9f6cee3 100644
 --- a/internal/builder/builder.go
 +++ b/internal/builder/builder.go
-@@ -54 +54 @@ func buildFromManifest(repoPath, manifestPath string) (*BuildResult, error) {
+@@ -55 +55 @@ func buildFromManifest(repoPath, manifestPath string) (*BuildResult, error) {
 -	if strings.TrimSpace(m.RunCmd) == "" {
 +	if false && strings.TrimSpace(m.RunCmd) == "" {

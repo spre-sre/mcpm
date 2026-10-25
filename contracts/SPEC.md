@@ -9,8 +9,8 @@ reject the change.
 
 ## Invariants
 
-- INV_PROJECT_DETECTED: dir ∌ {mcp.json, package.json, pyproject.toml, requirements.txt, go.mod} ⇒ (builder.DetectAndBuild(dir) fails with "could not detect project type" ∨ builder.DetectAndBuild(dir) = (r, nil) with r ≠ nil ∧ r.Command = "" ∧ r.Args = r.EnvNeeds = r.BuildErrors = ∅) -> REJECT(ERR_PROJECT_UNDETECTED)
-  Source: README.md "How It Works" step 2; internal/builder/builder.go DetectAndBuild; empty result without an error: GitHub issue #37 (request #26), approved by a maintainer.
+- INV_PROJECT_DETECTED: dir ∌ {mcp.json, package.json, pyproject.toml, requirements.txt, go.mod} ∧ ¬(builder.DetectAndBuild(dir) = (r, nil) with r ≠ nil ∧ r.Command = "" ∧ r.Args = r.EnvNeeds = r.BuildErrors = ∅) -> REJECT(ERR_PROJECT_UNDETECTED)
+  Source: README.md "How It Works" step 2; internal/builder/builder.go DetectAndBuild; empty result without an error: GitHub issue #37 (request #26), approved by a maintainer; tightened to require only the empty result: GitHub issue #45, approved by a maintainer.
 - INV_MANIFEST_JSON: dir ∋ mcp.json ∧ (¬json.Unmarshal(mcp.json, &Manifest) ∨ trim(Manifest.runCmd) = "") ⇒ builder.DetectAndBuild(dir) fails before buildCmd runs -> REJECT(ERR_MANIFEST_INVALID)
   Source: README.md "Custom (mcp.json)"; internal/builder/builder.go buildFromManifest; required runCmd: maintainer decision, 2026-10-06.
 - INV_SERVER_INSTALLED: os.Stat(cwd/.mcp/servers/name) reports not-exist ⇒ fetcher.GetServerPath(name) fails -> REJECT(ERR_SERVER_NOT_FOUND)
@@ -50,7 +50,7 @@ The accept side of each invariant is also checked:
 
 | Code | Value | Meaning |
 |---|---|---|
-| ERR_PROJECT_UNDETECTED | -1 | No mcp.json, package.json, pyproject.toml, requirements.txt or go.mod in the repository root. |
+| ERR_PROJECT_UNDETECTED | -1 | No mcp.json, package.json, pyproject.toml, requirements.txt or go.mod in the repository root, and DetectAndBuild did not return a non-nil empty result without an error. |
 | ERR_MANIFEST_INVALID | -2 | mcp.json exists but does not decode into the Manifest type. |
 | ERR_SERVER_NOT_FOUND | -3 | No entry with that name under .mcp/servers/. |
 | ERR_HOST_PORT_SPLIT | -4 | StripHostPort disagrees with the host that net.SplitHostPort returns. |
@@ -58,7 +58,6 @@ The accept side of each invariant is also checked:
 
 ## Gaps
 
-- The INV_PROJECT_DETECTED invariant accepts both the "could not detect project type" error and a non-nil empty result without an error for a root without a marker (a nil result is refused, because internal/tui/commands.go passes the result on), so the current code and the code for GitHub issue #37 (request #26, approved) both pass. A follow-up tightens the rule to require the empty result after the code change.
 - Go: no entropy check and no source-rule engine. Step 0 runs cmd/gate-ast (McCabe <= 10 per function; 12 pre-adoption functions grandfathered in .crucible/baseline.json, which may only go down).
 - main.go is not scanned by the AST gate (a source file in the gate's argv breaks command closure); it has one function with McCabe 1.
 - Go: code under test shares the test process; it could write CRUCIBLE_RESULTS or call os.Exit. Not statically checked.

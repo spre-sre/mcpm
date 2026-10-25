@@ -352,20 +352,19 @@ func emptyResult(result *builder.BuildResult) bool {
 }
 
 // checkNothingToBuild checks a tree without a root marker: DetectAndBuild
-// fails with ERR_PROJECT_UNDETECTED or returns a non-nil empty result without
-// an error (GitHub issue #37; SPEC.md ## Gaps).
+// returns a non-nil empty result without an error (GitHub issue #45).
 func checkNothingToBuild(t *testing.T, files map[string]string, label string) {
 	t.Helper()
 	code, result := detect(t, files)
-	ok := code == errProjectUndetected || (code == codeAccept && emptyResult(result))
+	ok := code == codeAccept && emptyResult(result)
 	record("INV_PROJECT_DETECTED", ok)
 	if !ok {
-		t.Errorf("INV_PROJECT_DETECTED %s: got code %d result %#v, want code %d or a non-nil empty result", label, code, result, errProjectUndetected)
+		t.Errorf("INV_PROJECT_DETECTED %s: got code %d result %#v, want code %d and a non-nil empty result", label, code, result, codeAccept)
 	}
 }
 
-// INV_PROJECT_DETECTED: no marker in the root, and neither the undetected
-// error nor a non-nil empty result -> REJECT(ERR_PROJECT_UNDETECTED)
+// INV_PROJECT_DETECTED: no marker in the root, and not a non-nil empty result
+// without an error -> REJECT(ERR_PROJECT_UNDETECTED)
 func TestCrucible_INV_PROJECT_DETECTED_boundary(t *testing.T) {
 	code, result := detect(t, map[string]string{"mcp.json": `{"runCmd":"run"}`})
 	check(t, "INV_PROJECT_DETECTED", code, codeAccept, "only mcp.json")
@@ -392,7 +391,7 @@ func TestCrucible_INV_PROJECT_DETECTED_random(t *testing.T) {
 		}
 		label := fmt.Sprintf("case=%d", i)
 		if rng.Intn(2) == 0 {
-			// No marker in the root: undetected, or nothing to build.
+			// No marker in the root: nothing to build.
 			checkNothingToBuild(t, files, label+" decoys only")
 			continue
 		}
