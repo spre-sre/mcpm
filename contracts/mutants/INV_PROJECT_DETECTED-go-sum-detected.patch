@@ -1,5 +1,5 @@
 Crucible-Mutant: INV_PROJECT_DETECTED
-Description: treat go.sum as a project marker, so a root without any real marker is not rejected
+Description: treat go.sum as a project marker, so a root without any real marker runs a Go build instead of being rejected or returning a non-nil empty result
 
 diff --git a/internal/builder/builder.go b/internal/builder/builder.go
 index 93c752c..2c36177 100644

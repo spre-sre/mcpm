@@ -344,22 +344,40 @@ func orEmpty(values []string) []string {
 	return values
 }
 
-// INV_PROJECT_DETECTED: no marker in the root -> REJECT(ERR_PROJECT_UNDETECTED)
+// emptyResult reports whether an accepted result is non-nil and builds and
+// runs nothing. A nil result is refused: internal/tui/commands.go passes it on.
+func emptyResult(result *builder.BuildResult) bool {
+	return result != nil && result.Command == "" && len(result.Args) == 0 &&
+		len(result.EnvNeeds) == 0 && len(result.BuildErrors) == 0
+}
+
+// checkNothingToBuild checks a tree without a root marker: DetectAndBuild
+// fails with ERR_PROJECT_UNDETECTED or returns a non-nil empty result without
+// an error (GitHub issue #37; SPEC.md ## Gaps).
+func checkNothingToBuild(t *testing.T, files map[string]string, label string) {
+	t.Helper()
+	code, result := detect(t, files)
+	ok := code == errProjectUndetected || (code == codeAccept && emptyResult(result))
+	record("INV_PROJECT_DETECTED", ok)
+	if !ok {
+		t.Errorf("INV_PROJECT_DETECTED %s: got code %d result %#v, want code %d or a non-nil empty result", label, code, result, errProjectUndetected)
+	}
+}
+
+// INV_PROJECT_DETECTED: no marker in the root, and neither the undetected
+// error nor a non-nil empty result -> REJECT(ERR_PROJECT_UNDETECTED)
 func TestCrucible_INV_PROJECT_DETECTED_boundary(t *testing.T) {
 	code, result := detect(t, map[string]string{"mcp.json": `{"runCmd":"run"}`})
 	check(t, "INV_PROJECT_DETECTED", code, codeAccept, "only mcp.json")
 	if code == codeAccept {
 		checkManifestResult(t, "INV_PROJECT_DETECTED", result, builder.Manifest{RunCmd: "run"}, "only mcp.json")
 	}
-	code, _ = detect(t, map[string]string{})
-	check(t, "INV_PROJECT_DETECTED", code, errProjectUndetected, "empty directory")
+	checkNothingToBuild(t, map[string]string{}, "empty directory")
 	for _, marker := range projectMarkers {
-		code, _ = detect(t, map[string]string{filepath.Join("src", marker): "{}"})
-		check(t, "INV_PROJECT_DETECTED", code, errProjectUndetected, "marker only in a subdirectory: "+marker)
+		checkNothingToBuild(t, map[string]string{filepath.Join("src", marker): "{}"}, "marker only in a subdirectory: "+marker)
 	}
 	for _, decoy := range decoys {
-		code, _ = detect(t, map[string]string{decoy: "{}"})
-		check(t, "INV_PROJECT_DETECTED", code, errProjectUndetected, "decoy "+decoy)
+		checkNothingToBuild(t, map[string]string{decoy: "{}"}, "decoy "+decoy)
 	}
 }
 
@@ -374,9 +392,8 @@ func TestCrucible_INV_PROJECT_DETECTED_random(t *testing.T) {
 		}
 		label := fmt.Sprintf("case=%d", i)
 		if rng.Intn(2) == 0 {
-			// No marker in the root: rejected.
-			code, _ := detect(t, files)
-			check(t, "INV_PROJECT_DETECTED", code, errProjectUndetected, label+" decoys only")
+			// No marker in the root: undetected, or nothing to build.
+			checkNothingToBuild(t, files, label+" decoys only")
 			continue
 		}
 		// mcp.json plus any other markers: the manifest wins, nothing is built.
