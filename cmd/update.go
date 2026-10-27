@@ -38,7 +38,11 @@ Examples:
   mcpm update --all --dry-run
 
   # Fetch every remote and report which servers have new commits
-  mcpm update --all --check`,
+  mcpm update --all --check
+
+A server installed at a pinned version (mcpm install @owner/repo#v1.2.0)
+stays pinned: a pinned tag is kept as is and a pinned branch only pulls
+new commits of that branch.`,
 	Args:              cobra.MaximumNArgs(1),
 	ValidArgsFunction: completeServerNames,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -115,11 +119,23 @@ func checkServerRemote(name string, _ bool) error {
 		return err
 	}
 
+	pin, err := serverPin(serverPath)
+	if err != nil {
+		return err
+	}
+	if pin.IsTag() {
+		fmt.Printf("  Pinned to %s (%.7s); not updated\n", pin.Short(), headCommit(serverPath))
+		return nil
+	}
+
 	local, remote, err := fetchHeads(serverPath)
 	if err != nil {
 		return err
 	}
 
+	if pin != "" {
+		fmt.Printf("  Pinned to branch %s\n", pin.Short())
+	}
 	if local == remote {
 		fmt.Printf("  Up to date (%s)\n", local.String()[:7])
 		return nil
@@ -168,8 +184,64 @@ func dryRunUpdate(name string, global bool) error {
 	if global {
 		scope = "global"
 	}
-	fmt.Printf("  Would pull latest changes into %s\n", serverPath)
+	pin, _ := serverPin(serverPath)
+	switch {
+	case pin.IsTag():
+		fmt.Printf("  Would keep pinned version %s in %s\n", pin.Short(), serverPath)
+	case pin != "":
+		fmt.Printf("  Would pull latest changes of pinned branch %s into %s\n", pin.Short(), serverPath)
+	default:
+		fmt.Printf("  Would pull latest changes into %s\n", serverPath)
+	}
 	fmt.Printf("  Would rebuild %s and re-register it (%s)\n", name, scope)
+	return nil
+}
+
+// serverPin opens the server repository at path and returns the reference it
+// was pinned to at install, or "" when it is not pinned.
+func serverPin(path string) (plumbing.ReferenceName, error) {
+	repo, err := git.PlainOpen(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+	return readPin(repo)
+}
+
+// pullServer updates the checkout at path. An unpinned server pulls its
+// default branch, a server pinned to a branch pulls only that branch and a
+// server pinned to a tag stays where it is.
+func pullServer(path string, pin plumbing.ReferenceName) error {
+	switch {
+	case pin == "":
+		fmt.Printf("  Pulling latest changes...\n")
+		return fetcher.Pull(path)
+	case pin.IsTag():
+		fmt.Printf("  Pinned to %s; keeping it\n", pin.Short())
+		return nil
+	}
+	fmt.Printf("  Pulling latest changes of pinned branch %s...\n", pin.Short())
+	return pullBranch(path, pin)
+}
+
+// pullBranch pulls branch from origin into the repository at path.
+func pullBranch(path string, branch plumbing.ReferenceName) error {
+	repo, err := git.PlainOpen(path)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+	err = worktree.Pull(&git.PullOptions{
+		RemoteName:    "origin",
+		ReferenceName: branch,
+		SingleBranch:  true,
+		Force:         true,
+	})
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("git pull failed: %w", err)
+	}
 	return nil
 }
 
@@ -180,9 +252,12 @@ func updateServer(name string, global bool) error {
 		return err
 	}
 
-	// Pull latest changes
-	fmt.Printf("  Pulling latest changes...\n")
-	if err := fetcher.Pull(serverPath); err != nil {
+	// Pull latest changes, staying on a pinned version
+	pin, err := serverPin(serverPath)
+	if err == nil {
+		err = pullServer(serverPath, pin)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to pull: %w", err)
 	}
 

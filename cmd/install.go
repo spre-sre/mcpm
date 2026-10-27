@@ -180,17 +180,47 @@ func clonePinned(url, version string) error {
 	if !ok {
 		return fmt.Errorf("version %q not found in %s: no tag or branch with that name", version, url)
 	}
-	_, err = git.PlainClone(target, false, &git.CloneOptions{
+	repo, err := git.PlainClone(target, false, &git.CloneOptions{
 		URL:           url,
 		ReferenceName: ref,
 		SingleBranch:  true,
 		Depth:         1,
 	})
+	if err == nil {
+		err = recordPin(repo, ref)
+	}
 	if err != nil {
 		os.RemoveAll(target)
 		return fmt.Errorf("git clone of %s at %s failed: %w", url, version, err)
 	}
 	return nil
+}
+
+// pinSection and pinOption name the git config entry that records the
+// pinned reference of a server ("[mcpm] pin = refs/tags/v1.2.0").
+const (
+	pinSection = "mcpm"
+	pinOption  = "pin"
+)
+
+// recordPin stores ref in the repository config so update keeps the pin.
+func recordPin(repo *git.Repository, ref plumbing.ReferenceName) error {
+	cfg, err := repo.Config()
+	if err != nil {
+		return err
+	}
+	cfg.Raw.Section(pinSection).SetOption(pinOption, ref.String())
+	return repo.SetConfig(cfg)
+}
+
+// readPin returns the reference the repository was pinned to at install, or
+// "" when it is not pinned.
+func readPin(repo *git.Repository) (plumbing.ReferenceName, error) {
+	cfg, err := repo.Config()
+	if err != nil {
+		return "", err
+	}
+	return plumbing.ReferenceName(cfg.Raw.Section(pinSection).Option(pinOption)), nil
 }
 
 // pinnedTarget returns the not yet existing server directory for url.

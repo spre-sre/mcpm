@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 func TestUpdateServerMissing(t *testing.T) {
@@ -238,6 +239,119 @@ func TestUpdateCheckReportsNewCommits(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(srv, "README")); err != nil || string(data) != "v1" {
 		t.Fatalf("working tree changed: %q, %v", data, err)
+	}
+}
+
+// clonePinnedServer clones ref of upstream into .mcp/servers/<name> under dir
+// and records the pin as clonePinned does.
+func clonePinnedServer(t *testing.T, dir, upstream, name string, ref plumbing.ReferenceName) string {
+	t.Helper()
+	srv := filepath.Join(dir, ".mcp", "servers", name)
+	repo, err := git.PlainClone(srv, false, &git.CloneOptions{URL: upstream, ReferenceName: ref, SingleBranch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPin(repo, ref); err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
+func setUpstreamRef(t *testing.T, upstream string, ref plumbing.ReferenceName, hash string) {
+	t.Helper()
+	repo, err := git.PlainOpen(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(ref, plumbing.NewHash(hash))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateKeepsPinnedTag(t *testing.T) {
+	dir := chdirTemp(t)
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	pinned := commitAll(t, upstream)
+	setUpstreamRef(t, upstream, "refs/tags/v1.2.0", pinned)
+	srv := clonePinnedServer(t, dir, upstream, "alpha", "refs/tags/v1.2.0")
+	commitMore(t, upstream, map[string]string{"README": "v2"})
+
+	if pin, err := serverPin(srv); err != nil || pin.Short() != "v1.2.0" {
+		t.Fatalf("serverPin = %q, %v; want v1.2.0", pin, err)
+	}
+	out := captureStdout(t, func() {
+		if err := checkServerRemote("alpha", false); err != nil {
+			t.Errorf("checkServerRemote: %v", err)
+		}
+	})
+	if want := "Pinned to v1.2.0 (" + pinned[:7] + ")"; !strings.Contains(out, want) || strings.Contains(out, "New commits") {
+		t.Fatalf("check output %q, want %q", out, want)
+	}
+	out = captureStdout(t, func() {
+		if err := pullServer(srv, "refs/tags/v1.2.0"); err != nil {
+			t.Errorf("pullServer: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Pinned to v1.2.0") || strings.Contains(out, "Pulling latest changes...") {
+		t.Errorf("pull output %q", out)
+	}
+	if got := headCommit(srv); got != pinned {
+		t.Fatalf("HEAD moved to %s, want pinned %s", got, pinned)
+	}
+}
+
+func TestUpdateKeepsPinnedBranch(t *testing.T) {
+	dir := chdirTemp(t)
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	first := commitAll(t, upstream)
+	setUpstreamRef(t, upstream, "refs/heads/stable", first)
+	srv := clonePinnedServer(t, dir, upstream, "alpha", "refs/heads/stable")
+	second := commitMore(t, upstream, map[string]string{"README": "v2"})
+
+	out := captureStdout(t, func() {
+		if err := checkServerRemote("alpha", false); err != nil {
+			t.Errorf("checkServerRemote: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Pinned to branch stable") || !strings.Contains(out, "Up to date") {
+		t.Fatalf("check output %q", out)
+	}
+	captureStdout(t, func() {
+		if err := pullServer(srv, "refs/heads/stable"); err != nil {
+			t.Errorf("pullServer: %v", err)
+		}
+	})
+	if got := headCommit(srv); got != first {
+		t.Fatalf("default branch commit pulled: HEAD %s, want %s", got, first)
+	}
+
+	setUpstreamRef(t, upstream, "refs/heads/stable", second)
+	captureStdout(t, func() {
+		if err := pullServer(srv, "refs/heads/stable"); err != nil {
+			t.Errorf("pullServer: %v", err)
+		}
+	})
+	if got := headCommit(srv); got != second {
+		t.Fatalf("pinned branch not pulled: HEAD %s, want %s", got, second)
+	}
+}
+
+func TestDryRunUpdatePinned(t *testing.T) {
+	dir := chdirTemp(t)
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	setUpstreamRef(t, upstream, "refs/tags/v1", commitAll(t, upstream))
+	clonePinnedServer(t, dir, upstream, "alpha", "refs/tags/v1")
+
+	out := captureStdout(t, func() {
+		if err := dryRunUpdate("alpha", false); err != nil {
+			t.Errorf("dryRunUpdate: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Would keep pinned version v1") {
+		t.Fatalf("dry-run output %q", out)
 	}
 }
 
