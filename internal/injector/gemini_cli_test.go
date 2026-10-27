@@ -170,6 +170,64 @@ func TestLookupGeminiCLIGlobalUsesHome(t *testing.T) {
 	}
 }
 
+func TestGeminiCLIRegistrationsLocalAndGlobal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := t.TempDir()
+	writeFile := func(base, content string) {
+		t.Helper()
+		gemDir := filepath.Join(base, ".gemini")
+		if err := os.MkdirAll(gemDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(gemDir, "settings.json"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(cwd, `{"mcpServers": {"demo": {"type": "stdio", "command": "node", "args": ["index.js"], "env": {"B": "v1", "A": "v2"}}}}`)
+	writeFile(home, `{"mcpServers": {"demo": {"type": "stdio", "command": "x"}}}`)
+
+	regs, err := GeminiCLIRegistrations(cwd, "demo")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(regs) != 2 {
+		t.Fatalf("regs = %+v, want local and global", regs)
+	}
+	local, global := regs[0], regs[1]
+	if local.Tool != TargetGeminiCLI || local.Scope != ScopeLocal || local.Command != "node" ||
+		len(local.EnvNames) != 2 || local.EnvNames[0] != "A" || local.EnvNames[1] != "B" {
+		t.Errorf("local = %+v", local)
+	}
+	if global.Scope != ScopeGlobal || global.Command != "x" || len(global.Args) != 0 {
+		t.Errorf("global = %+v", global)
+	}
+}
+
+func TestGeminiCLIRegistrationsNotRegistered(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	regs, err := GeminiCLIRegistrations(t.TempDir(), "demo")
+	if err != nil || len(regs) != 0 {
+		t.Errorf("regs=%+v err=%v, want none without error", regs, err)
+	}
+}
+
+func TestGeminiCLIRegistrationsInvalidJSON(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	gemDir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(gemDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(gemDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte("not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GeminiCLIRegistrations(cwd, "demo"); err == nil || !strings.Contains(err.Error(), settingsPath) {
+		t.Errorf("err = %v, want parse error naming %s", err, settingsPath)
+	}
+}
+
 func TestUnmarshalJSONInvalidReturnsError(t *testing.T) {
 	var cfg GeminiConfig
 	err := json.Unmarshal([]byte(`not json`), &cfg)

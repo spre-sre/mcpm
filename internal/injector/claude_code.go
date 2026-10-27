@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 
 	"mcpm/internal/builder"
 )
@@ -106,4 +107,59 @@ func lookupClaudeCode(cwd, name string, global bool) (McpServerDef, bool, error)
 	}
 	def, ok := servers[name]
 	return def, ok, nil
+}
+
+// Registration describes how one tool starts a server. EnvNames holds the
+// names of the environment variables only, never their values.
+type Registration struct {
+	Tool     TargetTool `json:"tool"`
+	Scope    string     `json:"scope"`
+	Command  string     `json:"command"`
+	Args     []string   `json:"args"`
+	EnvNames []string   `json:"envNames"`
+}
+
+// Registration scopes, matching the --global flag of mcpm install.
+const (
+	ScopeLocal  = "local"
+	ScopeGlobal = "global"
+)
+
+func newRegistration(tool TargetTool, global bool, def McpServerDef) Registration {
+	scope := ScopeLocal
+	if global {
+		scope = ScopeGlobal
+	}
+	envNames := make([]string, 0, len(def.Env))
+	for key := range def.Env {
+		envNames = append(envNames, key)
+	}
+	sort.Strings(envNames)
+	args := def.Args
+	if args == nil {
+		args = []string{}
+	}
+	return Registration{Tool: tool, Scope: scope, Command: def.Command, Args: args, EnvNames: envNames}
+}
+
+// registrationsIn returns the local and then the global registration of name
+// that lookup finds. A tool where name is not registered yields no entries.
+func registrationsIn(tool TargetTool, cwd, name string, lookup lookupFunc) ([]Registration, error) {
+	var regs []Registration
+	for _, global := range []bool{false, true} {
+		def, ok, err := lookup(cwd, name, global)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			regs = append(regs, newRegistration(tool, global, def))
+		}
+	}
+	return regs, nil
+}
+
+// ClaudeCodeRegistrations returns the Claude Code registrations of name in
+// the local scope of cwd and in the user (global) scope.
+func ClaudeCodeRegistrations(cwd, name string) ([]Registration, error) {
+	return registrationsIn(TargetClaudeCode, cwd, name, lookupClaudeCode)
 }

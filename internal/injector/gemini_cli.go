@@ -87,6 +87,12 @@ func lookupGeminiCLI(cwd, name string, global bool) (McpServerDef, bool, error) 
 	return def, ok, nil
 }
 
+// GeminiCLIRegistrations returns the Gemini CLI registrations of name in
+// <cwd>/.gemini/settings.json (local) and ~/.gemini/settings.json (global).
+func GeminiCLIRegistrations(cwd, name string) ([]Registration, error) {
+	return registrationsIn(TargetGeminiCLI, cwd, name, lookupGeminiCLI)
+}
+
 func updateGeminiCLI(cwd string, result *builder.BuildResult, env map[string]string, global bool) error {
 	name, nameErr := serverName(result)
 	if nameErr != nil {

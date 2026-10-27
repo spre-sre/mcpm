@@ -230,6 +230,57 @@ func TestLookupClaudeCodeInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeRegistrationsBothScopes(t *testing.T) {
+	cwd := "/work/project"
+	writeClaudeConfig(t, `{
+		"mcpServers": {"alpha": {"type": "stdio", "command": "/user/alpha", "env": {"TOKEN": "secret-1", "API_KEY": "secret-2"}}},
+		"projects": {"/work/project": {"mcpServers": {"alpha": {"type": "stdio", "command": "node", "args": ["/local/index.js"]}}}}
+	}`)
+
+	regs, err := ClaudeCodeRegistrations(cwd, "alpha")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(regs) != 2 {
+		t.Fatalf("regs = %+v, want local and global", regs)
+	}
+	local, global := regs[0], regs[1]
+	if local.Tool != TargetClaudeCode || local.Scope != ScopeLocal || local.Command != "node" ||
+		!equalArgs(local.Args, []string{"/local/index.js"}) || len(local.EnvNames) != 0 {
+		t.Errorf("local = %+v", local)
+	}
+	if global.Scope != ScopeGlobal || global.Command != "/user/alpha" ||
+		!equalArgs(global.EnvNames, []string{"API_KEY", "TOKEN"}) {
+		t.Errorf("global = %+v", global)
+	}
+
+	data, err := json.Marshal(regs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "secret") {
+		t.Errorf("JSON leaks env values: %s", data)
+	}
+	if !strings.Contains(string(data), `"args":[]`) {
+		t.Errorf("missing args should encode as []: %s", data)
+	}
+}
+
+func TestClaudeCodeRegistrationsNotRegistered(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	regs, err := ClaudeCodeRegistrations(t.TempDir(), "alpha")
+	if err != nil || len(regs) != 0 {
+		t.Errorf("regs=%+v err=%v, want none without error", regs, err)
+	}
+}
+
+func TestClaudeCodeRegistrationsInvalidJSON(t *testing.T) {
+	path := writeClaudeConfig(t, "not json")
+	if _, err := ClaudeCodeRegistrations(t.TempDir(), "alpha"); err == nil || !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %v, want parse error naming %s", err, path)
+	}
+}
+
 func TestMcpServerDefJSON(t *testing.T) {
 	def := McpServerDef{Type: "stdio", Command: "node", Args: []string{"index.js"}}
 	data, err := json.Marshal(def)
