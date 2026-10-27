@@ -1,14 +1,17 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"mcpm/internal/builder"
 	"mcpm/internal/fetcher"
 	"mcpm/internal/injector"
+	"mcpm/internal/server"
 )
 
 var (
@@ -100,7 +103,124 @@ func checkServer(name string, tools []injector.TargetTool, global bool) []string
 	return append(problems, injector.Check(name, result, tools, global)...)
 }
 
+var infoJSON bool
+
+var infoCmd = &cobra.Command{
+	Use:   "info <name>",
+	Short: "Show where an installed MCP server is registered and how it starts",
+	Long: `Show one server in .mcp/servers/: where it lives on disk, the repository
+and commit it came from, and each Claude Code and Gemini CLI registration
+(local or global) with the command that starts it and the names of the
+environment variables it is given. Values are never printed.
+
+Examples:
+  mcpm info myserver
+  mcpm info myserver --json`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeServerNames,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		info, err := collectServerInfo(cwd, args[0])
+		if err != nil {
+			return err
+		}
+		return writeServerInfo(cmd.OutOrStdout(), info, infoJSON)
+	},
+}
+
+// infoRegistration is one registration of a server and the runtime its
+// command starts.
+type infoRegistration struct {
+	injector.Registration
+	Runtime string `json:"runtime"`
+}
+
+// serverInfo is what mcpm info reports about one installed server.
+// Repository and Commit are empty when the server is not a git clone.
+type serverInfo struct {
+	Name          string             `json:"name"`
+	Path          string             `json:"path"`
+	Repository    string             `json:"repository"`
+	Commit        string             `json:"commit"`
+	Registrations []infoRegistration `json:"registrations"`
+}
+
+// collectServerInfo describes the installed server name. It fails when name
+// is not installed or a client config cannot be read.
+func collectServerInfo(cwd, name string) (serverInfo, error) {
+	path, err := installedServerDir(name)
+	if err != nil {
+		return serverInfo{}, err
+	}
+	regs, err := serverRegistrations(cwd, name)
+	if err != nil {
+		return serverInfo{}, err
+	}
+	info := serverInfo{Name: name, Path: path, Registrations: make([]infoRegistration, 0, len(regs))}
+	if url, commit, err := repoOrigin(path); err == nil {
+		info.Repository, info.Commit = url, commit
+	} else {
+		info.Commit = headCommit(path)
+	}
+	for _, reg := range regs {
+		info.Registrations = append(info.Registrations, infoRegistration{Registration: reg, Runtime: server.ClassifyLaunchCommand(reg.Command)})
+	}
+	return info, nil
+}
+
+// toolLabels names each client the way the other commands print it.
+var toolLabels = map[injector.TargetTool]string{
+	injector.TargetClaudeCode: "Claude Code",
+	injector.TargetGeminiCLI:  "Gemini CLI",
+}
+
+// writeServerInfo writes info to w as indented JSON or as text.
+func writeServerInfo(w io.Writer, info serverInfo, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(info)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Name:       %s\n", info.Name)
+	fmt.Fprintf(&b, "Path:       %s\n", info.Path)
+	fmt.Fprintf(&b, "Repository: %s\n", orNone(info.Repository))
+	fmt.Fprintf(&b, "Commit:     %s\n", orNone(info.Commit))
+	if len(info.Registrations) == 0 {
+		b.WriteString("Registered: nowhere\n")
+	} else {
+		b.WriteString("Registered:\n")
+	}
+	for _, reg := range info.Registrations {
+		writeInfoRegistration(&b, reg)
+	}
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+func writeInfoRegistration(b *strings.Builder, reg infoRegistration) {
+	fmt.Fprintf(b, "  %s (%s): %s [%s]\n", toolLabels[reg.Tool], reg.Scope,
+		formatRegistration(registration{Command: reg.Command, Args: reg.Args}), reg.Runtime)
+	if len(reg.EnvNames) > 0 {
+		fmt.Fprintf(b, "    env: %s\n", strings.Join(reg.EnvNames, ", "))
+	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
 func init() {
+	infoCmd.Flags().BoolVar(&infoJSON, "json", false, "Print the server as JSON")
+	rootCmd.AddCommand(infoCmd)
+
 	doctorCmd.Flags().BoolVar(&doctorClaudeCode, "claude", false, "Check only Claude Code")
 	doctorCmd.Flags().BoolVar(&doctorGeminiCLI, "gemini", false, "Check only Gemini CLI")
 	doctorCmd.Flags().BoolVarP(&doctorGlobal, "global", "g", false, "Check the global registrations")

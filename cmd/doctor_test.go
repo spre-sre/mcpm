@@ -113,6 +113,131 @@ func TestCheckServerMissingFolder(t *testing.T) {
 	}
 }
 
+// setupInfoServer installs srv with a local Claude Code registration and a
+// global Gemini CLI registration that carries a secret env value.
+func setupInfoServer(t *testing.T) string {
+	t.Helper()
+	dir := chdirTemp(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	writeFiles(t, filepath.Join(dir, ".mcp", "servers", "srv"), map[string]string{"index.js": ""})
+	writeFiles(t, claudeDir, map[string]string{".claude.json": `{"projects": {"` + dir +
+		`": {"mcpServers": {"srv": {"command": "node", "args": ["index.js"]}}}}}`})
+	writeFiles(t, home, map[string]string{filepath.Join(".gemini", "settings.json"): `{"mcpServers": {"srv": ` +
+		`{"command": "/opt/srv", "env": {"TOKEN": "s3cret", "API_KEY": "hunter2"}}}}`})
+	return dir
+}
+
+func TestCollectServerInfo(t *testing.T) {
+	dir := setupInfoServer(t)
+	info, err := collectServerInfo(dir, "srv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Path != filepath.Join(dir, ".mcp", "servers", "srv") || info.Repository != "" || info.Commit != "" {
+		t.Fatalf("info = %+v", info)
+	}
+	if len(info.Registrations) != 2 {
+		t.Fatalf("registrations = %+v", info.Registrations)
+	}
+	claude, gemini := info.Registrations[0], info.Registrations[1]
+	if claude.Tool != injector.TargetClaudeCode || claude.Scope != injector.ScopeLocal || claude.Runtime != "node" {
+		t.Errorf("claude = %+v", claude)
+	}
+	if gemini.Tool != injector.TargetGeminiCLI || gemini.Scope != injector.ScopeGlobal || gemini.Runtime != "binary" ||
+		strings.Join(gemini.EnvNames, ",") != "API_KEY,TOKEN" {
+		t.Errorf("gemini = %+v", gemini)
+	}
+}
+
+func TestWriteServerInfoHidesEnvValues(t *testing.T) {
+	dir := setupInfoServer(t)
+	info, err := collectServerInfo(dir, "srv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, asJSON := range []bool{false, true} {
+		var buf bytes.Buffer
+		if err := writeServerInfo(&buf, info, asJSON); err != nil {
+			t.Fatal(err)
+		}
+		out := buf.String()
+		if strings.Contains(out, "s3cret") || strings.Contains(out, "hunter2") {
+			t.Errorf("json=%v: env value printed: %s", asJSON, out)
+		}
+		if !strings.Contains(out, "API_KEY") || !strings.Contains(out, "TOKEN") {
+			t.Errorf("json=%v: env names missing: %s", asJSON, out)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := writeServerInfo(&buf, info, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Name:       srv\n",
+		"Repository: (none)\n",
+		"  Claude Code (local): node index.js [node]\n",
+		"  Gemini CLI (global): /opt/srv [binary]\n    env: API_KEY, TOKEN\n",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("text output missing %q:\n%s", want, buf.String())
+		}
+	}
+
+	buf.Reset()
+	if err := writeServerInfo(&buf, info, true); err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	regs, _ := decoded["registrations"].([]interface{})
+	if len(regs) != 2 {
+		t.Fatalf("registrations = %v", decoded["registrations"])
+	}
+	first, _ := regs[0].(map[string]interface{})
+	if first["tool"] != "claude-code" || first["scope"] != "local" || first["runtime"] != "node" {
+		t.Errorf("first registration = %v", first)
+	}
+}
+
+func TestCollectServerInfoUnregistered(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	writeFiles(t, filepath.Join(dir, ".mcp", "servers", "lone"), map[string]string{"README": ""})
+	info, err := collectServerInfo(dir, "lone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := writeServerInfo(&buf, info, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "Registered: nowhere\n") {
+		t.Errorf("got %s", buf.String())
+	}
+	buf.Reset()
+	if err := writeServerInfo(&buf, info, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"registrations": []`) {
+		t.Errorf("got %s", buf.String())
+	}
+}
+
+func TestCollectServerInfoNotInstalled(t *testing.T) {
+	dir := chdirTemp(t)
+	_, err := collectServerInfo(dir, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestDoctorTools(t *testing.T) {
 	if got := doctorTools(true, false); len(got) != 1 || got[0] != injector.TargetClaudeCode {
 		t.Fatalf("--claude: got %v", got)

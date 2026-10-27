@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"mcpm/internal/fetcher"
+	"mcpm/internal/injector"
 
 	"github.com/spf13/cobra"
 )
@@ -234,6 +235,30 @@ func geminiRegistration(cwd, name string, global bool) (registration, error) {
 		return registration{}, fmt.Errorf("%s: server %s: %w", configPath, name, err)
 	}
 	return reg, nil
+}
+
+// installedServerDir returns the directory of the installed server name, or
+// an error that says name is not installed.
+func installedServerDir(name string) (string, error) {
+	dir, err := fetcher.ServerDirToRemove(name)
+	if err != nil {
+		return "", fmt.Errorf("%w (run mcpm list to see installed servers)", err)
+	}
+	return dir, nil
+}
+
+// serverRegistrations returns the Claude Code and then the Gemini CLI
+// registrations of name, local before global, with env names only.
+func serverRegistrations(cwd, name string) ([]injector.Registration, error) {
+	regs, err := injector.ClaudeCodeRegistrations(cwd, name)
+	if err != nil {
+		return nil, fmt.Errorf("Claude Code: %w", err)
+	}
+	gemini, err := injector.GeminiCLIRegistrations(cwd, name)
+	if err != nil {
+		return nil, fmt.Errorf("Gemini CLI: %w", err)
+	}
+	return append(regs, gemini...), nil
 }
 
 func removeFromGeminiCLI(cwd, name string, global bool) error {

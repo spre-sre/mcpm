@@ -18,6 +18,33 @@ func TestRemoveFromGeminiCLIMissingFile(t *testing.T) {
 	}
 }
 
+func TestInstalledServerDir(t *testing.T) {
+	dir := chdirTemp(t)
+	server := filepath.Join(dir, ".mcp", "servers", "srv")
+	if err := os.MkdirAll(server, 0755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := installedServerDir("srv")
+	if err != nil || got != server {
+		t.Fatalf("installedServerDir = %q, %v", got, err)
+	}
+	for _, name := range []string{"ghost", "../srv", ""} {
+		if _, err := installedServerDir(name); err == nil || !strings.Contains(err.Error(), "mcpm list") {
+			t.Errorf("%q: err = %v", name, err)
+		}
+	}
+}
+
+func TestServerRegistrationsBadConfig(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): "{"})
+	if _, err := serverRegistrations(dir, "srv"); err == nil || !strings.HasPrefix(err.Error(), "Gemini CLI: ") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func setRemoveFlags(t *testing.T, claude, gemini, global, purge bool) {
 	t.Helper()
 	oldC, oldG, oldGl, oldP := removeClaudeCode, removeGeminiCLI, removeGlobal, removePurge
