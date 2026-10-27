@@ -17,6 +17,7 @@ import (
 var (
 	doctorClaudeCode bool
 	doctorGeminiCLI  bool
+	doctorLocal      bool
 	doctorGlobal     bool
 )
 
@@ -30,15 +31,22 @@ var doctorCmd = &cobra.Command{
 its registration in Claude Code and Gemini CLI runs the built command, and
 the registration sets every environment variable its mcp.json requires.
 
-Prints one line per problem and exits with status 1 if it finds any.
+Checks the local (project) and the global registrations in one run unless
+--local or --global limits it to one scope. When both scopes are checked, a
+server only has to be registered in one of them.
+
+Prints one line per problem, naming the client and scope it belongs to, and
+exits with status 1 if it finds any.
 
 Examples:
   mcpm doctor
   mcpm doctor --claude
+  mcpm doctor --local
   mcpm doctor --global`,
 	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
-		problems, err := runDoctor(os.Stdout, doctorTools(doctorClaudeCode, doctorGeminiCLI), doctorGlobal)
+		tools := doctorTools(doctorClaudeCode, doctorGeminiCLI)
+		problems, err := runDoctor(os.Stdout, tools, doctorScopes(doctorLocal, doctorGlobal))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -64,16 +72,28 @@ func doctorTools(claude, gemini bool) []injector.TargetTool {
 	return tools
 }
 
-// runDoctor checks every installed server, writes one line per problem to w
-// and returns the number of problems.
-func runDoctor(w io.Writer, tools []injector.TargetTool, global bool) (int, error) {
+// doctorScopes returns the scopes to check as global flags; both when neither
+// or both are selected.
+func doctorScopes(local, global bool) []bool {
+	switch {
+	case local && !global:
+		return []bool{false}
+	case global && !local:
+		return []bool{true}
+	}
+	return bothScopes
+}
+
+// runDoctor checks every installed server in scopes, writes one line per
+// problem to w and returns the number of problems.
+func runDoctor(w io.Writer, tools []injector.TargetTool, scopes []bool) (int, error) {
 	servers, err := fetcher.ListServers()
 	if err != nil {
 		return 0, err
 	}
 	count := 0
 	for _, name := range servers {
-		for _, problem := range checkServer(name, tools, global) {
+		for _, problem := range checkServer(name, tools, scopes) {
 			if _, err := fmt.Fprintln(w, problem); err != nil {
 				return count, err
 			}
@@ -84,8 +104,8 @@ func runDoctor(w io.Writer, tools []injector.TargetTool, global bool) (int, erro
 }
 
 // checkServer returns the problems of one installed server. Registration is
-// checked only when the server builds to a command.
-func checkServer(name string, tools []injector.TargetTool, global bool) []string {
+// checked, in each of scopes, only when the server builds to a command.
+func checkServer(name string, tools []injector.TargetTool, scopes []bool) []string {
 	path, err := fetcher.GetServerPath(name)
 	if err != nil {
 		return []string{fmt.Sprintf("%s: folder missing: %v", name, err)}
@@ -101,8 +121,58 @@ func checkServer(name string, tools []injector.TargetTool, global bool) []string
 	if result.Command == "" {
 		return append(problems, fmt.Sprintf("%s: no project detected, nothing to run", name))
 	}
-	problems = append(problems, injector.Check(name, result, tools, global)...)
-	return append(problems, envProblems(name, result.EnvNeeds, tools, global)...)
+	for _, tool := range tools {
+		problems = append(problems, registrationProblems(name, result, tool, scopes)...)
+	}
+	for _, global := range scopes {
+		problems = append(problems, envProblems(name, result.EnvNeeds, tools, global)...)
+	}
+	return problems
+}
+
+// registrationProblems checks the registration of name in tool in each of
+// scopes and names the scope in every problem. When several scopes are
+// checked, name missing from one of them is a problem only if it is missing
+// from all.
+func registrationProblems(name string, result *builder.BuildResult, tool injector.TargetTool, scopes []bool) []string {
+	unregistered := fmt.Sprintf("%s: not registered in %s", name, toolLabels[tool])
+	var problems []string
+	missing := 0
+	for _, global := range scopes {
+		problem := scopeProblem(name, result, tool, global)
+		if problem == unregistered {
+			missing++
+		}
+		if problem != "" && (problem != unregistered || len(scopes) == 1) {
+			problems = append(problems, withScope(problem, name, tool, scopeName(global)))
+		}
+	}
+	if len(scopes) > 1 && missing == len(scopes) {
+		problems = append(problems, withScope(unregistered, name, tool, injector.ScopeLocal+" or "+injector.ScopeGlobal))
+	}
+	return problems
+}
+
+// scopeProblem returns the problem injector.Check finds with the registration
+// of name in tool in one scope, or "" if there is none.
+func scopeProblem(name string, result *builder.BuildResult, tool injector.TargetTool, global bool) string {
+	problems := injector.Check(name, result, []injector.TargetTool{tool}, global)
+	if len(problems) == 0 {
+		return ""
+	}
+	return problems[0]
+}
+
+// withScope adds scope to the first mention of tool in problem, which
+// injector.Check writes as "<name>: ..." with the client label before any
+// command or error text.
+func withScope(problem, name string, tool injector.TargetTool, scope string) string {
+	prefix := name + ": "
+	rest, ok := strings.CutPrefix(problem, prefix)
+	if !ok {
+		return problem
+	}
+	return prefix + strings.Replace(rest, toolLabels[tool], scopedLabel(tool, scope), 1)
 }
 
 // envProblems returns one line per registration of name in tools that lacks a
@@ -265,6 +335,7 @@ func init() {
 
 	doctorCmd.Flags().BoolVar(&doctorClaudeCode, "claude", false, "Check only Claude Code")
 	doctorCmd.Flags().BoolVar(&doctorGeminiCLI, "gemini", false, "Check only Gemini CLI")
-	doctorCmd.Flags().BoolVarP(&doctorGlobal, "global", "g", false, "Check the global registrations")
+	doctorCmd.Flags().BoolVarP(&doctorLocal, "local", "l", false, "Check only the local (project) registrations")
+	doctorCmd.Flags().BoolVarP(&doctorGlobal, "global", "g", false, "Check only the global registrations")
 	rootCmd.AddCommand(doctorCmd)
 }

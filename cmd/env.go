@@ -123,8 +123,16 @@ type envTarget struct {
 }
 
 func (t envTarget) label() string {
-	return fmt.Sprintf("%s (%s)", toolLabels[t.Tool], t.Scope)
+	return scopedLabel(t.Tool, t.Scope)
 }
+
+// scopedLabel names a client and scope, e.g. "Claude Code (local)".
+func scopedLabel(tool injector.TargetTool, scope string) string {
+	return fmt.Sprintf("%s (%s)", toolLabels[tool], scope)
+}
+
+// bothScopes lists the scopes as global flags, local before global.
+var bothScopes = []bool{false, true}
 
 func scopeName(global bool) string {
 	if global {
@@ -205,7 +213,7 @@ func claudeEnvTargets(cwd, name string) ([]envTarget, error) {
 // name.
 func geminiEnvTargets(cwd, name string) ([]envTarget, error) {
 	var targets []envTarget
-	for _, global := range []bool{false, true} {
+	for _, global := range bothScopes {
 		def, ok, err := geminiEnvDef(cwd, name, global)
 		if err != nil {
 			return nil, err

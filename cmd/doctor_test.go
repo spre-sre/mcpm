@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +15,12 @@ import (
 )
 
 // writeRegistrations writes the Claude Code (local scope of dir) and Gemini
-// CLI (project) registrations of servers.
+// CLI (project) registrations of servers, with no global registrations.
 func writeRegistrations(t *testing.T, dir string, servers map[string]registration) {
 	t.Helper()
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	t.Setenv("HOME", t.TempDir())
 	claude, err := json.Marshal(map[string]interface{}{
 		"projects": map[string]interface{}{dir: map[string]interface{}{"mcpServers": servers}},
 	})
@@ -41,7 +44,7 @@ func TestRunDoctorNoProblems(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	n, err := runDoctor(&buf, doctorTools(false, false), false)
+	n, err := runDoctor(&buf, doctorTools(false, false), doctorScopes(false, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,22 +65,31 @@ func TestRunDoctorReportsProblems(t *testing.T) {
 		"stale": {Command: "node", Args: []string{"/old/index.js"}},
 	})
 
+	assertDoctorLines(t, doctorScopes(false, false), []string{
+		"broken: build failed: invalid mcp.json: runCmd is required",
+		"plain: no project detected, nothing to run",
+		`stale: Claude Code (local) runs "node /old/index.js", want "node ` + filepath.Join(stale, "index.js") + `"`,
+		`stale: Gemini CLI (local) runs "node /old/index.js", want "node ` + filepath.Join(stale, "index.js") + `"`,
+		"unreg: not registered in Claude Code (local or global)",
+		"unreg: not registered in Gemini CLI (local or global)",
+	})
+}
+
+// assertDoctorLines runs doctor for both clients in scopes and compares its
+// output with want, line by line.
+func assertDoctorLines(t *testing.T, scopes []bool, want []string) {
+	t.Helper()
 	var buf bytes.Buffer
-	n, err := runDoctor(&buf, doctorTools(false, false), false)
+	n, err := runDoctor(&buf, doctorTools(false, false), scopes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	var lines []string
+	if buf.Len() > 0 {
+		lines = strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	}
 	if n != len(lines) {
 		t.Fatalf("count %d, but %d lines: %q", n, len(lines), buf.String())
-	}
-	want := []string{
-		"broken: build failed: invalid mcp.json: runCmd is required",
-		"plain: no project detected, nothing to run",
-		`stale: Claude Code runs "node /old/index.js", want "node ` + filepath.Join(stale, "index.js") + `"`,
-		`stale: Gemini CLI runs "node /old/index.js", want "node ` + filepath.Join(stale, "index.js") + `"`,
-		"unreg: not registered in Claude Code",
-		"unreg: not registered in Gemini CLI",
 	}
 	if len(lines) != len(want) {
 		t.Fatalf("got %q, want %q", lines, want)
@@ -86,6 +98,54 @@ func TestRunDoctorReportsProblems(t *testing.T) {
 		if lines[i] != want[i] {
 			t.Errorf("line %d: got %q, want %q", i, lines[i], want[i])
 		}
+	}
+}
+
+func TestRunDoctorChecksBothScopes(t *testing.T) {
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "srv")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node","args":["index.js"]}`, "index.js": ""})
+	good := registration{Command: "node", Args: []string{filepath.Join(srv, "index.js")}}
+	writeRegistrations(t, dir, map[string]registration{"srv": good})
+	claude, err := json.Marshal(map[string]interface{}{
+		"mcpServers": map[string]registration{"srv": {Command: "node", Args: []string{"/old/index.js"}}},
+		"projects":   map[string]interface{}{dir: map[string]interface{}{"mcpServers": map[string]registration{"srv": good}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, os.Getenv("CLAUDE_CONFIG_DIR"), map[string]string{".claude.json": string(claude)})
+
+	stale := `srv: Claude Code (global) runs "node /old/index.js", want "node ` + filepath.Join(srv, "index.js") + `"`
+	assertDoctorLines(t, doctorScopes(false, false), []string{stale})
+	assertDoctorLines(t, doctorScopes(true, true), []string{stale})
+	assertDoctorLines(t, doctorScopes(true, false), nil)
+	assertDoctorLines(t, doctorScopes(false, true), []string{stale, "srv: not registered in Gemini CLI (global)"})
+}
+
+func TestDoctorScopes(t *testing.T) {
+	for _, tc := range []struct {
+		local, global bool
+		want          string
+	}{
+		{false, false, "[false true]"},
+		{true, true, "[false true]"},
+		{true, false, "[false]"},
+		{false, true, "[true]"},
+	} {
+		if got := fmt.Sprint(doctorScopes(tc.local, tc.global)); got != tc.want {
+			t.Errorf("doctorScopes(%v, %v) = %s, want %s", tc.local, tc.global, got, tc.want)
+		}
+	}
+}
+
+func TestWithScope(t *testing.T) {
+	got := withScope("Claude Code: Claude Code: bad", "Claude Code", injector.TargetClaudeCode, injector.ScopeGlobal)
+	if want := "Claude Code: Claude Code (global): bad"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := withScope("other: x", "srv", injector.TargetClaudeCode, injector.ScopeLocal); got != "other: x" {
+		t.Fatalf("foreign problem changed: %q", got)
 	}
 }
 
@@ -120,7 +180,7 @@ func TestRunDoctorReportsMissingEnv(t *testing.T) {
 		envServerDef{Command: "node", Args: args, Env: map[string]string{"API_KEY": "s3cret", "REGION": "eu"}})
 
 	var buf bytes.Buffer
-	n, err := runDoctor(&buf, doctorTools(false, false), false)
+	n, err := runDoctor(&buf, doctorTools(false, false), doctorScopes(false, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +193,7 @@ func TestRunDoctorReportsMissingEnv(t *testing.T) {
 	}
 
 	buf.Reset()
-	if n, err := runDoctor(&buf, []injector.TargetTool{injector.TargetGeminiCLI}, false); err != nil || n != 0 {
+	if n, err := runDoctor(&buf, []injector.TargetTool{injector.TargetGeminiCLI}, bothScopes); err != nil || n != 0 {
 		t.Fatalf("--gemini: got %d, %v: %q", n, err, buf.String())
 	}
 }
@@ -158,7 +218,7 @@ func TestCheckServerBuildErrors(t *testing.T) {
 		return &builder.BuildResult{Command: "bin", BuildErrors: []error{errors.New("boom")}}, nil
 	}
 
-	got := checkServer("x", []injector.TargetTool{injector.TargetClaudeCode}, false)
+	got := checkServer("x", []injector.TargetTool{injector.TargetClaudeCode}, []bool{false})
 	if len(got) != 1 || got[0] != "x: build failed: boom" {
 		t.Fatalf("got %q", got)
 	}
@@ -166,7 +226,7 @@ func TestCheckServerBuildErrors(t *testing.T) {
 
 func TestCheckServerMissingFolder(t *testing.T) {
 	chdirTemp(t)
-	got := checkServer("gone", doctorTools(false, false), false)
+	got := checkServer("gone", doctorTools(false, false), bothScopes)
 	if len(got) != 1 || !strings.HasPrefix(got[0], "gone: folder missing: ") {
 		t.Fatalf("got %q", got)
 	}
