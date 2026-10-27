@@ -27,7 +27,8 @@ var doctorCmd = &cobra.Command{
 	Use:   "doctor",
 	Short: "Check installed MCP servers for problems",
 	Long: `Check every server in .mcp/servers/: its folder exists, it still builds,
-and its registration in Claude Code and Gemini CLI runs the built command.
+its registration in Claude Code and Gemini CLI runs the built command, and
+the registration sets every environment variable its mcp.json requires.
 
 Prints one line per problem and exits with status 1 if it finds any.
 
@@ -100,7 +101,48 @@ func checkServer(name string, tools []injector.TargetTool, global bool) []string
 	if result.Command == "" {
 		return append(problems, fmt.Sprintf("%s: no project detected, nothing to run", name))
 	}
-	return append(problems, injector.Check(name, result, tools, global)...)
+	problems = append(problems, injector.Check(name, result, tools, global)...)
+	return append(problems, envProblems(name, result.EnvNeeds, tools, global)...)
+}
+
+// envProblems returns one line per registration of name in tools that lacks a
+// variable in required. A missing registration or an unreadable config is
+// already reported by injector.Check.
+func envProblems(name string, required []string, tools []injector.TargetTool, global bool) []string {
+	if len(required) == 0 {
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	defs, err := scopedEnvDefs(cwd, name, global)
+	if err != nil {
+		return nil
+	}
+	var problems []string
+	for _, tool := range tools {
+		def, ok := defs[tool]
+		if !ok {
+			continue
+		}
+		if missing := missingKeys(required, def.Env); len(missing) > 0 {
+			problems = append(problems, fmt.Sprintf("%s: %s (%s) is missing environment variable(s) %s (run mcpm env set %s KEY=VALUE)",
+				name, toolLabels[tool], scopeName(global), strings.Join(missing, ", "), name))
+		}
+	}
+	return problems
+}
+
+// missingKeys returns the keys that env does not set, in order.
+func missingKeys(keys []string, env map[string]string) []string {
+	var missing []string
+	for _, key := range keys {
+		if _, ok := env[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	return missing
 }
 
 var infoJSON bool

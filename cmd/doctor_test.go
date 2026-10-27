@@ -89,6 +89,65 @@ func TestRunDoctorReportsProblems(t *testing.T) {
 	}
 }
 
+// writeEnvRegistrations writes the Claude Code (local scope of dir) and
+// Gemini CLI (project) registrations of name, each with its own env.
+func writeEnvRegistrations(t *testing.T, dir, name string, claude, gemini envServerDef) {
+	t.Helper()
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	t.Setenv("HOME", t.TempDir())
+	claudeData, err := json.Marshal(map[string]interface{}{
+		"projects": map[string]interface{}{dir: map[string]interface{}{"mcpServers": map[string]envServerDef{name: claude}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	geminiData, err := json.Marshal(map[string]interface{}{"mcpServers": map[string]envServerDef{name: gemini}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, claudeDir, map[string]string{".claude.json": string(claudeData)})
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): string(geminiData)})
+}
+
+func TestRunDoctorReportsMissingEnv(t *testing.T) {
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "needy")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node","args":["index.js"],"requiredEnv":["API_KEY","REGION"]}`, "index.js": ""})
+	args := []string{filepath.Join(srv, "index.js")}
+	writeEnvRegistrations(t, dir, "needy",
+		envServerDef{Command: "node", Args: args, Env: map[string]string{"API_KEY": "s3cret"}},
+		envServerDef{Command: "node", Args: args, Env: map[string]string{"API_KEY": "s3cret", "REGION": "eu"}})
+
+	var buf bytes.Buffer
+	n, err := runDoctor(&buf, doctorTools(false, false), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "needy: Claude Code (local) is missing environment variable(s) REGION (run mcpm env set needy KEY=VALUE)\n"
+	if n != 1 || buf.String() != want {
+		t.Fatalf("got %d problems: %q, want %q", n, buf.String(), want)
+	}
+	if strings.Contains(buf.String(), "s3cret") {
+		t.Fatalf("env value printed: %q", buf.String())
+	}
+
+	buf.Reset()
+	if n, err := runDoctor(&buf, []injector.TargetTool{injector.TargetGeminiCLI}, false); err != nil || n != 0 {
+		t.Fatalf("--gemini: got %d, %v: %q", n, err, buf.String())
+	}
+}
+
+func TestMissingKeys(t *testing.T) {
+	got := missingKeys([]string{"A", "B", "C"}, map[string]string{"B": ""})
+	if strings.Join(got, ",") != "A,C" {
+		t.Fatalf("got %v", got)
+	}
+	if got := missingKeys([]string{"A"}, nil); len(got) != 1 {
+		t.Fatalf("nil env: got %v", got)
+	}
+}
+
 func TestCheckServerBuildErrors(t *testing.T) {
 	dir := chdirTemp(t)
 	writeFiles(t, filepath.Join(dir, ".mcp", "servers", "x"), map[string]string{"go.mod": ""})

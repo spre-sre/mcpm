@@ -29,12 +29,15 @@ type lockFile struct {
 // lockEntry records one installed server: where it came from, the commit
 // it is at and the clients it is registered in. Installer is "uv" for a
 // Python server managed with uv and empty (omitted) for every other server.
+// Env holds the names of the environment variables the server uses, never
+// their values.
 type lockEntry struct {
 	Name       string                `json:"name"`
 	Repository string                `json:"repository"`
 	Commit     string                `json:"commit"`
 	Targets    []injector.TargetTool `json:"targets"`
 	Installer  string                `json:"installer,omitempty"`
+	Env        []string              `json:"env,omitempty"`
 }
 
 // installerUV marks a lock entry whose server ships a uv.lock.
@@ -56,10 +59,11 @@ var exportCmd = &cobra.Command{
 	Short: "Write the installed MCP servers to mcpm.lock.json",
 	Long: `Write every server in .mcp/servers/ to mcpm.lock.json: its name, the
 repository URL it was cloned from, the commit it is at, and the clients
-(Claude Code, Gemini CLI) it is registered in. Use mcpm import to install
-the same set elsewhere.
+(Claude Code, Gemini CLI) it is registered in, and the names of the
+environment variables it uses. Use mcpm import to install the same set
+elsewhere.
 
-Environment variables are not written, so the file holds no secrets.
+Environment variable values are not written, so the file holds no secrets.
 
 Examples:
   mcpm export
@@ -111,7 +115,63 @@ func lockEntryFor(name string, global bool) (lockEntry, error) {
 	if err != nil {
 		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
 	}
-	return lockEntry{Name: name, Repository: url, Commit: commit, Targets: targets, Installer: serverInstaller(path)}, nil
+	env, err := lockEnvNames(name, global)
+	if err != nil {
+		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
+	}
+	return lockEntry{Name: name, Repository: url, Commit: commit, Targets: targets, Installer: serverInstaller(path), Env: env}, nil
+}
+
+// lockEnvNames returns the sorted names of the variables name requires in
+// its mcp.json or is given by a registration in the scope that install
+// writes to. Values are never read out. An unreadable mcp.json requires
+// nothing here; mcpm doctor reports it.
+func lockEnvNames(name string, global bool) ([]string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	required, _ := requiredEnv(name)
+	defs, err := scopedEnvDefs(cwd, name, global)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for _, key := range required {
+		seen[key] = true
+	}
+	for _, def := range defs {
+		for key := range def.Env {
+			seen[key] = true
+		}
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	return sortedEnvKeys(seen), nil
+}
+
+// scopedEnvDefs returns the Claude Code and Gemini CLI registrations of name
+// in one scope (project cwd, or global), keyed by client.
+func scopedEnvDefs(cwd, name string, global bool) (map[injector.TargetTool]envServerDef, error) {
+	defs := make(map[injector.TargetTool]envServerDef)
+	claude, err := claudeEnvTargets(cwd, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range claude {
+		if t.Scope == scopeName(global) {
+			defs[t.Tool] = t.Def
+		}
+	}
+	def, ok, err := geminiEnvDef(cwd, name, global)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		defs[injector.TargetGeminiCLI] = def
+	}
+	return defs, nil
 }
 
 // repoOrigin returns the origin URL and the HEAD commit of the repository at dir.

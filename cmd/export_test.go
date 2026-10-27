@@ -105,6 +105,52 @@ func TestBuildLockRecordsUV(t *testing.T) {
 	}
 }
 
+func TestBuildLockRecordsEnvNames(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	gitServer(t, filepath.Join(servers, "alpha"), "https://example.com/org/alpha", map[string]string{"mcp.json": `{"runCmd":"node","requiredEnv":["API_KEY"]}`})
+	gitServer(t, filepath.Join(servers, "beta"), "https://example.com/org/beta", map[string]string{"go.mod": "module b\n"})
+	writeEnvRegistrations(t, dir, "alpha",
+		envServerDef{Command: "node", Env: map[string]string{"TOKEN": "s3cret"}},
+		envServerDef{Command: "node", Env: map[string]string{"API_KEY": "hunter2"}})
+
+	lock, err := buildLock(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lock.Servers[0].Env; !slices.Equal(got, []string{"API_KEY", "TOKEN"}) {
+		t.Errorf("alpha env = %v", got)
+	}
+	if got := lock.Servers[1].Env; got != nil {
+		t.Errorf("beta env = %v", got)
+	}
+	if global, err := buildLock(true); err != nil || !slices.Equal(global.Servers[0].Env, []string{"API_KEY"}) {
+		t.Errorf("global: got %+v, %v", global.Servers, err)
+	}
+
+	path := filepath.Join(dir, lockFileName)
+	if err := writeLock(path, lock); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "s3cret") || strings.Contains(string(data), "hunter2") {
+		t.Fatalf("env value written: %s", data)
+	}
+	if n := strings.Count(string(data), `"env"`); n != 1 {
+		t.Fatalf("want env only on alpha, found %d: %s", n, data)
+	}
+	back, err := readLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(back.Servers[0].Env, []string{"API_KEY", "TOKEN"}) {
+		t.Fatalf("round trip: got %+v", back.Servers)
+	}
+}
+
 func TestBuildLockEmpty(t *testing.T) {
 	chdirTemp(t)
 	lock, err := buildLock(false)

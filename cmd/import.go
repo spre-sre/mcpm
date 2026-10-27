@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -38,8 +39,9 @@ its repository into .mcp/servers/, check out the recorded commit, build it
 and register it in the recorded clients.
 
 A server that is already installed from the same repository is checked out
-at the recorded commit and rebuilt. Environment variables are not in the
-lock file; servers that need them are listed after the import.
+at the recorded commit and rebuilt. The lock file holds the names of the
+environment variables but not their values; the variables each server still
+needs are listed after the import (set them with mcpm env set).
 
 Examples:
   mcpm import
@@ -90,6 +92,11 @@ func validateLockEntry(e lockEntry) error {
 			return fmt.Errorf("server '%s': unknown target %q", e.Name, t)
 		}
 	}
+	for _, key := range e.Env {
+		if !envKeyRe.MatchString(key) {
+			return fmt.Errorf("server '%s': invalid environment variable name %q", e.Name, key)
+		}
+	}
 	return nil
 }
 
@@ -117,15 +124,52 @@ func runImport(w io.Writer, lock lockFile, global bool) error {
 			return fmt.Errorf("server '%s': %w", e.Name, err)
 		}
 		fmt.Fprintf(w, "Installed %s at %s\n", e.Name, e.Commit[:12])
-		if len(envNeeds) > 0 {
-			needsEnv = append(needsEnv, fmt.Sprintf("  %s: %s", e.Name, strings.Join(envNeeds, ", ")))
+		if missing := unsetEnv(e, envNeeds, global); len(missing) > 0 {
+			needsEnv = append(needsEnv, fmt.Sprintf("  %s: %s", e.Name, strings.Join(missing, ", ")))
 		}
 	}
 	if len(needsEnv) > 0 {
-		fmt.Fprintln(w, "These servers need environment variables; set them in the client config:")
+		fmt.Fprintln(w, "These servers need environment variables; set them with mcpm env set <name> KEY=VALUE:")
 		fmt.Fprintln(w, strings.Join(needsEnv, "\n"))
 	}
 	return nil
+}
+
+// unsetEnv returns the sorted variables, recorded in e or required by the
+// built server, that a registration of e in its targets does not set yet.
+// When the registrations cannot be read, every variable is returned.
+func unsetEnv(e lockEntry, envNeeds []string, global bool) []string {
+	seen := make(map[string]bool)
+	for _, key := range append(slices.Clone(e.Env), envNeeds...) {
+		seen[key] = true
+	}
+	needed := sortedEnvKeys(seen)
+	cwd, err := os.Getwd()
+	if err != nil || len(e.Targets) == 0 {
+		return needed
+	}
+	defs, err := scopedEnvDefs(cwd, e.Name, global)
+	if err != nil {
+		return needed
+	}
+	var missing []string
+	for _, key := range needed {
+		if !setInAll(defs, e.Targets, key) {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+// setInAll reports whether the registration of every client in targets sets
+// key.
+func setInAll(defs map[injector.TargetTool]envServerDef, targets []injector.TargetTool, key string) bool {
+	for _, t := range targets {
+		if _, ok := defs[t].Env[key]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // importServer clones, checks out, builds and registers one server. It

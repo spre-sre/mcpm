@@ -126,6 +126,50 @@ func TestRunImportNoTargetsSkipsRegister(t *testing.T) {
 	}
 }
 
+func TestRunImportListsUnsetEnv(t *testing.T) {
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "alpha")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node","requiredEnv":["API_KEY"]}`})
+	commit := commitAll(t, srv)
+	fakeInstall(t, func(string) (string, error) { return srv, nil })
+	writeEnvRegistrations(t, dir, "alpha",
+		envServerDef{Command: "node", Env: map[string]string{"TOKEN": "x"}},
+		envServerDef{Command: "node"})
+
+	entry := lockEntry{Name: "alpha", Repository: "https://example.com/alpha", Commit: commit, Env: []string{"TOKEN", "REGION"}}
+	cases := []struct {
+		targets []injector.TargetTool
+		want    string
+	}{
+		{[]injector.TargetTool{injector.TargetClaudeCode}, "  alpha: API_KEY, REGION\n"},
+		{[]injector.TargetTool{injector.TargetClaudeCode, injector.TargetGeminiCLI}, "  alpha: API_KEY, REGION, TOKEN\n"},
+		{nil, "  alpha: API_KEY, REGION, TOKEN\n"},
+	}
+	for _, c := range cases {
+		entry.Targets = c.targets
+		var buf bytes.Buffer
+		if err := runImport(&buf, lockFile{Servers: []lockEntry{entry}}, false); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(buf.String(), "mcpm env set") || !strings.HasSuffix(buf.String(), c.want) {
+			t.Errorf("targets %v: output %q, want suffix %q", c.targets, buf.String(), c.want)
+		}
+	}
+
+	entry.Env = []string{"API_KEY", "TOKEN"}
+	entry.Targets = []injector.TargetTool{injector.TargetClaudeCode}
+	writeEnvRegistrations(t, dir, "alpha",
+		envServerDef{Command: "node", Env: map[string]string{"TOKEN": "x", "API_KEY": "y"}},
+		envServerDef{Command: "node"})
+	var buf bytes.Buffer
+	if err := runImport(&buf, lockFile{Servers: []lockEntry{entry}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "need environment variables") {
+		t.Errorf("all set, but output %q", buf.String())
+	}
+}
+
 func TestRunImportErrors(t *testing.T) {
 	dir := chdirTemp(t)
 	srv := filepath.Join(dir, ".mcp", "servers", "alpha")
@@ -162,6 +206,7 @@ func TestReadLockValidates(t *testing.T) {
 		{`{"servers":[{"name":"a","repository":"https://x/b.git","commit":"` + testCommit + `"}]}`, "installs as 'b'"},
 		{`{"servers":[{"name":"a","repository":"https://x/a.git","commit":"main"}]}`, "invalid commit"},
 		{`{"servers":[{"name":"a","repository":"https://x/a/","commit":"` + testCommit + `","targets":["vim"]}]}`, "unknown target"},
+		{`{"servers":[{"name":"a","repository":"https://x/a.git","commit":"` + testCommit + `","env":["A-B"]}]}`, "invalid environment variable name"},
 	}
 	for _, c := range cases {
 		writeFiles(t, dir, map[string]string{lockFileName: c.content})
