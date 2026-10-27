@@ -288,6 +288,49 @@ func TestRunDoctorChecksRegistrationBesideOff(t *testing.T) {
 	})
 }
 
+// writeRegisteredAgain installs srv, switches it off locally in both clients
+// and registers it again in the project Gemini CLI settings as gemini.
+func writeRegisteredAgain(t *testing.T, gemini string) string {
+	t.Helper()
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "srv")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node","args":["index.js"]}`, "index.js": ""})
+	writeRegistrations(t, dir, map[string]registration{})
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): gemini})
+	entry := json.RawMessage(`{"command":"node"}`)
+	writeOff(t, dir, false, offServers{"srv": {injector.TargetClaudeCode: entry, injector.TargetGeminiCLI: entry}})
+	return srv
+}
+
+func TestRunDoctorChecksRegisteredAgain(t *testing.T) {
+	srv := writeRegisteredAgain(t, `{"mcpServers": {"srv": {"command": "node", "args": ["/old/index.js"]}}}`)
+	stale := `srv: Gemini CLI (local) runs "node /old/index.js", want "node ` + filepath.Join(srv, "index.js") + `"`
+	assertDoctorLines(t, doctorScopes(false, false), []string{stale})
+
+	claudePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".claude.json")
+	writeFiles(t, os.Getenv("CLAUDE_CONFIG_DIR"), map[string]string{".claude.json": "{not json"})
+	var buf bytes.Buffer
+	if _, err := runDoctor(&buf, doctorTools(false, false), doctorScopes(false, false)); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, stale+"\n") || !strings.Contains(out, "srv: Claude Code (global): could not parse "+claudePath) {
+		t.Fatalf("broken Claude config: %q", out)
+	}
+}
+
+func TestRunDoctorChecksMalformedRegisteredAgain(t *testing.T) {
+	writeRegisteredAgain(t, `{"mcpServers": {"srv": {"command": "node", "args": "/old/index.js"}}}`)
+	var buf bytes.Buffer
+	n, err := runDoctor(&buf, doctorTools(false, false), doctorScopes(false, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || !strings.HasPrefix(buf.String(), "srv: Gemini CLI (local): could not parse ") {
+		t.Fatalf("got %d problems: %q", n, buf.String())
+	}
+}
+
 // setupInfoServer installs srv with a local Claude Code registration and a
 // global Gemini CLI registration that carries a secret env value.
 func setupInfoServer(t *testing.T) string {

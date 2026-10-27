@@ -37,7 +37,8 @@ server only has to be registered in one of them.
 
 A server switched off with mcpm disable is not reported as unregistered in
 the clients and scopes it is off in, and a server switched off everywhere
-it is checked is not checked at all.
+it is checked is not checked at all. A server registered again where it was
+switched off is on there and checked as usual.
 
 Prints one line per problem, naming the client and scope it belongs to, and
 exits with status 1 if it finds any.
@@ -118,6 +119,10 @@ func runDoctor(w io.Writer, tools []injector.TargetTool, scopes []bool) (int, er
 // offScopes holds the servers switched off in each scope, by global flag.
 type offScopes map[bool]offServers
 
+// loadOffScopes reads the servers switched off in each of scopes. A server
+// registered again in a client and scope it was switched off in is on there.
+// A client config that cannot be read leaves the server off; doctor reports
+// the config where it checks it.
 func loadOffScopes(cwd string, scopes []bool) (offScopes, error) {
 	off := make(offScopes)
 	for _, global := range scopes {
@@ -125,9 +130,22 @@ func loadOffScopes(cwd string, scopes []bool) (offScopes, error) {
 		if err != nil {
 			return nil, err
 		}
+		dropRegistered(cwd, servers, global)
 		off[global] = servers
 	}
 	return off, nil
+}
+
+// dropRegistered forgets each server in off that is registered again in the
+// client it is switched off in.
+func dropRegistered(cwd string, off offServers, global bool) {
+	for name, tools := range off {
+		for tool := range tools {
+			if entry, err := clientEntry(cwd, name, tool, global); err == nil && entry != nil {
+				off.drop(name, tool)
+			}
+		}
+	}
 }
 
 func (o offScopes) has(name string, tool injector.TargetTool, global bool) bool {
@@ -145,7 +163,8 @@ func (o offScopes) offIn(name string, tool injector.TargetTool, scopes []bool) b
 }
 
 // switchedOff reports whether name is switched off in each of tools, in one of
-// scopes at least, and registered in none of them, so no client starts it.
+// scopes at least, and registered in none of them, so no client starts it. A
+// client config that cannot be read counts as a registration to check.
 func (o offScopes) switchedOff(name string, tools []injector.TargetTool, scopes []bool) bool {
 	for _, tool := range tools {
 		if !o.offIn(name, tool, scopes) {
@@ -157,12 +176,8 @@ func (o offScopes) switchedOff(name string, tools []injector.TargetTool, scopes 
 		return false
 	}
 	for _, global := range scopes {
-		defs, err := scopedEnvDefs(cwd, name, global)
-		if err != nil {
-			return false
-		}
 		for _, tool := range tools {
-			if _, ok := defs[tool]; ok {
+			if entry, err := clientEntry(cwd, name, tool, global); err != nil || entry != nil {
 				return false
 			}
 		}
