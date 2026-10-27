@@ -74,6 +74,37 @@ func TestBuildLock(t *testing.T) {
 	}
 }
 
+func TestBuildLockRecordsUV(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	gitServer(t, filepath.Join(servers, "locked"), "https://example.com/org/locked", map[string]string{"pyproject.toml": "[project]\n", "uv.lock": ""})
+	gitServer(t, filepath.Join(servers, "pip"), "https://example.com/org/pip", map[string]string{"pyproject.toml": "[project]\n"})
+	gitServer(t, filepath.Join(servers, "stray"), "https://example.com/org/stray", map[string]string{"requirements.txt": "", "uv.lock": ""})
+
+	lock, err := buildLock(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"locked": installerUV, "pip": "", "stray": ""}
+	for _, e := range lock.Servers {
+		if e.Installer != want[e.Name] {
+			t.Errorf("%s: installer = %q, want %q", e.Name, e.Installer, want[e.Name])
+		}
+	}
+
+	path := filepath.Join(dir, lockFileName)
+	if err := writeLock(path, lock); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), `"installer"`); n != 1 {
+		t.Fatalf("want installer only on the uv server, found %d: %s", n, data)
+	}
+}
+
 func TestBuildLockEmpty(t *testing.T) {
 	chdirTemp(t)
 	lock, err := buildLock(false)

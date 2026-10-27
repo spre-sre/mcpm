@@ -27,12 +27,28 @@ type lockFile struct {
 }
 
 // lockEntry records one installed server: where it came from, the commit
-// it is at and the clients it is registered in.
+// it is at and the clients it is registered in. Installer is "uv" for a
+// Python server managed with uv and empty (omitted) for every other server.
 type lockEntry struct {
 	Name       string                `json:"name"`
 	Repository string                `json:"repository"`
 	Commit     string                `json:"commit"`
 	Targets    []injector.TargetTool `json:"targets"`
+	Installer  string                `json:"installer,omitempty"`
+}
+
+// installerUV marks a lock entry whose server ships a uv.lock.
+const installerUV = "uv"
+
+// serverInstaller returns installerUV when the server at dir is managed with
+// uv (a uv.lock next to its pyproject.toml) and "" otherwise.
+func serverInstaller(dir string) string {
+	for _, f := range []string{"uv.lock", "pyproject.toml"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			return ""
+		}
+	}
+	return installerUV
 }
 
 var exportCmd = &cobra.Command{
@@ -95,7 +111,7 @@ func lockEntryFor(name string, global bool) (lockEntry, error) {
 	if err != nil {
 		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
 	}
-	return lockEntry{Name: name, Repository: url, Commit: commit, Targets: targets}, nil
+	return lockEntry{Name: name, Repository: url, Commit: commit, Targets: targets, Installer: serverInstaller(path)}, nil
 }
 
 // repoOrigin returns the origin URL and the HEAD commit of the repository at dir.
