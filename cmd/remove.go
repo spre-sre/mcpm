@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"mcpm/internal/fetcher"
@@ -25,6 +27,8 @@ var removeCmd = &cobra.Command{
 	Use:   "remove <name>",
 	Short: "Remove an MCP server from Claude Code and/or Gemini CLI",
 	Long: `Remove an MCP server configuration from Claude Code and/or Gemini CLI.
+A server switched off with mcpm disable is forgotten, so mcpm enable cannot
+bring it back. To keep it for later, use mcpm disable instead.
 
 Examples:
   # Remove from both (current directory)
@@ -57,10 +61,7 @@ Examples:
 
 		cwd, _ := os.Getwd()
 
-		scope := "local"
-		if removeGlobal {
-			scope = "user"
-		}
+		scope := claudeScope(removeGlobal)
 
 		cmd.SilenceUsage = true
 		if removeDryRun {
@@ -69,11 +70,11 @@ Examples:
 		errs := make(map[string]error)
 
 		if removeClaudeCode {
-			reportRemove("Claude Code", name, removeFromClaudeCode(cwd, name, scope), errs)
+			reportRemove("Claude Code", name, removeOrForget(cwd, name, injector.TargetClaudeCode, removeGlobal), errs)
 		}
 
 		if removeGeminiCLI {
-			reportRemove("Gemini CLI", name, removeFromGeminiCLI(cwd, name, removeGlobal), errs)
+			reportRemove("Gemini CLI", name, removeOrForget(cwd, name, injector.TargetGeminiCLI, removeGlobal), errs)
 		}
 
 		clientErr := clientFailures("remove", errs)
@@ -106,11 +107,11 @@ func reportRemove(client, name string, err error, errs map[string]error) {
 func dryRunRemove(cwd, name, scope string) error {
 	errs := make(map[string]error)
 
-	if removeClaudeCode {
+	if removeClaudeCode && !dryRunForget(cwd, name, injector.TargetClaudeCode) {
 		fmt.Printf("Would run: claude mcp remove --scope %s %s\n", scope, name)
 	}
 
-	if removeGeminiCLI {
+	if removeGeminiCLI && !dryRunForget(cwd, name, injector.TargetGeminiCLI) {
 		configPath, err := geminiSettingsPath(cwd, removeGlobal)
 		if err == nil {
 			_, _, err = loadGeminiServer(configPath, name)
@@ -133,6 +134,39 @@ func dryRunRemove(cwd, name, scope string) error {
 	}
 	fmt.Printf("Would delete .mcp/servers/%s\n", name)
 	return clientErr
+}
+
+// dryRunForget prints that remove would forget the switched-off registration
+// of name in tool, and reports whether name is switched off there.
+func dryRunForget(cwd, name string, tool injector.TargetTool) bool {
+	off, path, err := loadOff(cwd, removeGlobal)
+	if err != nil || !off.has(name, tool) {
+		return false
+	}
+	fmt.Printf("Would forget switched-off %s in %s (%s)\n", name, toolLabels[tool], path)
+	return true
+}
+
+// removeOrForget removes name from tool in the scope. When name is switched
+// off there, it forgets the kept registration instead, so mcpm enable cannot
+// bring it back.
+func removeOrForget(cwd, name string, tool injector.TargetTool, global bool) error {
+	off, path, err := loadOff(cwd, global)
+	if err != nil {
+		return err
+	}
+	if !off.has(name, tool) {
+		return removeRegistration(cwd, name, tool, global)
+	}
+	off.drop(name, tool)
+	if err := saveOff(path, off); err != nil {
+		return err
+	}
+	entry, err := clientEntry(cwd, name, tool, global)
+	if err != nil || entry == nil {
+		return err
+	}
+	return removeRegistration(cwd, name, tool, global)
 }
 
 // purgeServer deletes the server directory and combines any purge failure
@@ -160,15 +194,28 @@ func removeFromClaudeCode(cwd, name, scope string) error {
 	cmdArgs := []string{"mcp", "remove", "--scope", scope, name}
 
 	// Run claude mcp remove command
-	cmd := exec.Command("claude", cmdArgs...)
-	cmd.Dir = cwd
-
-	output, err := cmd.CombinedOutput()
+	output, err := runClaude(cwd, cmdArgs...)
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, string(output))
 	}
 
 	return nil
+}
+
+// claudeScope returns the claude --scope value of the local or global scope.
+func claudeScope(global bool) string {
+	if global {
+		return "user"
+	}
+	return "local"
+}
+
+// removeRegistration removes name from tool in the local or global scope.
+func removeRegistration(cwd, name string, tool injector.TargetTool, global bool) error {
+	if tool == injector.TargetClaudeCode {
+		return removeFromClaudeCode(cwd, name, claudeScope(global))
+	}
+	return removeFromGeminiCLI(cwd, name, global)
 }
 
 // geminiSettingsPath returns the Gemini CLI settings file that remove edits.
@@ -283,7 +330,335 @@ func removeFromGeminiCLI(cwd, name string, global bool) error {
 	return os.WriteFile(configPath, newData, 0644)
 }
 
+var (
+	switchClaudeCode bool
+	switchGeminiCLI  bool
+	switchGlobal     bool
+)
+
+var disableCmd = &cobra.Command{
+	Use:     "disable <name>",
+	Aliases: []string{"off"},
+	Short:   "Switch an MCP server off in Claude Code and/or Gemini CLI without removing it",
+	Long: `Switch an MCP server off: Claude Code and Gemini CLI no longer start it,
+but mcpm keeps its folder in .mcp/servers, its build and its registration,
+including its environment variables, so mcpm enable switches it back on.
+
+The registrations taken out are kept in .mcp/disabled.json, or in
+~/.mcp/disabled-global.json with --global.
+
+Examples:
+  # Switch off in both (current directory)
+  mcpm disable myserver
+
+  # Switch off only in Claude Code
+  mcpm disable myserver --claude
+
+  # Switch off in the global configuration
+  mcpm disable myserver --global`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeServerNames,
+	RunE:              switchRunE(false),
+}
+
+var enableCmd = &cobra.Command{
+	Use:     "enable <name>",
+	Aliases: []string{"on"},
+	Short:   "Switch an MCP server that mcpm disable switched off back on",
+	Long: `Switch an MCP server back on: its registration in Claude Code and/or
+Gemini CLI is restored as it was when mcpm disable switched it off.
+
+Examples:
+  mcpm enable myserver
+  mcpm enable myserver --gemini
+  mcpm enable myserver --global`,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: completeServerNames,
+	RunE:              switchRunE(true),
+}
+
+func switchRunE(on bool) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		tools := doctorTools(switchClaudeCode, switchGeminiCLI)
+		return switchServer(cmd.OutOrStdout(), cmd.ErrOrStderr(), cwd, args[0], tools, switchGlobal, on)
+	}
+}
+
+// offServers maps a server name to the registrations mcpm disable took out of
+// each client: the client's entry as it was written.
+type offServers map[string]map[injector.TargetTool]json.RawMessage
+
+func (o offServers) has(name string, tool injector.TargetTool) bool {
+	_, ok := o[name][tool]
+	return ok
+}
+
+func (o offServers) keep(name string, tool injector.TargetTool, entry json.RawMessage) {
+	if o[name] == nil {
+		o[name] = make(map[injector.TargetTool]json.RawMessage)
+	}
+	o[name][tool] = entry
+}
+
+func (o offServers) drop(name string, tool injector.TargetTool) {
+	delete(o[name], tool)
+	if len(o[name]) == 0 {
+		delete(o, name)
+	}
+}
+
+// offPath returns the file that keeps the servers switched off in the project
+// cwd, or globally.
+func offPath(cwd string, global bool) (string, error) {
+	if !global {
+		return filepath.Join(cwd, ".mcp", "disabled.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not get home directory: %w", err)
+	}
+	return filepath.Join(home, ".mcp", "disabled-global.json"), nil
+}
+
+// loadOff reads the servers switched off in the scope and the path of the file
+// that keeps them. A missing file switches nothing off.
+func loadOff(cwd string, global bool) (offServers, string, error) {
+	path, err := offPath(cwd, global)
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(offServers), path, nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("could not read %s: %w", path, err)
+	}
+	var off offServers
+	if err := json.Unmarshal(data, &off); err != nil {
+		return nil, "", fmt.Errorf("could not parse %s: %w", path, err)
+	}
+	if off == nil {
+		off = make(offServers)
+	}
+	return off, path, nil
+}
+
+// saveOff writes off to path. The entries can hold environment values, so
+// only the owner can read the file.
+func saveOff(path string, off offServers) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(off, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeSettingsFile(path, data, true)
+}
+
+// rawClaudeConfig holds the user-scope servers and the local-scope servers of
+// each project in .claude.json, as written.
+type rawClaudeConfig struct {
+	McpServers map[string]json.RawMessage `json:"mcpServers"`
+	Projects   map[string]struct {
+		McpServers map[string]json.RawMessage `json:"mcpServers"`
+	} `json:"projects"`
+}
+
+// clientEntry returns the entry of name in tool's config for the scope as
+// written, or nil when name is not registered there.
+func clientEntry(cwd, name string, tool injector.TargetTool, global bool) (json.RawMessage, error) {
+	if tool == injector.TargetClaudeCode {
+		return claudeEntry(cwd, name, global)
+	}
+	return geminiEntry(cwd, name, global)
+}
+
+func claudeEntry(cwd, name string, global bool) (json.RawMessage, error) {
+	path, err := claudeJSONPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not read %s: %w", path, err)
+	}
+	var cfg rawClaudeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("could not parse %s: %w", path, err)
+	}
+	if global {
+		return cfg.McpServers[name], nil
+	}
+	return cfg.Projects[cwd].McpServers[name], nil
+}
+
+func geminiEntry(cwd, name string, global bool) (json.RawMessage, error) {
+	path, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := loadGeminiSettings(path)
+	if err != nil {
+		return nil, err
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	entry, ok := servers[name]
+	if !ok {
+		return nil, nil
+	}
+	return json.Marshal(entry)
+}
+
+// restoreEntry registers name in tool in the scope with the entry mcpm
+// disable kept.
+func restoreEntry(cwd, name string, tool injector.TargetTool, global bool, entry json.RawMessage) error {
+	if tool == injector.TargetGeminiCLI {
+		return restoreGeminiEntry(cwd, name, global, entry)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, entry); err != nil {
+		return fmt.Errorf("server %s: %w", name, err)
+	}
+	out, err := runClaude(cwd, "mcp", "add-json", "--scope", claudeScope(global), name, compact.String())
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, out)
+	}
+	return nil
+}
+
+// restoreGeminiEntry adds entry as name to the project or global Gemini CLI
+// settings and keeps every other field.
+func restoreGeminiEntry(cwd, name string, global bool, entry json.RawMessage) error {
+	path, err := geminiSettingsPath(cwd, global)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadGeminiSettings(path)
+	if err != nil {
+		return err
+	}
+	var value map[string]interface{}
+	if err := json.Unmarshal(entry, &value); err != nil {
+		return fmt.Errorf("server %s: %w", name, err)
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		servers = make(map[string]interface{})
+	}
+	servers[name] = value
+	cfg["mcpServers"] = servers
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("could not create .gemini dir: %w", err)
+	}
+	env, _ := value["env"].(map[string]interface{})
+	return writeSettingsFile(path, data, len(env) > 0)
+}
+
+// switchServer switches name off, or back on, in each of tools in the scope.
+// It reports each change to w and each failure to errW.
+func switchServer(w, errW io.Writer, cwd, name string, tools []injector.TargetTool, global, on bool) error {
+	off, path, err := loadOff(cwd, global)
+	if err != nil {
+		return err
+	}
+	state, action := "off", "switch off"
+	if on {
+		state, action = "on", "switch on"
+	}
+	errs := make(map[string]error)
+	for _, tool := range tools {
+		label := scopedLabel(tool, scopeName(global))
+		changed, err := switchTool(cwd, name, tool, global, on, off, path)
+		switch {
+		case err != nil:
+			fmt.Fprintf(errW, "Error switching %s %s in %s: %v\n", name, state, label, err)
+			errs[label] = err
+		case changed:
+			fmt.Fprintf(w, "Switched %s %s in %s\n", name, state, label)
+		default:
+			fmt.Fprintf(w, "%s is already %s in %s\n", name, state, label)
+		}
+	}
+	return clientFailures(action, errs)
+}
+
+// switchTool switches name off or on in tool in the scope, keeping off in
+// path, and reports whether anything changed.
+func switchTool(cwd, name string, tool injector.TargetTool, global, on bool, off offServers, path string) (bool, error) {
+	entry, err := clientEntry(cwd, name, tool, global)
+	if err != nil {
+		return false, err
+	}
+	if on {
+		return switchOn(cwd, name, tool, global, entry != nil, off, path)
+	}
+	return switchOff(cwd, name, tool, global, entry, off, path)
+}
+
+// switchOff keeps entry, the registration of name in tool, in off and then
+// removes the registration. If the removal fails, it forgets entry again.
+func switchOff(cwd, name string, tool injector.TargetTool, global bool, entry json.RawMessage, off offServers, path string) (bool, error) {
+	if entry == nil {
+		if off.has(name, tool) {
+			return false, nil
+		}
+		return false, fmt.Errorf("server %s not found", name)
+	}
+	off.keep(name, tool, entry)
+	if err := saveOff(path, off); err != nil {
+		return false, err
+	}
+	if err := removeRegistration(cwd, name, tool, global); err != nil {
+		off.drop(name, tool)
+		if saveErr := saveOff(path, off); saveErr != nil {
+			return false, fmt.Errorf("%w (forgetting the kept registration in %s also failed: %v)", err, path, saveErr)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// switchOn restores the registration of name in tool that off keeps and then
+// forgets it. A registration added since mcpm disable wins over the kept one.
+func switchOn(cwd, name string, tool injector.TargetTool, global, registered bool, off offServers, path string) (bool, error) {
+	entry, ok := off[name][tool]
+	if !ok && registered {
+		return false, nil
+	}
+	if !ok {
+		return false, fmt.Errorf("server %s is not switched off (run mcpm list to see which servers are off)", name)
+	}
+	if !registered {
+		if err := restoreEntry(cwd, name, tool, global, entry); err != nil {
+			return false, err
+		}
+	}
+	off.drop(name, tool)
+	return !registered, saveOff(path, off)
+}
+
 func init() {
+	for _, c := range []*cobra.Command{disableCmd, enableCmd} {
+		c.Flags().BoolVar(&switchClaudeCode, "claude", false, "Only Claude Code")
+		c.Flags().BoolVar(&switchGeminiCLI, "gemini", false, "Only Gemini CLI")
+		c.Flags().BoolVarP(&switchGlobal, "global", "g", false, "Global configuration")
+		rootCmd.AddCommand(c)
+	}
+
 	removeCmd.Flags().BoolVar(&removeClaudeCode, "claude", false, "Remove only from Claude Code")
 	removeCmd.Flags().BoolVar(&removeGeminiCLI, "gemini", false, "Remove only from Gemini CLI")
 	removeCmd.Flags().BoolVarP(&removeGlobal, "global", "g", false, "Remove from global configuration")

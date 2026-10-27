@@ -12,6 +12,8 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"mcpm/internal/injector"
 )
 
 func chdirTemp(t *testing.T) string {
@@ -235,6 +237,59 @@ func TestWriteListText(t *testing.T) {
 	want := "Installed MCP servers:\n  • alpha (" + filepath.Join(servers, "alpha") + ")\n"
 	if buf.String() != want {
 		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
+
+func TestWriteListMarksOff(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	servers := filepath.Join(dir, ".mcp", "servers")
+	for _, n := range []string{"alpha", "beta"} {
+		if err := os.MkdirAll(filepath.Join(servers, n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := json.RawMessage(`{"command":"node"}`)
+	writeOff(t, dir, false, offServers{"alpha": {injector.TargetGeminiCLI: entry, injector.TargetClaudeCode: entry}})
+	writeOff(t, dir, true, offServers{"alpha": {injector.TargetGeminiCLI: entry}, "ghost": {injector.TargetClaudeCode: entry}})
+
+	var buf bytes.Buffer
+	if err := writeList(&buf, false); err != nil {
+		t.Fatal(err)
+	}
+	want := "Installed MCP servers:\n" +
+		"  • alpha (" + filepath.Join(servers, "alpha") + ") [off: Claude Code (local), Gemini CLI (local), Gemini CLI (global)]\n" +
+		"  • beta (" + filepath.Join(servers, "beta") + ")\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+
+	buf.Reset()
+	if err := writeList(&buf, true); err != nil {
+		t.Fatal(err)
+	}
+	var got []listEntry
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Off != "Claude Code (local), Gemini CLI (local), Gemini CLI (global)" || got[1].Off != "" {
+		t.Fatalf("got %+v", got)
+	}
+	if strings.Count(buf.String(), `"off"`) != 1 {
+		t.Fatalf("want off only for alpha: %s", buf.String())
+	}
+}
+
+func TestWriteListBadOffFile(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	writeFiles(t, dir, map[string]string{filepath.Join(".mcp", "disabled.json"): "{"})
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp", "servers", "alpha"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := writeList(&buf, false); err == nil || !strings.Contains(err.Error(), "disabled.json") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

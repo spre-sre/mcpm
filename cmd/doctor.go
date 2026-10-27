@@ -35,6 +35,10 @@ Checks the local (project) and the global registrations in one run unless
 --local or --global limits it to one scope. When both scopes are checked, a
 server only has to be registered in one of them.
 
+A server switched off with mcpm disable is not reported as unregistered in
+the clients and scopes it is off in, and a server switched off everywhere
+it is checked is not checked at all.
+
 Prints one line per problem, naming the client and scope it belongs to, and
 exits with status 1 if it finds any.
 
@@ -91,9 +95,17 @@ func runDoctor(w io.Writer, tools []injector.TargetTool, scopes []bool) (int, er
 	if err != nil {
 		return 0, err
 	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return 0, err
+	}
+	off, err := loadOffScopes(cwd, scopes)
+	if err != nil {
+		return 0, err
+	}
 	count := 0
 	for _, name := range servers {
-		for _, problem := range checkServer(name, tools, scopes) {
+		for _, problem := range checkServer(name, tools, scopes, off) {
 			if _, err := fmt.Fprintln(w, problem); err != nil {
 				return count, err
 			}
@@ -103,9 +115,68 @@ func runDoctor(w io.Writer, tools []injector.TargetTool, scopes []bool) (int, er
 	return count, nil
 }
 
-// checkServer returns the problems of one installed server. Registration is
-// checked, in each of scopes, only when the server builds to a command.
-func checkServer(name string, tools []injector.TargetTool, scopes []bool) []string {
+// offScopes holds the servers switched off in each scope, by global flag.
+type offScopes map[bool]offServers
+
+func loadOffScopes(cwd string, scopes []bool) (offScopes, error) {
+	off := make(offScopes)
+	for _, global := range scopes {
+		servers, _, err := loadOff(cwd, global)
+		if err != nil {
+			return nil, err
+		}
+		off[global] = servers
+	}
+	return off, nil
+}
+
+func (o offScopes) has(name string, tool injector.TargetTool, global bool) bool {
+	return o[global].has(name, tool)
+}
+
+// offIn reports whether name is switched off in tool in one of scopes.
+func (o offScopes) offIn(name string, tool injector.TargetTool, scopes []bool) bool {
+	for _, global := range scopes {
+		if o.has(name, tool, global) {
+			return true
+		}
+	}
+	return false
+}
+
+// switchedOff reports whether name is switched off in each of tools, in one of
+// scopes at least, and registered in none of them, so no client starts it.
+func (o offScopes) switchedOff(name string, tools []injector.TargetTool, scopes []bool) bool {
+	for _, tool := range tools {
+		if !o.offIn(name, tool, scopes) {
+			return false
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	for _, global := range scopes {
+		defs, err := scopedEnvDefs(cwd, name, global)
+		if err != nil {
+			return false
+		}
+		for _, tool := range tools {
+			if _, ok := defs[tool]; ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// checkServer returns the problems of one installed server. A server switched
+// off everywhere it is checked has none. Registration is checked, in each of
+// scopes it is not switched off in, only when the server builds to a command.
+func checkServer(name string, tools []injector.TargetTool, scopes []bool, off offScopes) []string {
+	if off.switchedOff(name, tools, scopes) {
+		return nil
+	}
 	path, err := fetcher.GetServerPath(name)
 	if err != nil {
 		return []string{fmt.Sprintf("%s: folder missing: %v", name, err)}
@@ -122,7 +193,7 @@ func checkServer(name string, tools []injector.TargetTool, scopes []bool) []stri
 		return append(problems, fmt.Sprintf("%s: no project detected, nothing to run", name))
 	}
 	for _, tool := range tools {
-		problems = append(problems, registrationProblems(name, result, tool, scopes)...)
+		problems = append(problems, registrationProblems(name, result, tool, scopes, off)...)
 	}
 	for _, global := range scopes {
 		problems = append(problems, envProblems(name, result.EnvNeeds, tools, global)...)
@@ -131,26 +202,36 @@ func checkServer(name string, tools []injector.TargetTool, scopes []bool) []stri
 }
 
 // registrationProblems checks the registration of name in tool in each of
-// scopes and names the scope in every problem. When several scopes are
-// checked, name missing from one of them is a problem only if it is missing
-// from all.
-func registrationProblems(name string, result *builder.BuildResult, tool injector.TargetTool, scopes []bool) []string {
+// scopes it is not switched off in, and names the scope in every problem.
+// Name missing from a scope is a problem only if it is missing from every
+// checked scope and switched off in none.
+func registrationProblems(name string, result *builder.BuildResult, tool injector.TargetTool, scopes []bool, off offScopes) []string {
 	unregistered := fmt.Sprintf("%s: not registered in %s", name, toolLabels[tool])
 	var problems []string
 	missing := 0
 	for _, global := range scopes {
+		if off.has(name, tool, global) {
+			continue
+		}
 		problem := scopeProblem(name, result, tool, global)
 		if problem == unregistered {
 			missing++
-		}
-		if problem != "" && (problem != unregistered || len(scopes) == 1) {
+		} else if problem != "" {
 			problems = append(problems, withScope(problem, name, tool, scopeName(global)))
 		}
 	}
-	if len(scopes) > 1 && missing == len(scopes) {
-		problems = append(problems, withScope(unregistered, name, tool, injector.ScopeLocal+" or "+injector.ScopeGlobal))
+	if missing == len(scopes) {
+		problems = append(problems, withScope(unregistered, name, tool, scopesLabel(scopes)))
 	}
 	return problems
+}
+
+// scopesLabel names the checked scopes, e.g. "local or global".
+func scopesLabel(scopes []bool) string {
+	if len(scopes) == 1 {
+		return scopeName(scopes[0])
+	}
+	return injector.ScopeLocal + " or " + injector.ScopeGlobal
 }
 
 // scopeProblem returns the problem injector.Check finds with the registration

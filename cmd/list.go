@@ -13,12 +13,14 @@ import (
 	"github.com/spf13/cobra"
 	"mcpm/internal/builder"
 	"mcpm/internal/fetcher"
+	"mcpm/internal/injector"
 )
 
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List installed MCP servers",
 	Long: `List all MCP servers installed in the current directory's .mcp/servers/ folder.
+A server switched off with mcpm disable is marked with the clients it is off in.
 
 Examples:
   mcpm list
@@ -45,6 +47,37 @@ type listEntry struct {
 	BuildType  string `json:"buildType"`
 	RunCommand string `json:"runCommand"`
 	Commit     string `json:"commit"`
+	// Off names the clients and scopes the server is switched off in, e.g.
+	// "Claude Code (local), Gemini CLI (global)".
+	Off string `json:"off,omitempty"`
+}
+
+// markOff fills in Off for each entry switched off locally or globally.
+func markOff(cwd string, entries []listEntry) error {
+	for _, global := range bothScopes {
+		off, _, err := loadOff(cwd, global)
+		if err != nil {
+			return err
+		}
+		for i := range entries {
+			entries[i].Off = appendOff(entries[i].Off, off, entries[i].Name, global)
+		}
+	}
+	return nil
+}
+
+// appendOff adds to labels each client name is switched off in, in off.
+func appendOff(labels string, off offServers, name string, global bool) string {
+	for _, tool := range []injector.TargetTool{injector.TargetClaudeCode, injector.TargetGeminiCLI} {
+		if !off.has(name, tool) {
+			continue
+		}
+		if labels != "" {
+			labels += ", "
+		}
+		labels += scopedLabel(tool, scopeName(global))
+	}
+	return labels
 }
 
 // describeServer fills in the build type, run command and git commit of the
@@ -154,40 +187,61 @@ func fileExists(path string) bool {
 
 // writeList writes the installed servers to w, as a JSON array or as text.
 func writeList(w io.Writer, asJSON bool) error {
-	servers, err := fetcher.ListServers()
+	entries, err := listEntries()
 	if err != nil {
 		return err
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-
-	entries := make([]listEntry, 0, len(servers))
-	for _, name := range servers {
-		entries = append(entries, listEntry{Name: name, Path: filepath.Join(cwd, ".mcp", "servers", name)})
-	}
-
 	if asJSON {
 		for i := range entries {
 			describeServer(&entries[i])
 		}
 		return json.NewEncoder(w).Encode(entries)
 	}
+	return writeListText(w, entries)
+}
 
+// listEntries returns one entry per installed server, with Off filled in.
+func listEntries() ([]listEntry, error) {
+	servers, err := fetcher.ListServers()
+	if err != nil {
+		return nil, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]listEntry, 0, len(servers))
+	for _, name := range servers {
+		entries = append(entries, listEntry{Name: name, Path: filepath.Join(cwd, ".mcp", "servers", name)})
+	}
+	if err := markOff(cwd, entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// writeListText writes entries to w as human-readable text.
+func writeListText(w io.Writer, entries []listEntry) error {
 	if len(entries) == 0 {
-		_, err = fmt.Fprintln(w, "No servers installed in .mcp/servers/")
+		_, err := fmt.Fprintln(w, "No servers installed in .mcp/servers/")
 		return err
 	}
-	if _, err = fmt.Fprintln(w, "Installed MCP servers:"); err != nil {
+	if _, err := fmt.Fprintln(w, "Installed MCP servers:"); err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if _, err = fmt.Fprintf(w, "  • %s (%s)\n", e.Name, e.Path); err != nil {
+		if _, err := fmt.Fprintf(w, "  • %s (%s)%s\n", e.Name, e.Path, offSuffix(e.Off)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func offSuffix(off string) string {
+	if off == "" {
+		return ""
+	}
+	return " [off: " + off + "]"
 }
 
 // writeNames writes the installed server names to w, one per line.

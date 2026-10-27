@@ -218,7 +218,7 @@ func TestCheckServerBuildErrors(t *testing.T) {
 		return &builder.BuildResult{Command: "bin", BuildErrors: []error{errors.New("boom")}}, nil
 	}
 
-	got := checkServer("x", []injector.TargetTool{injector.TargetClaudeCode}, []bool{false})
+	got := checkServer("x", []injector.TargetTool{injector.TargetClaudeCode}, []bool{false}, nil)
 	if len(got) != 1 || got[0] != "x: build failed: boom" {
 		t.Fatalf("got %q", got)
 	}
@@ -226,10 +226,66 @@ func TestCheckServerBuildErrors(t *testing.T) {
 
 func TestCheckServerMissingFolder(t *testing.T) {
 	chdirTemp(t)
-	got := checkServer("gone", doctorTools(false, false), bothScopes)
+	got := checkServer("gone", doctorTools(false, false), bothScopes, nil)
 	if len(got) != 1 || !strings.HasPrefix(got[0], "gone: folder missing: ") {
 		t.Fatalf("got %q", got)
 	}
+}
+
+// writeOff writes the servers switched off in the project dir, or globally
+// under $HOME.
+func writeOff(t *testing.T, dir string, global bool, off offServers) {
+	t.Helper()
+	path, err := offPath(dir, global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveOff(path, off); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunDoctorSkipsSwitchedOff(t *testing.T) {
+	dir := chdirTemp(t)
+	servers := filepath.Join(dir, ".mcp", "servers")
+	writeFiles(t, filepath.Join(servers, "broken"), map[string]string{"mcp.json": `{"runCmd":""}`})
+	writeFiles(t, filepath.Join(servers, "half"), map[string]string{"mcp.json": `{"runCmd":"node"}`})
+	writeRegistrations(t, dir, map[string]registration{})
+	entry := json.RawMessage(`{"command":"node"}`)
+	writeOff(t, dir, false, offServers{
+		"broken": {injector.TargetClaudeCode: entry, injector.TargetGeminiCLI: entry},
+		"half":   {injector.TargetClaudeCode: entry},
+	})
+
+	assertDoctorLines(t, doctorScopes(false, false), []string{
+		"half: not registered in Gemini CLI (local or global)",
+	})
+	// Off locally only: a global check still checks the server.
+	assertDoctorLines(t, doctorScopes(false, true), []string{
+		"broken: build failed: invalid mcp.json: runCmd is required",
+		"half: not registered in Claude Code (global)",
+		"half: not registered in Gemini CLI (global)",
+	})
+}
+
+func TestRunDoctorChecksRegistrationBesideOff(t *testing.T) {
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "srv")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node","args":["index.js"]}`, "index.js": ""})
+	writeRegistrations(t, dir, map[string]registration{})
+	claude, err := json.Marshal(map[string]interface{}{
+		"mcpServers": map[string]registration{"srv": {Command: "node", Args: []string{"/old/index.js"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFiles(t, os.Getenv("CLAUDE_CONFIG_DIR"), map[string]string{".claude.json": string(claude)})
+	entry := json.RawMessage(`{"command":"node"}`)
+	writeOff(t, dir, false, offServers{"srv": {injector.TargetClaudeCode: entry, injector.TargetGeminiCLI: entry}})
+
+	assertDoctorLines(t, doctorScopes(false, false), []string{
+		`srv: Claude Code (global) runs "node /old/index.js", want "node ` + filepath.Join(srv, "index.js") + `"`,
+	})
 }
 
 // setupInfoServer installs srv with a local Claude Code registration and a
