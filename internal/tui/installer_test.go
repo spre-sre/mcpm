@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"mcpm/internal/builder"
@@ -192,6 +193,37 @@ func TestModelViewBuilding(t *testing.T) {
 	m.state = stateBuilding
 	if v := m.View(); !strings.Contains(v, "Analyzing and building project...") {
 		t.Fatalf("unexpected building view: %q", v)
+	}
+}
+
+func TestModelViewProgressShowsNameAndElapsed(t *testing.T) {
+	for _, state := range []sessionState{stateFetching, stateBuilding} {
+		m := NewInstallModel("", "github-mcp", false)
+		m.state = state
+		m.now = func() time.Time { return m.started.Add(12*time.Second + 900*time.Millisecond) }
+		v := m.View()
+		if !strings.Contains(v, "Installing github-mcp (12s)") {
+			t.Fatalf("state %v: expected name and elapsed seconds, got %q", state, v)
+		}
+		if !strings.HasPrefix(v, m.spinner.View()) {
+			t.Fatalf("state %v: expected spinner at start of line, got %q", state, v)
+		}
+	}
+}
+
+func TestModelElapsedSeconds(t *testing.T) {
+	m := NewInstallModel("", "repo", false)
+	if s := m.elapsedSeconds(); s != 0 {
+		t.Fatalf("expected 0s right after start, got %d", s)
+	}
+	m.now = func() time.Time { return m.started.Add(-time.Second) }
+	if s := m.elapsedSeconds(); s != 0 {
+		t.Fatalf("expected negative elapsed clamped to 0, got %d", s)
+	}
+	m.now = nil
+	m.started = time.Now().Add(-3 * time.Second)
+	if s := m.elapsedSeconds(); s < 3 {
+		t.Fatalf("expected at least 3s with default clock, got %d", s)
 	}
 }
 

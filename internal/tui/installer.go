@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -29,6 +30,9 @@ type Model struct {
 	buildResult *builder.BuildResult
 	global      bool
 
+	started time.Time
+	now     func() time.Time // clock used for elapsed time; overridable in tests
+
 	spinner    spinner.Model
 	inputs     []textinput.Model
 	focusIndex int
@@ -53,6 +57,8 @@ func NewInstallModel(repoUrl, repoName string, global bool) Model {
 		repoUrl:  repoUrl,
 		repoName: repoName,
 		global:   global,
+		started:  time.Now(),
+		now:      time.Now,
 		spinner:  s,
 		clients:  []string{fmt.Sprintf("Claude Code (%s)", scope), fmt.Sprintf("Gemini CLI (%s)", scope)},
 		selected: map[int]bool{0: true, 1: true},
@@ -117,6 +123,24 @@ func (m Model) Err() error {
 	return m.err
 }
 
+// elapsedSeconds returns the whole seconds since the install started.
+func (m Model) elapsedSeconds() int {
+	now := m.now
+	if now == nil {
+		now = time.Now
+	}
+	secs := int(now().Sub(m.started) / time.Second)
+	if secs < 0 {
+		return 0
+	}
+	return secs
+}
+
+// progressLine renders the spinner line, e.g. "⣾ Installing github-mcp (12s) · Fetching github-mcp...".
+func (m Model) progressLine(phase string) string {
+	return fmt.Sprintf("%s Installing %s (%ds) · %s", m.spinner.View(), m.repoName, m.elapsedSeconds(), phase)
+}
+
 func (m Model) View() string {
 	if m.err != nil {
 		return errorStyle.Render(fmt.Sprintf("L Error: %v\n", m.err))
@@ -124,9 +148,9 @@ func (m Model) View() string {
 
 	switch m.state {
 	case stateFetching:
-		return fmt.Sprintf("%s Fetching %s...", m.spinner.View(), m.repoName)
+		return m.progressLine(fmt.Sprintf("Fetching %s...", m.repoName))
 	case stateBuilding:
-		return fmt.Sprintf("%s Analyzing and building project...", m.spinner.View())
+		return m.progressLine("Analyzing and building project...")
 	case stateConfigEnv:
 		var b strings.Builder
 		b.WriteString(titleStyle.Render("Configuration Required"))
