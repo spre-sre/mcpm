@@ -33,6 +33,29 @@ func TestClassifyStatusCodeAllCodes(t *testing.T) {
 	}
 }
 
+func TestClassifyLaunchCommand(t *testing.T) {
+	cases := map[string]string{
+		"":                        "unknown",
+		"   ":                     "unknown",
+		"node":                    "node",
+		"npx":                     "node",
+		"/usr/local/bin/node":     "node",
+		"python3":                 "python",
+		"uvx":                     "python",
+		"go":                      "go",
+		"docker":                  "docker",
+		"Node.exe":                "node",
+		"/srv/mcp/bin/server":     "binary",
+		"./server":                "binary",
+		"/opt/servers/github-mcp": "binary",
+	}
+	for command, want := range cases {
+		if got := ClassifyLaunchCommand(command); got != want {
+			t.Errorf("ClassifyLaunchCommand(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
 func TestEvaluateRiskScoreAllCombinations(t *testing.T) {
 	for mask := 0; mask < 1<<12; mask++ {
 		var flags [12]bool
