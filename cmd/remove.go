@@ -587,8 +587,8 @@ type switchResult struct {
 }
 
 // switchServer switches name off, or back on, in each of tools in the scope.
-// It reports each change to w and each failure to errW. Clients that do not
-// have name are only reported, unless none of tools has it.
+// It reports each change to w and each failure and skipped client to errW.
+// Clients that do not have name are only reported, unless none of tools has it.
 func switchServer(w, errW io.Writer, cwd, name string, tools []injector.TargetTool, global, on bool) error {
 	off, path, err := loadOff(cwd, global)
 	if err != nil {
@@ -617,7 +617,7 @@ func reportSwitch(w, errW io.Writer, name string, on bool, results []switchResul
 	for _, r := range results {
 		switch {
 		case isAbsent(r.err) && !allAbsent:
-			fmt.Fprintf(w, "Skipped %s: %v\n", r.label, r.err)
+			fmt.Fprintf(errW, "Skipped %s: %v\n", r.label, r.err)
 		case r.err != nil:
 			fmt.Fprintf(errW, "Error switching %s %s in %s: %v\n", name, state, r.label, r.err)
 			errs[r.label] = r.err

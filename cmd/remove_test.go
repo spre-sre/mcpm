@@ -377,6 +377,26 @@ func TestSwitchSkipsClientsWithoutServer(t *testing.T) {
 	}
 }
 
+func TestSwitchPrintsSkippedOnStderr(t *testing.T) {
+	dir := switchFixture(t)
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): `{"mcpServers": {"srv": {"command": "node"}}}`})
+	stubClaude(t, nil)
+	both := doctorTools(false, false)
+
+	for _, on := range []bool{false, true} {
+		var out, errOut bytes.Buffer
+		if err := switchServer(&out, &errOut, dir, "srv", both, false, on); err != nil {
+			t.Fatalf("on=%v: %v", on, err)
+		}
+		if strings.Contains(out.String(), "Skipped") || !strings.Contains(out.String(), "Switched srv") {
+			t.Errorf("on=%v: stdout = %q", on, out.String())
+		}
+		if !strings.Contains(errOut.String(), "Skipped Claude Code (local)") {
+			t.Errorf("on=%v: stderr = %q", on, errOut.String())
+		}
+	}
+}
+
 func TestRemoveForgetsSwitchedOff(t *testing.T) {
 	dir := switchFixture(t)
 	writeOff(t, dir, false, offServers{"srv": {injector.TargetGeminiCLI: json.RawMessage(`{"command":"x"}`)}})
