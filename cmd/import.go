@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -36,7 +37,8 @@ var importCmd = &cobra.Command{
 	Short: "Install the MCP servers listed in mcpm.lock.json",
 	Long: `Install every server in mcpm.lock.json (written by mcpm export): clone
 its repository into .mcp/servers/, check out the recorded commit, build it
-and register it in the recorded clients.
+and register it in the recorded clients. A server exported with a pinned
+version stays pinned to it, so mcpm update keeps it there.
 
 A server that is already installed from the same repository is checked out
 at the recorded commit and rebuilt. The lock file holds the names of the
@@ -87,6 +89,15 @@ func validateLockEntry(e lockEntry) error {
 	if !isCommitHash(e.Commit) {
 		return fmt.Errorf("server '%s': invalid commit %q", e.Name, e.Commit)
 	}
+	if !validPin(e.Pin) {
+		return fmt.Errorf("server '%s': invalid pin %q", e.Name, e.Pin)
+	}
+	return validateLockLists(e)
+}
+
+// validateLockLists rejects an entry with an unknown target or an invalid
+// environment variable name.
+func validateLockLists(e lockEntry) error {
 	for _, t := range e.Targets {
 		if t != injector.TargetClaudeCode && t != injector.TargetGeminiCLI {
 			return fmt.Errorf("server '%s': unknown target %q", e.Name, t)
@@ -111,6 +122,34 @@ func isCommitHash(s string) bool {
 	return len(s) == 40 && err == nil
 }
 
+// validPin reports whether pin is empty or a tag or branch reference that
+// git accepts. Import writes a pinned branch as a ref file, so a name such as
+// "refs/heads/../../x" must not pass.
+func validPin(pin string) bool {
+	if pin == "" {
+		return true
+	}
+	ref := plumbing.ReferenceName(pin)
+	if !ref.IsTag() && !ref.IsBranch() {
+		return false
+	}
+	return validRefPath(strings.TrimPrefix(strings.TrimPrefix(pin, "refs/tags/"), "refs/heads/"))
+}
+
+// validRefPath applies git check-ref-format rules to the short name of a
+// reference.
+func validRefPath(short string) bool {
+	for _, part := range strings.Split(short, "/") {
+		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	if strings.Contains(short, "..") || strings.Contains(short, "@{") || strings.HasSuffix(short, ".") {
+		return false
+	}
+	return !strings.ContainsAny(short, " ~^:?*[\\") && strings.IndexFunc(short, unicode.IsControl) < 0
+}
+
 // runImport installs each server of lock in order and stops at the first
 // failure. It writes one line per installed server to w.
 func runImport(w io.Writer, lock lockFile, global bool) error {
@@ -123,7 +162,7 @@ func runImport(w io.Writer, lock lockFile, global bool) error {
 		if err != nil {
 			return fmt.Errorf("server '%s': %w", e.Name, err)
 		}
-		fmt.Fprintf(w, "Installed %s at %s\n", e.Name, e.Commit[:12])
+		fmt.Fprintf(w, "Installed %s at %s%s\n", e.Name, e.Commit[:12], pinSuffix(e.Pin))
 		if missing := unsetEnv(e, envNeeds, global); len(missing) > 0 {
 			needsEnv = append(needsEnv, fmt.Sprintf("  %s: %s", e.Name, strings.Join(missing, ", ")))
 		}
@@ -185,6 +224,9 @@ func importServer(e lockEntry, global bool) ([]string, error) {
 	if err := checkoutCommit(path, e.Commit); err != nil {
 		return nil, err
 	}
+	if err := keepPin(path, e); err != nil {
+		return nil, err
+	}
 	result, err := detectAndBuild(path)
 	if err != nil {
 		return nil, err
@@ -219,6 +261,58 @@ func checkoutCommit(dir, commit string) error {
 	}
 	if err := wt.Checkout(&git.CheckoutOptions{Hash: hash, Force: true}); err != nil {
 		return fmt.Errorf("failed to check out %s: %w", commit, err)
+	}
+	return nil
+}
+
+// keepPin records the pin of e in the repository at dir, as install does, so
+// update keeps the server on it. A pinned branch is checked out at e.Commit
+// so update can pull it. An entry without a pin clears an earlier pin of a
+// server that was already installed.
+func keepPin(dir string, e lockEntry) error {
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+	pin := plumbing.ReferenceName(e.Pin)
+	if pin == "" {
+		return clearPin(repo)
+	}
+	if pin.IsBranch() {
+		if err := checkoutBranchAt(repo, pin, e.Commit); err != nil {
+			return err
+		}
+	}
+	if err := recordPin(repo, pin); err != nil {
+		return fmt.Errorf("failed to record pin %s: %w", pin.Short(), err)
+	}
+	return nil
+}
+
+func clearPin(repo *git.Repository) error {
+	cfg, err := repo.Config()
+	if err != nil {
+		return err
+	}
+	if cfg.Raw.Section(pinSection).Option(pinOption) == "" {
+		return nil
+	}
+	cfg.Raw.Section(pinSection).RemoveOption(pinOption)
+	return repo.SetConfig(cfg)
+}
+
+// checkoutBranchAt points branch at commit and checks it out.
+func checkoutBranchAt(repo *git.Repository, branch plumbing.ReferenceName, commit string) error {
+	ref := plumbing.NewHashReference(branch, plumbing.NewHash(commit))
+	if err := repo.Storer.SetReference(ref); err != nil {
+		return fmt.Errorf("failed to set branch %s: %w", branch.Short(), err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+	if err := wt.Checkout(&git.CheckoutOptions{Branch: branch, Force: true}); err != nil {
+		return fmt.Errorf("failed to check out branch %s: %w", branch.Short(), err)
 	}
 	return nil
 }

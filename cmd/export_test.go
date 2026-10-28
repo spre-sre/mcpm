@@ -105,6 +105,48 @@ func TestBuildLockRecordsUV(t *testing.T) {
 	}
 }
 
+func TestBuildLockRecordsPin(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	servers := filepath.Join(dir, ".mcp", "servers")
+	gitServer(t, filepath.Join(servers, "pinned"), "https://example.com/org/pinned", map[string]string{"go.mod": "module p\n"})
+	gitServer(t, filepath.Join(servers, "plain"), "https://example.com/org/plain", map[string]string{"go.mod": "module q\n"})
+	repo, err := git.PlainOpen(filepath.Join(servers, "pinned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPin(repo, "refs/tags/v1.2.0"); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := buildLock(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lock.Servers) != 2 || lock.Servers[0].Pin != "refs/tags/v1.2.0" || lock.Servers[1].Pin != "" {
+		t.Fatalf("got %+v", lock.Servers)
+	}
+	path := filepath.Join(dir, lockFileName)
+	if err := writeLock(path, lock); err != nil {
+		t.Fatal(err)
+	}
+	back, err := readLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Servers[0].Pin != "refs/tags/v1.2.0" {
+		t.Fatalf("round trip lost the pin: %+v", back.Servers[0])
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), `"pin"`); n != 1 {
+		t.Fatalf("want pin only on the pinned server, found %d: %s", n, data)
+	}
+}
+
 func TestBuildLockRecordsEnvNames(t *testing.T) {
 	dir := chdirTemp(t)
 	servers := filepath.Join(dir, ".mcp", "servers")

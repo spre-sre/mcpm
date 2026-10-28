@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/go-git/go-git/v5"
@@ -42,7 +44,11 @@ Examples:
 
 A server installed at a pinned version (mcpm install @owner/repo#v1.2.0)
 stays pinned: a pinned tag is kept as is and a pinned branch only pulls
-new commits of that branch.`,
+new commits of that branch.
+
+update --all ends with a summary of the servers it updated, those already
+current, those kept on their pin and those that failed, with the reason.
+It exits with status 1 when any server failed.`,
 	Args:              cobra.MaximumNArgs(1),
 	ValidArgsFunction: completeServerNames,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -85,17 +91,78 @@ func updateAllServers(update func(name string, global bool) error) bool {
 	_, verb := updateAction()
 	reportSuccess := !updateDryRun && !updateCheck
 
-	ok := true
+	var summary updateSummary
 	for _, name := range servers {
 		fmt.Printf("%s %s...\n", verb, name)
-		if err := update(name, updateGlobal); err != nil {
+		before := readServerState(name)
+		err := update(name, updateGlobal)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "  Error: %v\n", err)
-			ok = false
 		} else if reportSuccess {
 			fmt.Printf("  Updated successfully\n")
 		}
+		summary.record(name, before, err)
 	}
-	return ok
+	if reportSuccess {
+		summary.write(os.Stdout)
+	}
+	return len(summary.failed) == 0
+}
+
+// serverState is what update --all reads of a server before updating it.
+type serverState struct {
+	path string
+	head string
+	pin  plumbing.ReferenceName
+}
+
+// readServerState returns the path, HEAD commit and pin of name. A value that
+// cannot be read stays empty; update reports the error.
+func readServerState(name string) serverState {
+	path, err := fetcher.GetServerPath(name)
+	if err != nil {
+		return serverState{}
+	}
+	pin, _ := serverPin(path)
+	return serverState{path: path, head: headCommit(path), pin: pin}
+}
+
+// updateSummary sorts the servers of update --all by outcome.
+type updateSummary struct {
+	updated, current, pinned, failed []string
+}
+
+// record files name under its outcome: failed with err, kept on a pinned tag,
+// already current when HEAD did not move, or updated.
+func (s *updateSummary) record(name string, before serverState, err error) {
+	switch {
+	case err != nil:
+		s.failed = append(s.failed, fmt.Sprintf("%s (%v)", name, err))
+	case before.pin.IsTag():
+		s.pinned = append(s.pinned, fmt.Sprintf("%s (%s)", name, before.pin.Short()))
+	case headCommit(before.path) == before.head:
+		s.current = append(s.current, name)
+	default:
+		s.updated = append(s.updated, name)
+	}
+}
+
+// write prints one line per outcome that has servers. Each failure gets its
+// own line, so its reason stays readable.
+func (s *updateSummary) write(w io.Writer) {
+	fmt.Fprintln(w, "Summary:")
+	writeSummaryLine(w, "Updated", s.updated)
+	writeSummaryLine(w, "Already current", s.current)
+	writeSummaryLine(w, "Kept on pin", s.pinned)
+	for _, f := range s.failed {
+		fmt.Fprintf(w, "  Failed: %s\n", f)
+	}
+}
+
+func writeSummaryLine(w io.Writer, label string, names []string) {
+	if len(names) > 0 {
+		fmt.Fprintf(w, "  %s: %s\n", label, strings.Join(names, ", "))
+	}
 }
 
 // updateAction returns the per-server function and progress verb selected

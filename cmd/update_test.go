@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -352,6 +353,70 @@ func TestDryRunUpdatePinned(t *testing.T) {
 	})
 	if !strings.Contains(out, "Would keep pinned version v1") {
 		t.Fatalf("dry-run output %q", out)
+	}
+}
+
+func TestUpdateAllServersSummary(t *testing.T) {
+	dir := chdirTemp(t)
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	setUpstreamRef(t, upstream, "refs/tags/v1.2.0", commitAll(t, upstream))
+	clonePinnedServer(t, dir, upstream, "pinned", "refs/tags/v1.2.0")
+	servers := filepath.Join(dir, ".mcp", "servers")
+	for _, name := range []string{"current", "moved"} {
+		if _, err := git.PlainClone(filepath.Join(servers, name), false, &git.CloneOptions{URL: upstream}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(servers, "broken"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDry, oldCheck := updateDryRun, updateCheck
+	t.Cleanup(func() { updateDryRun, updateCheck = oldDry, oldCheck })
+	updateDryRun, updateCheck = false, false
+
+	update := func(name string, _ bool) error {
+		switch name {
+		case "broken":
+			return errors.New("failed to pull: not a repository")
+		case "moved":
+			commitMore(t, filepath.Join(servers, name), map[string]string{"README": "v2"})
+		}
+		return nil
+	}
+	var ok bool
+	out := captureStdout(t, func() { ok = updateAllServers(update) })
+	if ok {
+		t.Error("updateAllServers reported success with a failed server")
+	}
+	want := "Summary:\n" +
+		"  Updated: moved\n" +
+		"  Already current: current\n" +
+		"  Kept on pin: pinned (v1.2.0)\n" +
+		"  Failed: broken (failed to pull: not a repository)\n"
+	if !strings.HasSuffix(out, want) {
+		t.Fatalf("output %q, want suffix %q", out, want)
+	}
+
+	out = captureStdout(t, func() {
+		ok = updateAllServers(func(name string, _ bool) error { return nil })
+	})
+	if !ok || strings.Contains(out, "Failed:") {
+		t.Fatalf("all succeeded: ok %v, output %q", ok, out)
+	}
+}
+
+func TestUpdateAllServersDryRunNoSummary(t *testing.T) {
+	dir := chdirTemp(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".mcp", "servers", "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDry := updateDryRun
+	t.Cleanup(func() { updateDryRun = oldDry })
+	updateDryRun = true
+	out := captureStdout(t, func() { updateAllServers(dryRunUpdate) })
+	if strings.Contains(out, "Summary:") {
+		t.Fatalf("dry-run printed a summary: %q", out)
 	}
 }
 

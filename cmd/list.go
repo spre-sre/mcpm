@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/spf13/cobra"
 	"mcpm/internal/builder"
 	"mcpm/internal/fetcher"
@@ -20,6 +21,7 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List installed MCP servers",
 	Long: `List all MCP servers installed in the current directory's .mcp/servers/ folder.
+A server installed at a pinned version is marked with it, e.g. [pinned v1.2.0].
 A server switched off with mcpm disable is marked with the clients it is off in.
 
 Examples:
@@ -50,6 +52,25 @@ type listEntry struct {
 	// Off names the clients and scopes the server is switched off in, e.g.
 	// "Claude Code (local), Gemini CLI (global)".
 	Off string `json:"off,omitempty"`
+	// Pin is the reference the server was pinned to at install, e.g.
+	// "refs/tags/v1.2.0".
+	Pin string `json:"pin,omitempty"`
+}
+
+// pinLabel names pin for people: "v1.2.0" for a tag, "branch stable" for a
+// branch.
+func pinLabel(pin plumbing.ReferenceName) string {
+	if pin.IsBranch() {
+		return "branch " + pin.Short()
+	}
+	return pin.Short()
+}
+
+func pinSuffix(pin string) string {
+	if pin == "" {
+		return ""
+	}
+	return " [pinned " + pinLabel(plumbing.ReferenceName(pin)) + "]"
 }
 
 // markOff fills in Off for each entry switched off locally or globally. A
@@ -215,7 +236,10 @@ func listEntries() ([]listEntry, error) {
 	}
 	entries := make([]listEntry, 0, len(servers))
 	for _, name := range servers {
-		entries = append(entries, listEntry{Name: name, Path: filepath.Join(cwd, ".mcp", "servers", name)})
+		path := filepath.Join(cwd, ".mcp", "servers", name)
+		// A server that is not a git repository has no pin.
+		pin, _ := serverPin(path)
+		entries = append(entries, listEntry{Name: name, Path: path, Pin: pin.String()})
 	}
 	if err := markOff(cwd, entries); err != nil {
 		return nil, err
@@ -233,7 +257,7 @@ func writeListText(w io.Writer, entries []listEntry) error {
 		return err
 	}
 	for _, e := range entries {
-		if _, err := fmt.Fprintf(w, "  • %s (%s)%s\n", e.Name, e.Path, offSuffix(e.Off)); err != nil {
+		if _, err := fmt.Fprintf(w, "  • %s (%s)%s%s\n", e.Name, e.Path, pinSuffix(e.Pin), offSuffix(e.Off)); err != nil {
 			return err
 		}
 	}

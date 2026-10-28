@@ -30,11 +30,13 @@ type lockFile struct {
 // it is at and the clients it is registered in. Installer is "uv" for a
 // Python server managed with uv and empty (omitted) for every other server.
 // Env holds the names of the environment variables the server uses, never
-// their values.
+// their values. Pin is the tag or branch the server was pinned to at install
+// ("refs/tags/v1.2.0") and empty (omitted) for a server that is not pinned.
 type lockEntry struct {
 	Name       string                `json:"name"`
 	Repository string                `json:"repository"`
 	Commit     string                `json:"commit"`
+	Pin        string                `json:"pin,omitempty"`
 	Targets    []injector.TargetTool `json:"targets"`
 	Installer  string                `json:"installer,omitempty"`
 	Env        []string              `json:"env,omitempty"`
@@ -58,7 +60,8 @@ var exportCmd = &cobra.Command{
 	Use:   "export",
 	Short: "Write the installed MCP servers to mcpm.lock.json",
 	Long: `Write every server in .mcp/servers/ to mcpm.lock.json: its name, the
-repository URL it was cloned from, the commit it is at, and the clients
+repository URL it was cloned from, the commit it is at, the version it is
+pinned to (mcpm install @owner/repo#v1.2.0), the clients
 (Claude Code, Gemini CLI) it is registered in, and the names of the
 environment variables it uses. Use mcpm import to install the same set
 elsewhere.
@@ -111,6 +114,10 @@ func lockEntryFor(name string, global bool) (lockEntry, error) {
 	if err != nil {
 		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
 	}
+	pin, err := serverPin(path)
+	if err != nil {
+		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
+	}
 	targets, err := registeredTargets(name, global)
 	if err != nil {
 		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
@@ -119,7 +126,7 @@ func lockEntryFor(name string, global bool) (lockEntry, error) {
 	if err != nil {
 		return lockEntry{}, fmt.Errorf("server '%s': %w", name, err)
 	}
-	return lockEntry{Name: name, Repository: url, Commit: commit, Targets: targets, Installer: serverInstaller(path), Env: env}, nil
+	return lockEntry{Name: name, Repository: url, Commit: commit, Pin: pin.String(), Targets: targets, Installer: serverInstaller(path), Env: env}, nil
 }
 
 // lockEnvNames returns the sorted names of the variables name requires in

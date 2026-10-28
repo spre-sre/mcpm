@@ -280,6 +280,46 @@ func TestWriteListMarksOff(t *testing.T) {
 	}
 }
 
+func TestWriteListMarksPinned(t *testing.T) {
+	dir := chdirTemp(t)
+	t.Setenv("HOME", t.TempDir())
+	upstream := filepath.Join(dir, "upstream")
+	writeFiles(t, upstream, map[string]string{"README": "v1"})
+	commit := commitAll(t, upstream)
+	setUpstreamRef(t, upstream, "refs/tags/v1.2.0", commit)
+	setUpstreamRef(t, upstream, "refs/heads/stable", commit)
+	alpha := clonePinnedServer(t, dir, upstream, "alpha", "refs/tags/v1.2.0")
+	beta := clonePinnedServer(t, dir, upstream, "beta", "refs/heads/stable")
+	plain := filepath.Join(dir, ".mcp", "servers", "plain")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeList(&buf, false); err != nil {
+		t.Fatal(err)
+	}
+	want := "Installed MCP servers:\n" +
+		"  • alpha (" + alpha + ") [pinned v1.2.0]\n" +
+		"  • beta (" + beta + ") [pinned branch stable]\n" +
+		"  • plain (" + plain + ")\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+
+	buf.Reset()
+	if err := writeList(&buf, true); err != nil {
+		t.Fatal(err)
+	}
+	var got []listEntry
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Pin != "refs/tags/v1.2.0" || got[1].Pin != "refs/heads/stable" || got[2].Pin != "" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestWriteListRegisteredAgainIsOn(t *testing.T) {
 	srv := writeRegisteredAgain(t, `{"mcpServers": {"srv": {"command": "node"}}}`)
 	var buf bytes.Buffer

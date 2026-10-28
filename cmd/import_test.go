@@ -194,6 +194,68 @@ func TestRunImportErrors(t *testing.T) {
 	}
 }
 
+func TestRunImportKeepsPin(t *testing.T) {
+	dir := chdirTemp(t)
+	srv := filepath.Join(dir, ".mcp", "servers", "alpha")
+	writeFiles(t, srv, map[string]string{"mcp.json": `{"runCmd":"node"}`})
+	first := commitAll(t, srv)
+	commitMore(t, srv, map[string]string{"v2.js": ""})
+	fakeInstall(t, func(string) (string, error) { return srv, nil })
+	entry := lockEntry{Name: "alpha", Repository: "https://example.com/alpha", Commit: first, Pin: "refs/tags/v1.2.0"}
+
+	var buf bytes.Buffer
+	if err := runImport(&buf, lockFile{Servers: []lockEntry{entry}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if pin, err := serverPin(srv); err != nil || pin != "refs/tags/v1.2.0" {
+		t.Fatalf("serverPin = %q, %v", pin, err)
+	}
+	if got := headCommit(srv); got != first {
+		t.Fatalf("HEAD = %s, want %s", got, first)
+	}
+	if want := "Installed alpha at " + first[:12] + " [pinned v1.2.0]\n"; !strings.HasPrefix(buf.String(), want) {
+		t.Fatalf("output %q, want prefix %q", buf.String(), want)
+	}
+
+	entry.Pin = "refs/heads/stable"
+	if err := runImport(&bytes.Buffer{}, lockFile{Servers: []lockEntry{entry}}, false); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := git.PlainOpen(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := repo.Head()
+	if err != nil || head.Name() != "refs/heads/stable" || head.Hash().String() != first {
+		t.Fatalf("HEAD = %v, %v; want branch stable at %s", head, err, first)
+	}
+	if pin, _ := serverPin(srv); pin != "refs/heads/stable" {
+		t.Fatalf("serverPin = %q", pin)
+	}
+
+	entry.Pin = ""
+	if err := runImport(&bytes.Buffer{}, lockFile{Servers: []lockEntry{entry}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if pin, err := serverPin(srv); err != nil || pin != "" {
+		t.Fatalf("unpinned entry kept pin %q, %v", pin, err)
+	}
+}
+
+func TestValidPin(t *testing.T) {
+	for _, pin := range []string{"", "refs/tags/v1.2.0", "refs/heads/stable", "refs/heads/release/1.x"} {
+		if !validPin(pin) {
+			t.Errorf("validPin(%q) = false", pin)
+		}
+	}
+	for _, pin := range []string{"v1.2.0", "refs/remotes/origin/main", "refs/tags/", "refs/heads/../../x", "refs/heads/a..b",
+		"refs/heads/.hidden", "refs/heads/a/", "refs/heads/x.lock", "refs/tags/a b", "refs/tags/a~1", "refs/tags/a@{1}", "refs/tags/a\n"} {
+		if validPin(pin) {
+			t.Errorf("validPin(%q) = true", pin)
+		}
+	}
+}
+
 func TestReadLockValidates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, lockFileName)
@@ -207,6 +269,7 @@ func TestReadLockValidates(t *testing.T) {
 		{`{"servers":[{"name":"a","repository":"https://x/a.git","commit":"main"}]}`, "invalid commit"},
 		{`{"servers":[{"name":"a","repository":"https://x/a/","commit":"` + testCommit + `","targets":["vim"]}]}`, "unknown target"},
 		{`{"servers":[{"name":"a","repository":"https://x/a.git","commit":"` + testCommit + `","env":["A-B"]}]}`, "invalid environment variable name"},
+		{`{"servers":[{"name":"a","repository":"https://x/a.git","commit":"` + testCommit + `","pin":"refs/heads/../x"}]}`, "invalid pin"},
 	}
 	for _, c := range cases {
 		writeFiles(t, dir, map[string]string{lockFileName: c.content})
