@@ -348,6 +348,35 @@ func TestSwitchUnknownServer(t *testing.T) {
 	}
 }
 
+func TestSwitchSkipsClientsWithoutServer(t *testing.T) {
+	dir := switchFixture(t)
+	writeFiles(t, dir, map[string]string{filepath.Join(".gemini", "settings.json"): `{"mcpServers": {"srv": {"command": "node"}}}`})
+	stubClaude(t, nil)
+	both := doctorTools(false, false)
+
+	out, err := runSwitch(t, dir, both, false, false)
+	if err != nil {
+		t.Fatalf("disable: %q, %v", out, err)
+	}
+	if !strings.Contains(out, "Switched srv off in Gemini CLI (local)") || !strings.Contains(out, "Skipped Claude Code (local): server srv not found") || strings.Contains(out, "Error") {
+		t.Errorf("disable output = %q", out)
+	}
+	if !loadOffT(t, dir, false).has("srv", injector.TargetGeminiCLI) {
+		t.Fatal("registration not kept")
+	}
+
+	out, err = runSwitch(t, dir, both, false, true)
+	if err != nil {
+		t.Fatalf("enable: %q, %v", out, err)
+	}
+	if !strings.Contains(out, "Switched srv on in Gemini CLI (local)") || !strings.Contains(out, "Skipped Claude Code (local): server srv is not switched off") || strings.Contains(out, "Error") {
+		t.Errorf("enable output = %q", out)
+	}
+	if len(loadOffT(t, dir, false)) != 0 {
+		t.Fatal("kept registration not forgotten")
+	}
+}
+
 func TestRemoveForgetsSwitchedOff(t *testing.T) {
 	dir := switchFixture(t)
 	writeOff(t, dir, false, offServers{"srv": {injector.TargetGeminiCLI: json.RawMessage(`{"command":"x"}`)}})

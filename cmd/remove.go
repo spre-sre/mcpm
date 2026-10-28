@@ -568,29 +568,63 @@ func restoreGeminiEntry(cwd, name string, global bool, entry json.RawMessage) er
 	return writeSettingsFile(path, data, len(env) > 0)
 }
 
+// absentError says that a client has nothing to switch: name is neither
+// registered nor kept switched off there.
+type absentError struct{ msg string }
+
+func (e absentError) Error() string { return e.msg }
+
+func isAbsent(err error) bool {
+	var absent absentError
+	return errors.As(err, &absent)
+}
+
+// switchResult is the outcome of switching name in one client.
+type switchResult struct {
+	label   string
+	changed bool
+	err     error
+}
+
 // switchServer switches name off, or back on, in each of tools in the scope.
-// It reports each change to w and each failure to errW.
+// It reports each change to w and each failure to errW. Clients that do not
+// have name are only reported, unless none of tools has it.
 func switchServer(w, errW io.Writer, cwd, name string, tools []injector.TargetTool, global, on bool) error {
 	off, path, err := loadOff(cwd, global)
 	if err != nil {
 		return err
 	}
+	results := make([]switchResult, 0, len(tools))
+	for _, tool := range tools {
+		changed, err := switchTool(cwd, name, tool, global, on, off, path)
+		results = append(results, switchResult{scopedLabel(tool, scopeName(global)), changed, err})
+	}
+	return reportSwitch(w, errW, name, on, results)
+}
+
+// reportSwitch prints each result and returns the failures. A client that
+// does not have name is a failure only when no client has it.
+func reportSwitch(w, errW io.Writer, name string, on bool, results []switchResult) error {
 	state, action := "off", "switch off"
 	if on {
 		state, action = "on", "switch on"
 	}
+	allAbsent := true
+	for _, r := range results {
+		allAbsent = allAbsent && isAbsent(r.err)
+	}
 	errs := make(map[string]error)
-	for _, tool := range tools {
-		label := scopedLabel(tool, scopeName(global))
-		changed, err := switchTool(cwd, name, tool, global, on, off, path)
+	for _, r := range results {
 		switch {
-		case err != nil:
-			fmt.Fprintf(errW, "Error switching %s %s in %s: %v\n", name, state, label, err)
-			errs[label] = err
-		case changed:
-			fmt.Fprintf(w, "Switched %s %s in %s\n", name, state, label)
+		case isAbsent(r.err) && !allAbsent:
+			fmt.Fprintf(w, "Skipped %s: %v\n", r.label, r.err)
+		case r.err != nil:
+			fmt.Fprintf(errW, "Error switching %s %s in %s: %v\n", name, state, r.label, r.err)
+			errs[r.label] = r.err
+		case r.changed:
+			fmt.Fprintf(w, "Switched %s %s in %s\n", name, state, r.label)
 		default:
-			fmt.Fprintf(w, "%s is already %s in %s\n", name, state, label)
+			fmt.Fprintf(w, "%s is already %s in %s\n", name, state, r.label)
 		}
 	}
 	return clientFailures(action, errs)
@@ -616,7 +650,7 @@ func switchOff(cwd, name string, tool injector.TargetTool, global bool, entry js
 		if off.has(name, tool) {
 			return false, nil
 		}
-		return false, fmt.Errorf("server %s not found", name)
+		return false, absentError{fmt.Sprintf("server %s not found", name)}
 	}
 	off.keep(name, tool, entry)
 	if err := saveOff(path, off); err != nil {
@@ -640,7 +674,7 @@ func switchOn(cwd, name string, tool injector.TargetTool, global, registered boo
 		return false, nil
 	}
 	if !ok {
-		return false, fmt.Errorf("server %s is not switched off (run mcpm list to see which servers are off)", name)
+		return false, absentError{fmt.Sprintf("server %s is not switched off (run mcpm list to see which servers are off)", name)}
 	}
 	if !registered {
 		if err := restoreEntry(cwd, name, tool, global, entry); err != nil {
