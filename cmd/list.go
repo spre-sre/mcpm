@@ -52,13 +52,16 @@ type listEntry struct {
 	Off string `json:"off,omitempty"`
 }
 
-// markOff fills in Off for each entry switched off locally or globally.
+// markOff fills in Off for each entry switched off locally or globally. A
+// server registered again in a client and scope it was switched off in is on
+// there.
 func markOff(cwd string, entries []listEntry) error {
 	for _, global := range bothScopes {
 		off, _, err := loadOff(cwd, global)
 		if err != nil {
 			return err
 		}
+		dropRegistered(cwd, off, global)
 		for i := range entries {
 			entries[i].Off = appendOff(entries[i].Off, off, entries[i].Name, global)
 		}

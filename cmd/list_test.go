@@ -280,6 +280,18 @@ func TestWriteListMarksOff(t *testing.T) {
 	}
 }
 
+func TestWriteListRegisteredAgainIsOn(t *testing.T) {
+	srv := writeRegisteredAgain(t, `{"mcpServers": {"srv": {"command": "node"}}}`)
+	var buf bytes.Buffer
+	if err := writeList(&buf, false); err != nil {
+		t.Fatal(err)
+	}
+	want := "Installed MCP servers:\n  • srv (" + srv + ") [off: Claude Code (local)]\n"
+	if buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
+	}
+}
+
 func TestWriteListBadOffFile(t *testing.T) {
 	dir := chdirTemp(t)
 	t.Setenv("HOME", t.TempDir())
