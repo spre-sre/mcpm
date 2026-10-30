@@ -2881,7 +2881,7 @@ def mutation_summary(check: dict) -> dict:
             "controls": check["controls"], "no_controls_reason": check["no_controls_reason"]}
 
 
-KIT_VERSION = "3.2.3"  # tests/test_kit_version.py keeps this equal to the VERSION file
+KIT_VERSION = "3.2.4"  # tests/test_kit_version.py keeps this equal to the VERSION file
 MUTATION_DIRNAME = "mutation"
 PASS_FILE = "pass.json"
 ATTEMPTS_FILE = "attempts.json"

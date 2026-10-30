@@ -231,8 +231,8 @@ them): `gocognit`, `golangci-lint`, `staticcheck`.
 Kit v2.0 counts closures and nested scopes toward the enclosing function and
 refuses a baseline with `"version": 1`. The migration is human-led; the
 baseline is a trusted input. Counting and the trust rules are in
-reference/architecture.md section 15. `<kit>` below is the installed skill
-directory (for example `~/.claude/skills/crucible-init`).
+reference/architecture.md section 15. `<kit>` below is the kit's install path:
+`claude plugin list --json` → `installPath` of `crucible`, or your clone.
 
 1. Replace the repo's engine with the kit version. `install_kit.py` refuses a
    changed file, so a re-install is not the way:
