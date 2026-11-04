@@ -117,6 +117,62 @@ func TestRunHelpGoesToStdout(t *testing.T) {
 	}
 }
 
+// A malformed default config must not slow down or break help and version:
+// they skip the config read entirely.
+func TestHelpAndVersionSkipConfig(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".mcpm.yaml"), []byte("key: [unclosed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	oldCfg := cfgFile
+	cfgFile = ""
+	viper.Reset()
+	t.Cleanup(func() {
+		cfgFile = oldCfg
+		viper.Reset()
+	})
+
+	for _, args := range [][]string{{"help"}, {"help", "list"}, {"version"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("run(%v) exit code = %d, want 0; stderr:\n%s", args, code, stderr.String())
+		}
+		if stdout.Len() == 0 {
+			t.Errorf("run(%v) printed nothing on stdout", args)
+		}
+		if viper.ConfigFileUsed() != "" {
+			t.Errorf("run(%v) read config %q, want no read", args, viper.ConfigFileUsed())
+		}
+	}
+}
+
+func TestNeedsConfig(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"help"}, false},
+		{[]string{"version"}, false},
+		{[]string{"completion", "bash"}, false},
+		{[]string{"list"}, true},
+		{[]string{"env", "list"}, true},
+	}
+	// Cobra adds help and completion inside Execute; add them here so the
+	// test does not depend on another test running first.
+	rootCmd.InitDefaultHelpCmd()
+	rootCmd.InitDefaultCompletionCmd()
+	for _, tc := range tests {
+		c, _, err := rootCmd.Find(tc.args)
+		if err != nil {
+			t.Fatalf("Find(%v): %v", tc.args, err)
+		}
+		if got := needsConfig(c); got != tc.want {
+			t.Errorf("needsConfig(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
 func TestReadConfig(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -56,8 +56,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func init() {
-	cobra.OnInitialize(initConfig)
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		if needsConfig(cmd) {
+			initConfig()
+		}
+	}
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.mcpm.yaml)")
+}
+
+// needsConfig reports whether cmd reads the config file. Help, version and
+// shell completion do not, so they start without touching the disk.
+func needsConfig(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		switch c.Name() {
+		case "help", "version", "completion",
+			cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+			return false
+		}
+	}
+	return true
 }
 
 func initConfig() {
